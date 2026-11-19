@@ -1,0 +1,477 @@
+# 内网现状（面板一、面板二）：docs/02-内网现状.md 的机器可读版，两者同时更新。
+#
+# 地址都是占位符：<监控机>、<P节点1>、<D节点1>、<proxy机器> 等；需要示例地址时只用示例集 10.1.x.x。
+# 实验室地址（10.98.x.x）只出现在 lab_mirror 一节，并注明是实验室地址。
+# 目录占位符：<ROOT> = 面板目录的上级目录（VLLM_PD_ROOT，手册中写作 <总目录>）；
+#             <用户目录> = 监控机上放部署包和更新脚本的个人目录（更新脚本的 USER_DIR）；
+#             ~ = 监控机上执行账号的家目录。现场值只放在 local/，不进 git。
+#
+# 状态时点：T51 两份内网手册执行完以后（2026-11-19）。test 已删除，test-glm53 已装在原来那两台机器上。
+#
+# 字段含义：
+#   as_of            状态时点
+#   basis            每条值的依据，取值见 basis_values
+#   monitor          监控机：架构、执行账号、注册表、共用的 Grafana、docker 网络
+#   packages         监控机上在用和停用的部署包、更新脚本：sha256_8 为 sha256 前 8 位，built 为包内 MANIFEST 的构建时间
+#   clusters         每个已登记的集群一条：
+#     name             内部名（容器、目录、注册表、看板 UID 用它）
+#     display_name     Grafana 文件夹和看板标题里显示的名字
+#     panels           装了哪些面板：panel1（服务侧指标，Prometheus）、panel2（请求时延 L1/L2/L3，ClickHouse）
+#     purpose          用途
+#     model_group      MODEL_GROUP，等于 Grafana 子文件夹名
+#     grafana_folder   看板所在的「上一层 / 子文件夹」
+#     package          用的包及 sha256 前 8 位；config_id 为面板二 segments.json 的 config_id
+#     mode             面板二的 NODE_MODE：mock 或 vllm；只有面板一时为 null
+#     port_base        端口基数 B；ports 为它占用的主机端口（ClickHouse = B，拉取程序 = B+1，Prometheus = B+2）
+#     dirs             监控机上的目录
+#     nodes            节点数与实例布局
+#     coupling         与其他集群的耦合
+#     basis            这一条的依据
+#   grafana_folders  Grafana 文件夹树及每个文件夹里的看板（title + uid）
+#   topology         真实拓扑（两种集群形态和 glm5.3 测试集群）
+#   removed_or_retired  已删除或停用的东西
+#   lab_mirror       实验室镜像与内网的已知不同
+#   unverified       未核实的事项
+
+schema_version: 1
+as_of: "2026-11-19"
+state_basis: "T51 两份手册（面板手册第 1-22 步、打补丁手册）执行完以后。2026-11-19 21:4x 时内网做到面板手册第 13 步、打补丁手册第 3 步，此后的带回输出未见"
+
+basis_values:
+  intranet_output: "内网带回的输出（注明任务与日期）"
+  manual: "交付给内网的手册"
+  system_manual: "《面板系统说明书》v3.1-extra 第二部分（2026-11-14 的状态）"
+  manual_and_mirror: "按手册与镜像推得，未经内网核对"
+  unverified: "未核实"
+
+placeholders:
+  "<监控机>": "监控机地址"
+  "<P节点1>": "某集群 P 侧第 1 台机器的地址，依此类推"
+  "<D节点1>": "某集群 D 侧第 1 台机器的地址，依此类推"
+  "<proxy机器>": "test-glm53 的 proxy 所在机器"
+  "<ROOT>": "面板目录的上级目录（包二 v3 已填路径更新脚本的 ROOT）"
+  "<用户目录>": "监控机上放部署包和更新脚本的个人目录（同一脚本的 USER_DIR）"
+  "<SSH账号>": "从监控机登录节点的账号（deploy.env 的 SSH_USER）"
+
+monitor:
+  address: "<监控机>"
+  arch: "aarch64"
+  exec_account: "装面板、执行更新脚本的账号；注册表、备份、诊断报告在它的家目录"
+  registry:
+    path: "~/.vllm-pd-clusters.json"
+    format: "vllm-pd-clusters version 1"
+    root: "<ROOT>"
+    holds_credentials: false
+  docker_network: "obs-net"
+  grafana:
+    version: "12.4.2"
+    plugins: ["grafana-clickhouse-datasource 4.23.4"]
+    port: "说明书记为 3000，未经内网核对（实验室镜像为 3300）"
+    container: "deploy.env 的 GRAFANA_CONTAINER，未核实"
+    shared_by_all_clusters: true
+  prometheus:
+    version: "v3.11.2"
+    retention: "15d"
+    alertmanager: false
+  clickhouse_image: "clickhouse/clickhouse-server:26.8.36.3"
+  vector_image: "timberio/vector:0.61.0-debian"
+  credentials_location: "各集群 deploy.env（权限 600）、采集器配置、容器启动参数；--env-from 只取 6 个共用值"
+  shared_keys_from_env: ["GRAFANA_URL", "GRAFANA_USER", "Grafana 凭据", "GRAFANA_CONTAINER", "DOCKER_NETWORK", "MONITOR_HOST"]
+  basis: "system_manual；T45 镜像同步记录（2026-11-18）"
+
+packages:
+  - name: "面板一部署包"
+    file: "vllm-pd-grafana-panel1.tar.gz"
+    sha256_8: "60ce7f30"
+    built: "2026-11-12T15:06:34Z"
+    location: "<用户目录>/vllm-pd-panel1-update-2/（解在 pack/vllm-pd-grafana-panel1/）"
+    used_by: ["glm53-1", "glm53-0", "glm53-2", "dsv41-flash-1", "dsv41-flash-2", "dsv41-flash-3", "dsv41-flash-4", "dsv41-flash-5"]
+    status: "在用"
+    basis: "manual（《面板一加集群说明书》第 2-3 步）"
+  - name: "面板二 v3 部署包"
+    file: "vllm-pd-grafana-panel2.tar.gz"
+    version: "v3"
+    sha256_8: "3e98c2b4"
+    built: "2026-11-16T11:57:20Z"
+    config_id: "pd-diag-v3-2026-11-16"
+    location: "<用户目录>/vllm-pd-panel2-update-v3/（解在 pack/vllm-pd-grafana-panel2/）"
+    used_by: ["glm53-1"]
+    status: "在用"
+    basis: "system_manual 第 8.3、8.8 节；包二 v3 MANIFEST"
+  - name: "包二 v3 更新脚本"
+    file: "vllm_pd_update_pack2_filled.py"
+    location: "<用户目录>/vllm-pd-update-v3/"
+    note: "「现场路径」一段的 USER_DIR、ROOT 是各手册已填路径版的来源；与占位符版只差 USER_DIR 一行"
+    status: "在用"
+    basis: "system_manual 第 8.3 节"
+  - name: "面板二 v3.1-extra 部署包"
+    file: "vllm-pd-grafana-panel2.tar.gz"
+    version: "v3.1-extra"
+    sha256_8: "e3885b93"
+    built: "2026-11-19T08:48:35Z"
+    config_id: "pd-diag-v3.1-extra-glm53-2026-11-19c"
+    location: "<用户目录>/vllm-pd-panel2-v3.1-extra/（解在 pack/vllm-pd-grafana-panel2/）"
+    used_by: ["test-glm53"]
+    status: "在用"
+    basis: "manual（面板手册第 1、11 步）"
+  - name: "面板二离线包"
+    file: "vllm-pd-grafana-panel2-offline-aarch64.tar.gz"
+    sha256_8: "14c00e3a"
+    content: "ClickHouse 与 Vector 镜像、ClickHouse 插件 4.23.4、Python 3.12.16"
+    location: "<用户目录>/vllm-pd-panel2-update-1112/"
+    used_by: ["glm53-1", "test-glm53"]
+    status: "在用，各版共用"
+    basis: "包二 v3 MANIFEST"
+  - name: "看板分层与加集群工具"
+    files: ["arrange_boards.py", "boards_layout.txt", "clusters.txt", "make_inventories.py", "SHA256SUMS"]
+    location: "<用户目录>/vllm-pd-boards-clusters/"
+    repo_path: "tools/"
+    note: "每次 add、更新、回滚以后执行一次 arrange_boards.py apply；boards_layout.txt 在内网为 10 行（仓库 9 行加 test-glm53 一行）"
+    status: "在用"
+    basis: "T45 交付；面板手册第 16 步"
+  - name: "包一 v1.0 更新脚本"
+    file: "vllm_pd_update_filled.py"
+    location: "<用户目录>/vllm-pd-update-v1.0/"
+    status: "停用，不再执行"
+    reason: "把模型文件夹写死为 GLM-5.3、不读注册表；执行后会在顶层新建 GLM-5.3 并挪走面板一看板，然后在登记时停下"
+    basis: "《动现有看板操作单》0.4 节"
+  - name: "包二 v2.0、v2.1 的包与更新脚本"
+    location: "<用户目录>/vllm-pd-update-v2.0/、vllm-pd-update-v2.1/、vllm-pd-panel2-update-v2.1/"
+    status: "停用"
+    basis: "system_manual 第 5.4、8.3 节"
+  - name: "包二 v3.1-extra 更新脚本与《操作说明 B》"
+    status: "未用（对象 test 已删除、没有升级）；是否拷到监控机未核实"
+    basis: "T51 任务记录"
+
+clusters:
+  - name: "glm53-1"
+    display_name: "glm53-1"
+    panels: ["panel1", "panel2"]
+    purpose: "glm5.3 服务集群；面板一显示真实服务指标，面板二在真实 vLLM 接入前用 mock 跑通链路"
+    model_group: "glm53-1"
+    grafana_folder: "GLM-5.3/glm53-1"
+    package:
+      panel1: {sha256_8: "60ce7f30", built: "2026-11-12T15:06:34Z"}
+      panel2: {version: "v3", sha256_8: "3e98c2b4", built: "2026-11-16T11:57:20Z", config_id: "pd-diag-v3-2026-11-16", segments_profile: ""}
+    mode: "mock"
+    mock_rate: "说明书记为 64，未经内网核对"
+    port_base: 18100
+    ports: {clickhouse: 18100, puller: 18101, prometheus: 18102}
+    containers: ["vllm-pd-prometheus-glm53-1", "vllm-pd-clickhouse-glm53-1", "vllm-pd-vector-glm53-1"]
+    dirs:
+      panel1: "<ROOT>/vllm-pd-grafana-panel1/glm53-1"
+      panel1_inventory: "<ROOT>/vllm-pd-grafana-panel1/glm53-1/prometheus/inventory.json"
+      panel2: "<ROOT>/vllm-pd-grafana-panel2/glm53-1"
+      timing_home: "<ROOT>/vllm-timing/glm53-1"
+      clickhouse_data_dir: "<glm53-1 的数据目录>（已设，路径未核实）"
+      node_conf_dir: "节点上 <SSH账号> 家目录下的 vllm-pd-diag/conf（默认值，内网是否改过未核实）"
+      node_log_dir: "节点上 <SSH账号> 家目录下的 vllm-pd-diag/logs（同上）"
+    deploy_env_keys: {NODE_MODE: "mock", EVENT_TTL_DAYS: "15", SUMMARY_TTL_DAYS: "30", PULL_RSYNC_FLAGS: "--append", SEGMENTS_PROFILE: ""}
+    nodes:
+      machines: 12
+      prefill: {machines: 8, instances_per_machine: 1, instances: "P0-P7", tp: 16}
+      decode: {machines: 4, instances_per_machine: 16, instances: "D0-D63", tp: 1}
+      addresses: ["<P节点1>", "…", "<P节点8>", "<D节点1>", "…", "<D节点4>"]
+    grafana:
+      boards: ["vllm-pd-prefill-glm53-1", "vllm-pd-decode-glm53-1", "vllm-pd-request-glm53-1"]
+      datasources: ["prometheus-glm53-1", "vllm-pd-clickhouse-glm53-1"]
+    coupling:
+      - "面板二用面板一的 Prometheus 做采集链路告警（注册表 PROMETHEUS_YML 指向面板一目录的 prometheus.yml）"
+      - "它的面板二 deploy.env 是 test-glm53 的 --env-from、7 套新面板一集群 add 的 --env-from、arrange_boards.py 的 --env-from"
+      - "它的面板一清单是 make_inventories.py 的 --defaults（exporter 端口、抓取间隔、超时、保留期）"
+    basis: "system_manual 第 6 节；T45 镜像同步记录"
+
+  - name: "test-glm53"
+    display_name: "test-glm53"
+    panels: ["panel2"]
+    purpose: "glm5.3 测试集群；面板二读打过补丁的 vLLM 的真实日志，验证 L1/L2/L3 段"
+    history: "原面板二集群 test（v3，vllm，同两台机器）先删除、数据不留，再用 v3.1-extra 包全新安装"
+    model_group: "test-glm53"
+    grafana_folder: "GLM-5.3/test-glm53"
+    package:
+      panel2: {version: "v3.1-extra", sha256_8: "e3885b93", built: "2026-11-19T08:48:35Z", config_id: "pd-diag-v3.1-extra-glm53-2026-11-19c", segments_profile: "glm53"}
+    mode: "vllm"
+    port_base: 18110
+    port_base_basis: "manual_and_mirror：面板手册第 12 步 names.py alloc 复用 test 空出的 18110；内网以该步输出为准"
+    ports: {clickhouse: 18110, puller: 18111, prometheus: 18112}
+    containers: ["vllm-pd-clickhouse-test-glm53", "vllm-pd-vector-test-glm53", "vllm-pd-prometheus-test-glm53"]
+    volumes: ["vllm-pd-clickhouse-test-glm53-data", "vllm-pd-clickhouse-test-glm53-logs", "vllm-pd-vector-test-glm53-data", "vllm-pd-prometheus-data-test-glm53"]
+    dirs:
+      panel2: "<ROOT>/vllm-pd-grafana-panel2/test-glm53"
+      timing_home: "<ROOT>/vllm-timing/test-glm53"
+      pull_dir: "<ROOT>/vllm-timing/test-glm53/pull"
+      own_prometheus_yml: "<ROOT>/vllm-pd-prometheus-test-glm53/prometheus.yml"
+      pack: "<用户目录>/vllm-pd-panel2-v3.1-extra/pack/vllm-pd-grafana-panel2"
+      account_workdir: "~/vllm-pd-test-glm53/"
+      node_conf_dir: "/data/pd-diag/conf（容器里同路径）"
+      node_log_dir: "/data/pd-diag/logs（容器里同路径）"
+    deploy_env_keys:
+      NODE_MODE: "vllm"
+      MODEL_GROUP: "test-glm53"
+      SEGMENTS_PROFILE: "glm53"
+      PROMETHEUS_YML: "<ROOT>/vllm-pd-prometheus-test-glm53/prometheus.yml"
+      SSH_USER: "<SSH账号>（沿用 test）"
+      NODE_CONF_DIR: "/data/pd-diag/conf"
+      NODE_LOG_DIR: "/data/pd-diag/logs"
+      NODE_CONF_DIR_IN_CONTAINER: "/data/pd-diag/conf"
+      NODE_LOG_DIR_IN_CONTAINER: "/data/pd-diag/logs"
+      NODE_CONTAINER_UID: ""
+      PULL_MIN_DISK_GB: "16"
+      CLICKHOUSE_MIN_DISK_GB: "85"
+      NODE_MIN_DISK_GB: "50"
+      CLICKHOUSE_DATA_DIR: ""
+      PROXY_COLLECT: "1（面板手册第 17 步；是否已写入未核实）"
+      PROXY_MACHINE: "<proxy机器>"
+      PROXY_LOG_DIR: "<proxy日志目录>"
+      MOONCAKE_LOG_COLLECT: "1（同上）"
+      MOONCAKE_LOG_FILES: "<P节点1>=<P 实例日志文件>"
+      MOONCAKE_TID_FALLBACK: "0"
+    nodes:
+      machines: 2
+      prefill: {machines: 1, instances_per_machine: 1, instances: "P0", port: 9900, tp: "未核实"}
+      decode: {machines: 1, instances_per_machine: 16, instances: "D0-D15", ports: "9100-9115", tp: 1, dp: 16}
+      addresses: ["<P节点1>", "<D节点1>"]
+      nodes_basis: "intranet_output（T51 面板手册第 13 步、打补丁手册第 3 步检测，2026-11-19）"
+    vllm:
+      versions: "vLLM v0.30.0；vllm-ascend d4ad49796（现场有本地改动）；MooncakeConnectorV1 + AscendStoreConnector"
+      logcfg_before_patch: "D 机器 unset；P 机器检测时没有找到运行中的 vLLM，未得到"
+      patches: "vLLM、vllm-ascend、p2d 三件按打补丁手册分三批装入；可选的 Mooncake 替换库是否已换未核实；proxy 补丁不在打补丁手册内，是否已打未核实"
+    expected_segments: "47 段里 42 段有值；做了 Mooncake 部分后 45 段"
+    grafana:
+      boards: ["vllm-pd-request-test-glm53"]
+      datasources: ["vllm-pd-clickhouse-test-glm53"]
+    coupling:
+      - "没有面板一；自己的只告警 Prometheus 手工起，网络与镜像取自 vllm-pd-prometheus-glm53-1，不归 panel2_cluster.sh remove 管，不是 Grafana 数据源"
+      - "6 个共用值取自 glm53-1 面板二的 deploy.env（--env-from）"
+      - "与已删除的 test 用同两台机器、同一个节点目录 /data/pd-diag"
+    basis: "manual（《面板二：删除 test、安装 test-glm53 操作手册》第 1-22 步），节点为 intranet_output"
+
+  - name: "glm53-0"
+    display_name: "glm53-0"
+    panels: ["panel1"]
+    purpose: "glm5.3 集群，只接面板一"
+    model_group: "glm53-0"
+    grafana_folder: "GLM-5.3/glm53-0"
+    package: {panel1: {sha256_8: "60ce7f30"}}
+    mode: null
+    port_base: 18120
+    ports: {prometheus: 18122}
+    port_basis: "manual_and_mirror"
+    containers: ["vllm-pd-prometheus-glm53-0"]
+    dirs: {panel1: "<ROOT>/vllm-pd-grafana-panel1/glm53-0"}
+    nodes: {machines: "未核实（镜像按 glm53-1 形态：12 台，P 8 个、D 64 个实例，抓取目标 97 个）"}
+    vllm_ascend_patched: false
+    basis: "T45 交付（2026-11-17）与镜像同步记录（2026-11-18）"
+
+  - name: "glm53-2"
+    display_name: "glm53-2"
+    panels: ["panel1"]
+    purpose: "glm5.3 集群，只接面板一"
+    model_group: "glm53-2"
+    grafana_folder: "GLM-5.3/glm53-2"
+    package: {panel1: {sha256_8: "60ce7f30"}}
+    mode: null
+    port_base: 18130
+    ports: {prometheus: 18132}
+    port_basis: "manual_and_mirror"
+    containers: ["vllm-pd-prometheus-glm53-2"]
+    dirs: {panel1: "<ROOT>/vllm-pd-grafana-panel1/glm53-2"}
+    nodes: {machines: "未核实（同 glm53-0）"}
+    vllm_ascend_patched: false
+    basis: "同 glm53-0"
+
+  - name: "dsv41-flash-1"
+    display_name: "dsv4.1-flash-1"
+    panels: ["panel1"]
+    purpose: "dsv4.1-flash 集群，只接面板一（dsv4.1 的面板二已暂停）"
+    model_group: "dsv4.1-flash-1"
+    grafana_folder: "dsv4.1-flash/dsv4.1-flash-1"
+    package: {panel1: {sha256_8: "60ce7f30"}}
+    mode: null
+    port_base: 18140
+    ports: {prometheus: 18142}
+    port_basis: "manual_and_mirror"
+    containers: ["vllm-pd-prometheus-dsv41-flash-1"]
+    dirs: {panel1: "<ROOT>/vllm-pd-grafana-panel1/dsv41-flash-1"}
+    nodes: &dsv41_nodes
+      machines: 6
+      prefill: {machines: 4, instances_per_machine: 2, instances: "P0-P7", ports: "7100,7101"}
+      decode: {machines: 2, instances_per_machine: 8, instances: "D0-D15", ports: "7100-7107"}
+      scrape_targets: 37
+      nodes_basis: "T43 用户答复（2026-11-16）"
+    vllm_ascend_patched: false
+    basis: "T43 用户答复；T45 交付与镜像同步记录"
+
+  - name: "dsv41-flash-2"
+    display_name: "dsv4.1-flash-2"
+    panels: ["panel1"]
+    purpose: "同 dsv41-flash-1"
+    model_group: "dsv4.1-flash-2"
+    grafana_folder: "dsv4.1-flash/dsv4.1-flash-2"
+    package: {panel1: {sha256_8: "60ce7f30"}}
+    mode: null
+    port_base: 18150
+    ports: {prometheus: 18152}
+    port_basis: "manual_and_mirror"
+    containers: ["vllm-pd-prometheus-dsv41-flash-2"]
+    dirs: {panel1: "<ROOT>/vllm-pd-grafana-panel1/dsv41-flash-2"}
+    nodes: *dsv41_nodes
+    vllm_ascend_patched: false
+    basis: "同 dsv41-flash-1"
+
+  - name: "dsv41-flash-3"
+    display_name: "dsv4.1-flash-3"
+    panels: ["panel1"]
+    purpose: "同 dsv41-flash-1"
+    model_group: "dsv4.1-flash-3"
+    grafana_folder: "dsv4.1-flash/dsv4.1-flash-3"
+    package: {panel1: {sha256_8: "60ce7f30"}}
+    mode: null
+    port_base: 18160
+    ports: {prometheus: 18162}
+    port_basis: "manual_and_mirror"
+    containers: ["vllm-pd-prometheus-dsv41-flash-3"]
+    dirs: {panel1: "<ROOT>/vllm-pd-grafana-panel1/dsv41-flash-3"}
+    nodes: *dsv41_nodes
+    vllm_ascend_patched: false
+    basis: "同 dsv41-flash-1"
+
+  - name: "dsv41-flash-4"
+    display_name: "dsv4.1-flash-4"
+    panels: ["panel1"]
+    purpose: "同 dsv41-flash-1"
+    model_group: "dsv4.1-flash-4"
+    grafana_folder: "dsv4.1-flash/dsv4.1-flash-4"
+    package: {panel1: {sha256_8: "60ce7f30"}}
+    mode: null
+    port_base: 18170
+    ports: {prometheus: 18172}
+    port_basis: "manual_and_mirror"
+    containers: ["vllm-pd-prometheus-dsv41-flash-4"]
+    dirs: {panel1: "<ROOT>/vllm-pd-grafana-panel1/dsv41-flash-4"}
+    nodes: *dsv41_nodes
+    vllm_ascend_patched: false
+    basis: "同 dsv41-flash-1"
+
+  - name: "dsv41-flash-5"
+    display_name: "dsv4.1-flash-5"
+    panels: ["panel1"]
+    purpose: "同 dsv41-flash-1"
+    model_group: "dsv4.1-flash-5"
+    grafana_folder: "dsv4.1-flash/dsv4.1-flash-5"
+    package: {panel1: {sha256_8: "60ce7f30"}}
+    mode: null
+    port_base: 18180
+    ports: {prometheus: 18182}
+    port_basis: "manual_and_mirror"
+    containers: ["vllm-pd-prometheus-dsv41-flash-5"]
+    dirs: {panel1: "<ROOT>/vllm-pd-grafana-panel1/dsv41-flash-5"}
+    nodes: *dsv41_nodes
+    vllm_ascend_patched: false
+    basis: "同 dsv41-flash-1"
+
+grafana_folders:
+  basis: "manual_and_mirror（T45 镜像同步记录的 10 个文件夹、18 张看板，加 T51 面板手册第 6-8、16 步）"
+  totals: {folders: 11, boards: 18, datasources: 10}
+  tree:
+    - folder: "GLM-5.3"
+      subfolders:
+        - folder: "glm53-0"
+          boards:
+            - {title: "vLLM 服务侧监控面板 - Prefill实例（glm53-0）", uid: "vllm-pd-prefill-glm53-0"}
+            - {title: "vLLM 服务侧监控面板 - Decode实例（glm53-0）", uid: "vllm-pd-decode-glm53-0"}
+        - folder: "glm53-1"
+          boards:
+            - {title: "vLLM 服务侧监控面板 - Prefill实例（glm53-1）", uid: "vllm-pd-prefill-glm53-1"}
+            - {title: "vLLM 服务侧监控面板 - Decode实例（glm53-1）", uid: "vllm-pd-decode-glm53-1"}
+            - {title: "面板二：请求时延拆解（P / D）（glm53-1）", uid: "vllm-pd-request-glm53-1"}
+        - folder: "glm53-2"
+          boards:
+            - {title: "vLLM 服务侧监控面板 - Prefill实例（glm53-2）", uid: "vllm-pd-prefill-glm53-2"}
+            - {title: "vLLM 服务侧监控面板 - Decode实例（glm53-2）", uid: "vllm-pd-decode-glm53-2"}
+        - folder: "test-glm53"
+          boards:
+            - {title: "面板二：请求时延拆解（P / D）（test-glm53）", uid: "vllm-pd-request-test-glm53"}
+    - folder: "dsv4.1-flash"
+      subfolders:
+        - folder: "dsv4.1-flash-1"
+          boards:
+            - {title: "vLLM 服务侧监控面板 - Prefill实例（dsv4.1-flash-1）", uid: "vllm-pd-prefill-dsv41-flash-1"}
+            - {title: "vLLM 服务侧监控面板 - Decode实例（dsv4.1-flash-1）", uid: "vllm-pd-decode-dsv41-flash-1"}
+        - folder: "dsv4.1-flash-2"
+          boards:
+            - {title: "vLLM 服务侧监控面板 - Prefill实例（dsv4.1-flash-2）", uid: "vllm-pd-prefill-dsv41-flash-2"}
+            - {title: "vLLM 服务侧监控面板 - Decode实例（dsv4.1-flash-2）", uid: "vllm-pd-decode-dsv41-flash-2"}
+        - folder: "dsv4.1-flash-3"
+          boards:
+            - {title: "vLLM 服务侧监控面板 - Prefill实例（dsv4.1-flash-3）", uid: "vllm-pd-prefill-dsv41-flash-3"}
+            - {title: "vLLM 服务侧监控面板 - Decode实例（dsv4.1-flash-3）", uid: "vllm-pd-decode-dsv41-flash-3"}
+        - folder: "dsv4.1-flash-4"
+          boards:
+            - {title: "vLLM 服务侧监控面板 - Prefill实例（dsv4.1-flash-4）", uid: "vllm-pd-prefill-dsv41-flash-4"}
+            - {title: "vLLM 服务侧监控面板 - Decode实例（dsv4.1-flash-4）", uid: "vllm-pd-decode-dsv41-flash-4"}
+        - folder: "dsv4.1-flash-5"
+          boards:
+            - {title: "vLLM 服务侧监控面板 - Prefill实例（dsv4.1-flash-5）", uid: "vllm-pd-prefill-dsv41-flash-5"}
+            - {title: "vLLM 服务侧监控面板 - Decode实例（dsv4.1-flash-5）", uid: "vllm-pd-decode-dsv41-flash-5"}
+  datasources:
+    prometheus: ["prometheus-glm53-1", "prometheus-glm53-0", "prometheus-glm53-2", "prometheus-dsv41-flash-1", "prometheus-dsv41-flash-2", "prometheus-dsv41-flash-3", "prometheus-dsv41-flash-4", "prometheus-dsv41-flash-5"]
+    clickhouse: ["vllm-pd-clickhouse-glm53-1", "vllm-pd-clickhouse-test-glm53"]
+  boards_layout_rows_on_intranet: 10
+  boards_layout_note: "仓库 tools/boards_layout.txt 的 9 行（含已删除的 test 一行，arrange_boards.py 视为未登记而跳过），加面板手册第 16 步追加的 test-glm53 一行"
+
+topology:
+  glm53:
+    prefill: "8 台，每台 1 个实例（DP8，TP16，8 个 P 实例一个 DP 组，data-parallel 地址指向 P0，每个实例一个 API server）"
+    decode: "4 台，每台 16 个实例，共 64 个（TP1，每个实例一个 API server）"
+    instances: "P0-P7、D0-D63"
+    used_by: ["glm53-1"]
+    basis: "用户提供（T14，2026-11-05；2026-11-18 重申）；system_manual 第 6.1 节"
+  dsv41:
+    prefill: "4 台，每台 2 个实例，8 个 P 实例一个 DP 组"
+    decode: "2 台，每台 8 个实例，共 16 个"
+    instances: "P0-P7、D0-D15"
+    used_by: ["dsv41-flash-1", "dsv41-flash-2", "dsv41-flash-3", "dsv41-flash-4", "dsv41-flash-5"]
+    basis: "用户提供（2026-11-18）；T43 用户答复（2026-11-16）"
+  glm53_test:
+    prefill: "1 台 1 个实例（端口 9900）"
+    decode: "1 台 16 个实例（端口 9100-9115，TP1）"
+    instances: "P0、D0-D15"
+    used_by: ["test-glm53"]
+    basis: "intranet_output（T51，2026-11-19）"
+  naming_rule: "实例名按清单里 API server 的顺序计算（第 n 项为 Pn / Dn，按 DP rank 排），不写死；整个 P/D 集群一个 proxy"
+
+removed_or_retired:
+  - {object: "面板二集群 test（v3，vllm，端口 18110-18112）及其只告警 Prometheus、数据卷、配置目录、看板、数据源", action: "删除，数据不留", when: "T51，2026-11-19", basis: "面板手册第 5-10 步"}
+  - {object: "旧面板一（文件预置看板、旧数据源、旧 Prometheus 容器）", action: "停用；旧数据卷是否删除由用户决定", when: "T26，2026-11-12", basis: "《停用旧面板一操作单》；残留未核实"}
+  - {object: "包一 v1.0 更新脚本 <用户目录>/vllm-pd-update-v1.0/vllm_pd_update_filled.py", action: "不再执行（写死 GLM-5.3）", when: "T45，2026-11-17 起", basis: "《动现有看板操作单》0.4 节"}
+  - {object: "包二 v2.0、v2.1 的更新脚本", action: "不再执行", when: "升到 v3 以后", basis: "system_manual 第 5.4 节"}
+  - {object: "<用户目录>/vllm-pd-panel2-diag/ 独立诊断工具", action: "不再使用，诊断用集群目录的 bin/diag.sh", when: "v2.1 以后", basis: "system_manual 第 5.4 节"}
+  - {object: "dsv4.1 的面板二（dsv41 段定义与补丁包）", action: "暂停", when: "T51，2026-11-19 起只做 glm5.3", basis: "T51 任务记录"}
+
+lab_mirror:
+  note: "实验室镜像只用交付给内网的同一批命令更新；以下为与内网的已知不同"
+  lab_address_range: "10.98.0.0/16（实验室地址，不是内网地址）"
+  differences:
+    - {item: "T51 之后的状态", mirror: "尚未同步：仍有 test，没有 test-glm53", intranet: "test 已删，test-glm53 已装"}
+    - {item: "用户目录", mirror: "/data/labuser", intranet: "<用户目录>"}
+    - {item: "Prometheus 保留期", mirror: "2h（全部集群，2026-11-18 决定保留）", intranet: "15d"}
+    - {item: "glm53-1 面板二节点", mirror: "5 个节点容器", intranet: "12 台"}
+    - {item: "glm53-1 面板一抓取目标", mirror: "占位主机名，全部 down", intranet: "真实目标"}
+    - {item: "vLLM", mirror: "替身进程，节点上 SSH 账号不能执行 docker", intranet: "真实 vLLM 容器"}
+    - {item: "Grafana 端口", mirror: "3300", intranet: "说明书记为 3000，未经内网核对"}
+    - {item: "数据", mirror: "空库起，只有 mock 或替身数据", intranet: "真实历史"}
+  basis: "T45 镜像同步记录（2026-11-18）；T52 摸底（2026-11-19）；T51 任务记录"
+
+unverified:
+  - "内网是否已做完面板手册第 14-22 步和打补丁手册（2026-11-19 21:4x 时做到面板手册第 13 步、打补丁手册第 3 步）"
+  - "test-glm53 的端口基数（手册与走查为 18110，以第 12 步输出为准）"
+  - "glm53-0、glm53-2、dsv41-flash-1…5 的端口基数 18120…18180（按镜像同步时的添加顺序推得）"
+  - "glm53-0、glm53-2 的机器数和实例布局"
+  - "Grafana 的页面端口、容器名和 GRAFANA_URL"
+  - "glm53-1 面板二的 MOCK_RATE、mock 是否在跑、节点目录、CLICKHOUSE_DATA_DIR 的路径"
+  - "glm53-1 清单的 vllm_ascend_patched；npu-exporter、node_exporter 的端口（镜像为 8082、9100）"
+  - "test-glm53 的 proxy 补丁与 PROXY_COLLECT、MOONCAKE_LOG_COLLECT 是否已开；Mooncake 替换库是否已换；P 实例的 TP"
+  - "面板一部署包目录 vllm-pd-panel1-update-2 与 vllm-pd-panel1-update-1112 是否都在"
+  - "旧面板一的残留（vLLM P/D 文件夹、数据源 Prometheus、旧数据卷）"
+  - "Grafana 文件夹、看板、数据源的数量"

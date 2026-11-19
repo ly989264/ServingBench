@@ -1,0 +1,13 @@
+# 看板分层的对照表：每个集群的看板放在 Grafana 的「上一层文件夹 / 子文件夹」里。arrange_boards.py 读这个文件。
+# 列：上一层文件夹  集群名（部署包里的名字）  子文件夹  [看板标题里显示的名字]
+# 子文件夹就是这个集群的模型文件夹（MODEL_GROUP）。第 4 列只在显示名和集群名不同时写：
+# arrange_boards.py 把这个集群面板一两张看板标题末尾的「（集群名）」改成「（第 4 列）」。
+GLM-5.3        glm53-0        glm53-0
+GLM-5.3        glm53-1        glm53-1
+GLM-5.3        test           glm53-1
+GLM-5.3        glm53-2        glm53-2
+dsv4.1-flash   dsv41-flash-1  dsv4.1-flash-1  dsv4.1-flash-1
+dsv4.1-flash   dsv41-flash-2  dsv4.1-flash-2  dsv4.1-flash-2
+dsv4.1-flash   dsv41-flash-3  dsv4.1-flash-3  dsv4.1-flash-3
+dsv4.1-flash   dsv41-flash-4  dsv4.1-flash-4  dsv4.1-flash-4
+dsv4.1-flash   dsv41-flash-5  dsv4.1-flash-5  dsv4.1-flash-5
