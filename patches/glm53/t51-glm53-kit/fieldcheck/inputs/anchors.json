@@ -1,0 +1,929 @@
+{
+  "script": "replay_p2d.py",
+  "script_sha256": "02304c8f76429780635870d17bac73558a2ecfafaadd744428c0ec93f457d4b3",
+  "base": "vllm-ascend d4ad49796, vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py",
+  "base_sha256": "4e476a50afb5a7f13c274c071efc909ee823577383843b04e952bbdad21d1453",
+  "patched_sha256": "f953b27c3e53c125e6d931bb35d698b5e39662485b972e056447ef9b09a61909",
+  "rule": "changes are applied in id order; each uses the first entry (primary, then alternatives in order) whose anchor matches exactly one line inside its function in the file as changed so far; a walk then moves from that line to the first line matching the walk anchor; a required change with no such entry stops the replay. C08 turns the body of _handle_request into _handle_request_body, so C09-C14 look there (function_in_unpatched_file names where the lines are before the replay); C14's anchor is the line C13 writes. The authoritative check is `replay_p2d.py --check` on the site file",
+  "match_modes": {
+    "equal": "the line with leading and trailing white space removed equals the anchor",
+    "prefix": "the line with leading and trailing white space removed starts with the anchor",
+    "regex": "Python re.search of the anchor on the raw line (indentation included)",
+    "scope_end": "no anchor: after the last non-blank line of the function or class"
+  },
+  "changes": [
+    {
+      "id": "C01",
+      "name": "import pd_diagnostics",
+      "function": "<module>",
+      "function_in_unpatched_file": "<module>",
+      "primary_anchor_written_by": null,
+      "required": true,
+      "module_level": true,
+      "primary": {
+        "rank": 1,
+        "match": "equal",
+        "anchor": "from vllm.v1.request import RequestStatus",
+        "op": "before",
+        "indent_relative_to_anchor": 0,
+        "walk": null,
+        "before_blank_lines": false,
+        "before_decorators": false,
+        "reads_from_line": null,
+        "keeps_line": false
+      },
+      "alternatives": [
+        {
+          "rank": 2,
+          "match": "prefix",
+          "anchor": "from vllm.v1.kv_cache_interface import (",
+          "op": "before",
+          "indent_relative_to_anchor": 0,
+          "walk": null,
+          "before_blank_lines": false,
+          "before_decorators": false,
+          "reads_from_line": null,
+          "keeps_line": false
+        }
+      ]
+    },
+    {
+      "id": "C02",
+      "name": "module helpers",
+      "function": "<module>",
+      "function_in_unpatched_file": "<module>",
+      "primary_anchor_written_by": null,
+      "required": true,
+      "module_level": true,
+      "primary": {
+        "rank": 1,
+        "match": "equal",
+        "anchor": "KV_CACHE_BUFFER_ALIGNMENT = 2 * 1024 * 1024",
+        "op": "after",
+        "indent_relative_to_anchor": 0,
+        "walk": null,
+        "before_blank_lines": false,
+        "before_decorators": false,
+        "reads_from_line": null,
+        "keeps_line": false
+      },
+      "alternatives": [
+        {
+          "rank": 2,
+          "match": "prefix",
+          "anchor": "MAX_REQUESTS_PER_PEER_HANDLER =",
+          "op": "after",
+          "indent_relative_to_anchor": 0,
+          "walk": null,
+          "before_blank_lines": false,
+          "before_decorators": false,
+          "reads_from_line": null,
+          "keeps_line": false
+        },
+        {
+          "rank": 3,
+          "match": "prefix",
+          "anchor": "class RemotePortInfo(",
+          "op": "before",
+          "indent_relative_to_anchor": 0,
+          "walk": null,
+          "before_blank_lines": true,
+          "before_decorators": true,
+          "reads_from_line": null,
+          "keeps_line": false
+        }
+      ]
+    },
+    {
+      "id": "C03",
+      "name": "ReqMeta.pd_execution_id",
+      "function": "ReqMeta",
+      "function_in_unpatched_file": "ReqMeta",
+      "primary_anchor_written_by": null,
+      "required": true,
+      "module_level": false,
+      "primary": {
+        "rank": 1,
+        "match": "scope_end",
+        "anchor": null,
+        "op": "after",
+        "indent_relative_to_anchor": 0,
+        "walk": null,
+        "before_blank_lines": false,
+        "before_decorators": false,
+        "reads_from_line": null,
+        "keeps_line": false
+      },
+      "alternatives": []
+    },
+    {
+      "id": "C04",
+      "name": "receiver state",
+      "function": "KVCacheRecvingThread.__init__",
+      "function_in_unpatched_file": "KVCacheRecvingThread.__init__",
+      "primary_anchor_written_by": null,
+      "required": true,
+      "module_level": false,
+      "primary": {
+        "rank": 1,
+        "match": "equal",
+        "anchor": "self.request_task_counts_lock = threading.Lock()",
+        "op": "after",
+        "indent_relative_to_anchor": 0,
+        "walk": null,
+        "before_blank_lines": false,
+        "before_decorators": false,
+        "reads_from_line": null,
+        "keeps_line": false
+      },
+      "alternatives": [
+        {
+          "rank": 2,
+          "match": "prefix",
+          "anchor": "super().__init__(",
+          "op": "after",
+          "indent_relative_to_anchor": 0,
+          "walk": null,
+          "before_blank_lines": false,
+          "before_decorators": false,
+          "reads_from_line": null,
+          "keeps_line": false
+        }
+      ]
+    },
+    {
+      "id": "C05",
+      "name": "add_request parameters",
+      "function": "KVCacheRecvingThread.add_request",
+      "function_in_unpatched_file": "KVCacheRecvingThread.add_request",
+      "primary_anchor_written_by": null,
+      "required": true,
+      "module_level": false,
+      "primary": {
+        "rank": 1,
+        "match": "equal",
+        "anchor": "remote_block_ids_replicate_k: BlockIds | None = None,",
+        "op": "after",
+        "indent_relative_to_anchor": 0,
+        "walk": null,
+        "before_blank_lines": false,
+        "before_decorators": false,
+        "reads_from_line": null,
+        "keeps_line": false
+      },
+      "alternatives": [
+        {
+          "rank": 2,
+          "match": "prefix",
+          "anchor": "def add_request(",
+          "op": "before",
+          "indent_relative_to_anchor": 4,
+          "walk": {
+            "direction": "fwd",
+            "match": "prefix",
+            "anchor": ")",
+            "may_stop_on_anchor_line": false
+          },
+          "before_blank_lines": false,
+          "before_decorators": false,
+          "reads_from_line": null,
+          "keeps_line": false
+        }
+      ]
+    },
+    {
+      "id": "C06",
+      "name": "add_request task identity",
+      "function": "KVCacheRecvingThread.add_request",
+      "function_in_unpatched_file": "KVCacheRecvingThread.add_request",
+      "primary_anchor_written_by": null,
+      "required": true,
+      "module_level": false,
+      "primary": {
+        "rank": 1,
+        "match": "equal",
+        "anchor": "logger.debug(\"Adding request %s to the queue.Trans info:%s\", request_id, trans_info)",
+        "op": "after",
+        "indent_relative_to_anchor": 0,
+        "walk": null,
+        "before_blank_lines": false,
+        "before_decorators": false,
+        "reads_from_line": null,
+        "keeps_line": false
+      },
+      "alternatives": [
+        {
+          "rank": 2,
+          "match": "equal",
+          "anchor": "self.request_queue.put(trans_info)",
+          "op": "before",
+          "indent_relative_to_anchor": 0,
+          "walk": null,
+          "before_blank_lines": false,
+          "before_decorators": false,
+          "reads_from_line": null,
+          "keeps_line": false
+        }
+      ]
+    },
+    {
+      "id": "C07",
+      "name": "_submit_request submitted_ns",
+      "function": "KVCacheRecvingThread._submit_request",
+      "function_in_unpatched_file": "KVCacheRecvingThread._submit_request",
+      "primary_anchor_written_by": null,
+      "required": true,
+      "module_level": false,
+      "primary": {
+        "rank": 1,
+        "match": "equal",
+        "anchor": "peer_key = (request_data[\"remote_host\"], request_data[\"remote_handshake_port\"])",
+        "op": "after",
+        "indent_relative_to_anchor": 0,
+        "walk": null,
+        "before_blank_lines": false,
+        "before_decorators": false,
+        "reads_from_line": null,
+        "keeps_line": false
+      },
+      "alternatives": [
+        {
+          "rank": 2,
+          "match": "prefix",
+          "anchor": "def _submit_request(",
+          "op": "before",
+          "indent_relative_to_anchor": 0,
+          "walk": {
+            "direction": "fwd",
+            "match": "statement",
+            "anchor": null,
+            "may_stop_on_anchor_line": false
+          },
+          "before_blank_lines": false,
+          "before_decorators": false,
+          "reads_from_line": null,
+          "keeps_line": false
+        }
+      ]
+    },
+    {
+      "id": "C08",
+      "name": "_handle_request wrapper",
+      "function": "KVCacheRecvingThread",
+      "function_in_unpatched_file": "KVCacheRecvingThread",
+      "primary_anchor_written_by": null,
+      "required": true,
+      "module_level": false,
+      "primary": {
+        "rank": 1,
+        "match": "equal",
+        "anchor": "def _handle_request(self, req_meta: dict[str, Any]):",
+        "op": "after",
+        "indent_relative_to_anchor": 0,
+        "walk": null,
+        "before_blank_lines": false,
+        "before_decorators": false,
+        "reads_from_line": null,
+        "keeps_line": false
+      },
+      "alternatives": [
+        {
+          "rank": 2,
+          "match": "prefix",
+          "anchor": "def _handle_request(self",
+          "op": "after",
+          "indent_relative_to_anchor": 0,
+          "walk": {
+            "direction": "fwd",
+            "match": "regex",
+            "anchor": ":\\s*(#.*)?$",
+            "may_stop_on_anchor_line": true
+          },
+          "before_blank_lines": false,
+          "before_decorators": false,
+          "reads_from_line": null,
+          "keeps_line": false
+        }
+      ]
+    },
+    {
+      "id": "C09",
+      "name": "skip after failure",
+      "function": "KVCacheRecvingThread._handle_request_body",
+      "function_in_unpatched_file": "KVCacheRecvingThread._handle_request",
+      "primary_anchor_written_by": null,
+      "required": true,
+      "module_level": false,
+      "primary": {
+        "rank": 1,
+        "match": "equal",
+        "anchor": "logger.warning(\"Skipping KV cache transfer for request. remote_request_id=%s. \", remote_request_id)",
+        "op": "after",
+        "indent_relative_to_anchor": 0,
+        "walk": null,
+        "before_blank_lines": false,
+        "before_decorators": false,
+        "reads_from_line": null,
+        "keeps_line": false
+      },
+      "alternatives": [
+        {
+          "rank": 2,
+          "match": "equal",
+          "anchor": "if transfer_failed:",
+          "op": "after",
+          "indent_relative_to_anchor": 4,
+          "walk": null,
+          "before_blank_lines": false,
+          "before_decorators": false,
+          "reads_from_line": null,
+          "keeps_line": false
+        }
+      ]
+    },
+    {
+      "id": "C10",
+      "name": "transfer outcome",
+      "function": "KVCacheRecvingThread._handle_request_body",
+      "function_in_unpatched_file": "KVCacheRecvingThread._handle_request",
+      "primary_anchor_written_by": null,
+      "required": true,
+      "module_level": false,
+      "primary": {
+        "rank": 1,
+        "match": "equal",
+        "anchor": "self._transfer_kv_cache_all_groups(req_meta)",
+        "op": "after",
+        "indent_relative_to_anchor": 0,
+        "walk": null,
+        "before_blank_lines": false,
+        "before_decorators": false,
+        "reads_from_line": null,
+        "keeps_line": false
+      },
+      "alternatives": []
+    },
+    {
+      "id": "C11",
+      "name": "transfer exception",
+      "function": "KVCacheRecvingThread._handle_request_body",
+      "function_in_unpatched_file": "KVCacheRecvingThread._handle_request",
+      "primary_anchor_written_by": null,
+      "required": true,
+      "module_level": false,
+      "primary": {
+        "rank": 1,
+        "match": "equal",
+        "anchor": "self._transfer_kv_cache_all_groups(req_meta)",
+        "op": "after",
+        "indent_relative_to_anchor": 4,
+        "walk": {
+          "direction": "fwd",
+          "match": "prefix",
+          "anchor": "except Exception",
+          "may_stop_on_anchor_line": false
+        },
+        "before_blank_lines": false,
+        "before_decorators": false,
+        "reads_from_line": "exc",
+        "keeps_line": false
+      },
+      "alternatives": []
+    },
+    {
+      "id": "C12",
+      "name": "tracker_completed",
+      "function": "KVCacheRecvingThread._handle_request_body",
+      "function_in_unpatched_file": "KVCacheRecvingThread._handle_request",
+      "primary_anchor_written_by": null,
+      "required": true,
+      "module_level": false,
+      "primary": {
+        "rank": 1,
+        "match": "equal",
+        "anchor": "all_tasks_done = self._mark_request_task_done(request_id, all_task_done)",
+        "op": "after",
+        "indent_relative_to_anchor": 0,
+        "walk": null,
+        "before_blank_lines": false,
+        "before_decorators": false,
+        "reads_from_line": null,
+        "keeps_line": false
+      },
+      "alternatives": [
+        {
+          "rank": 2,
+          "match": "prefix",
+          "anchor": "all_tasks_done = self._mark_request_task_done(",
+          "op": "after",
+          "indent_relative_to_anchor": 0,
+          "walk": null,
+          "before_blank_lines": false,
+          "before_decorators": false,
+          "reads_from_line": null,
+          "keeps_line": false
+        }
+      ]
+    },
+    {
+      "id": "C13",
+      "name": "reformat stage",
+      "function": "KVCacheRecvingThread._handle_request_body",
+      "function_in_unpatched_file": "KVCacheRecvingThread._handle_request",
+      "primary_anchor_written_by": null,
+      "required": true,
+      "module_level": false,
+      "primary": {
+        "rank": 1,
+        "match": "prefix",
+        "anchor": "self._reformat_pending_kv_caches(",
+        "op": "replace",
+        "indent_relative_to_anchor": 0,
+        "walk": null,
+        "before_blank_lines": false,
+        "before_decorators": false,
+        "reads_from_line": "arg",
+        "keeps_line": true
+      },
+      "alternatives": []
+    },
+    {
+      "id": "C14",
+      "name": "reformat failure",
+      "function": "KVCacheRecvingThread._handle_request_body",
+      "function_in_unpatched_file": "KVCacheRecvingThread._handle_request",
+      "primary_anchor_written_by": "C13",
+      "required": true,
+      "module_level": false,
+      "primary": {
+        "rank": 1,
+        "match": "regex",
+        "anchor": "^\\s*with self\\._pd_reformat_stage\\(req_meta, \\w+\\):\\s*$",
+        "op": "after",
+        "indent_relative_to_anchor": 4,
+        "walk": {
+          "direction": "fwd",
+          "match": "prefix",
+          "anchor": "except Exception",
+          "may_stop_on_anchor_line": false
+        },
+        "before_blank_lines": false,
+        "before_decorators": false,
+        "reads_from_line": "exc",
+        "keeps_line": false
+      },
+      "alternatives": []
+    },
+    {
+      "id": "C15",
+      "name": "receiver methods",
+      "function": "KVCacheRecvingThread",
+      "function_in_unpatched_file": "KVCacheRecvingThread",
+      "primary_anchor_written_by": null,
+      "required": true,
+      "module_level": false,
+      "primary": {
+        "rank": 1,
+        "match": "prefix",
+        "anchor": "def _send_done_signal_to_free_remote_port(",
+        "op": "before",
+        "indent_relative_to_anchor": 0,
+        "walk": null,
+        "before_blank_lines": false,
+        "before_decorators": true,
+        "reads_from_line": null,
+        "keeps_line": false
+      },
+      "alternatives": [
+        {
+          "rank": 2,
+          "match": "prefix",
+          "anchor": "def _transfer_kv_cache_all_groups(",
+          "op": "before",
+          "indent_relative_to_anchor": 0,
+          "walk": null,
+          "before_blank_lines": false,
+          "before_decorators": true,
+          "reads_from_line": null,
+          "keeps_line": false
+        },
+        {
+          "rank": 3,
+          "match": "prefix",
+          "anchor": "def _send_done_recv_signal(",
+          "op": "before",
+          "indent_relative_to_anchor": 0,
+          "walk": null,
+          "before_blank_lines": false,
+          "before_decorators": true,
+          "reads_from_line": null,
+          "keeps_line": false
+        }
+      ]
+    },
+    {
+      "id": "C16",
+      "name": "full prefix hit",
+      "function": "KVCacheRecvingThread._transfer_kv_cache_all_groups",
+      "function_in_unpatched_file": "KVCacheRecvingThread._transfer_kv_cache_all_groups",
+      "primary_anchor_written_by": null,
+      "required": true,
+      "module_level": false,
+      "primary": {
+        "rank": 1,
+        "match": "equal",
+        "anchor": "if num_local_blocks == 0 and not has_replicate_k_blocks:",
+        "op": "after",
+        "indent_relative_to_anchor": 4,
+        "walk": null,
+        "before_blank_lines": false,
+        "before_decorators": false,
+        "reads_from_line": null,
+        "keeps_line": false
+      },
+      "alternatives": [
+        {
+          "rank": 2,
+          "match": "prefix",
+          "anchor": "if num_local_blocks == 0",
+          "op": "after",
+          "indent_relative_to_anchor": 4,
+          "walk": null,
+          "before_blank_lines": false,
+          "before_decorators": false,
+          "reads_from_line": null,
+          "keeps_line": false
+        }
+      ]
+    },
+    {
+      "id": "C17",
+      "name": "meta_fetch begin",
+      "function": "KVCacheRecvingThread._transfer_kv_cache_all_groups",
+      "function_in_unpatched_file": "KVCacheRecvingThread._transfer_kv_cache_all_groups",
+      "primary_anchor_written_by": null,
+      "required": true,
+      "module_level": false,
+      "primary": {
+        "rank": 1,
+        "match": "equal",
+        "anchor": "# Check if we have the remote metadata cached.",
+        "op": "after",
+        "indent_relative_to_anchor": 0,
+        "walk": null,
+        "before_blank_lines": false,
+        "before_decorators": false,
+        "reads_from_line": null,
+        "keeps_line": false
+      },
+      "alternatives": [
+        {
+          "rank": 2,
+          "match": "prefix",
+          "anchor": "has_remote_metadata = (",
+          "op": "before",
+          "indent_relative_to_anchor": 0,
+          "walk": {
+            "direction": "back",
+            "match": "equal",
+            "anchor": "with self.remote_metadata_lock:",
+            "may_stop_on_anchor_line": false
+          },
+          "before_blank_lines": false,
+          "before_decorators": false,
+          "reads_from_line": null,
+          "keeps_line": false
+        }
+      ]
+    },
+    {
+      "id": "C18",
+      "name": "metadata_request",
+      "function": "KVCacheRecvingThread._transfer_kv_cache_all_groups",
+      "function_in_unpatched_file": "KVCacheRecvingThread._transfer_kv_cache_all_groups",
+      "primary_anchor_written_by": null,
+      "required": true,
+      "module_level": false,
+      "primary": {
+        "rank": 1,
+        "match": "prefix",
+        "anchor": "self._get_remote_metadata(",
+        "op": "replace",
+        "indent_relative_to_anchor": 0,
+        "walk": null,
+        "before_blank_lines": false,
+        "before_decorators": false,
+        "reads_from_line": null,
+        "keeps_line": true
+      },
+      "alternatives": []
+    },
+    {
+      "id": "C19",
+      "name": "meta_fetch end",
+      "function": "KVCacheRecvingThread._transfer_kv_cache_all_groups",
+      "function_in_unpatched_file": "KVCacheRecvingThread._transfer_kv_cache_all_groups",
+      "primary_anchor_written_by": null,
+      "required": true,
+      "module_level": false,
+      "primary": {
+        "rank": 1,
+        "match": "equal",
+        "anchor": "remote_layer_name_to_idx = build_layer_name_to_metadata_idx(remote_kv_group2layeridx)",
+        "op": "before",
+        "indent_relative_to_anchor": 0,
+        "walk": null,
+        "before_blank_lines": false,
+        "before_decorators": false,
+        "reads_from_line": null,
+        "keeps_line": false
+      },
+      "alternatives": [
+        {
+          "rank": 2,
+          "match": "prefix",
+          "anchor": "session_id = ",
+          "op": "before",
+          "indent_relative_to_anchor": 0,
+          "walk": null,
+          "before_blank_lines": false,
+          "before_decorators": false,
+          "reads_from_line": null,
+          "keeps_line": false
+        },
+        {
+          "rank": 3,
+          "match": "prefix",
+          "anchor": "req_start_time = time.perf_counter()",
+          "op": "before",
+          "indent_relative_to_anchor": 0,
+          "walk": null,
+          "before_blank_lines": false,
+          "before_decorators": false,
+          "reads_from_line": null,
+          "keeps_line": false
+        }
+      ]
+    },
+    {
+      "id": "C20",
+      "name": "prepare begin",
+      "function": "KVCacheRecvingThread._transfer_kv_cache_all_groups",
+      "function_in_unpatched_file": "KVCacheRecvingThread._transfer_kv_cache_all_groups",
+      "primary_anchor_written_by": null,
+      "required": true,
+      "module_level": false,
+      "primary": {
+        "rank": 1,
+        "match": "prefix",
+        "anchor": "req_start_time = time.perf_counter()",
+        "op": "after",
+        "indent_relative_to_anchor": 0,
+        "walk": null,
+        "before_blank_lines": false,
+        "before_decorators": false,
+        "reads_from_line": null,
+        "keeps_line": false
+      },
+      "alternatives": []
+    },
+    {
+      "id": "C21",
+      "name": "prepare end",
+      "function": "KVCacheRecvingThread._transfer_kv_cache_all_groups",
+      "function_in_unpatched_file": "KVCacheRecvingThread._transfer_kv_cache_all_groups",
+      "primary_anchor_written_by": null,
+      "required": true,
+      "module_level": false,
+      "primary": {
+        "rank": 1,
+        "match": "equal",
+        "anchor": "if not src_list:",
+        "op": "before",
+        "indent_relative_to_anchor": 0,
+        "walk": null,
+        "before_blank_lines": false,
+        "before_decorators": false,
+        "reads_from_line": null,
+        "keeps_line": false
+      },
+      "alternatives": [
+        {
+          "rank": 2,
+          "match": "regex",
+          "anchor": "self\\.engine\\.batch_transfer_sync_read\\(",
+          "op": "before",
+          "indent_relative_to_anchor": 0,
+          "walk": null,
+          "before_blank_lines": false,
+          "before_decorators": false,
+          "reads_from_line": null,
+          "keeps_line": false
+        }
+      ]
+    },
+    {
+      "id": "C22",
+      "name": "no work",
+      "function": "KVCacheRecvingThread._transfer_kv_cache_all_groups",
+      "function_in_unpatched_file": "KVCacheRecvingThread._transfer_kv_cache_all_groups",
+      "primary_anchor_written_by": null,
+      "required": false,
+      "module_level": false,
+      "primary": {
+        "rank": 1,
+        "match": "equal",
+        "anchor": "if not src_list:",
+        "op": "after",
+        "indent_relative_to_anchor": 4,
+        "walk": null,
+        "before_blank_lines": false,
+        "before_decorators": false,
+        "reads_from_line": null,
+        "keeps_line": false
+      },
+      "alternatives": []
+    },
+    {
+      "id": "C23",
+      "name": "observed READ",
+      "function": "KVCacheRecvingThread._transfer_kv_cache_all_groups",
+      "function_in_unpatched_file": "KVCacheRecvingThread._transfer_kv_cache_all_groups",
+      "primary_anchor_written_by": null,
+      "required": true,
+      "module_level": false,
+      "primary": {
+        "rank": 1,
+        "match": "regex",
+        "anchor": "self\\.engine\\.batch_transfer_sync_read\\(.*\\)\\s*$",
+        "op": "sub",
+        "indent_relative_to_anchor": 0,
+        "walk": null,
+        "before_blank_lines": false,
+        "before_decorators": false,
+        "reads_from_line": null,
+        "keeps_line": false
+      },
+      "alternatives": []
+    },
+    {
+      "id": "C24",
+      "name": "consumer link",
+      "function": "MooncakeConnectorScheduler.build_connector_meta",
+      "function_in_unpatched_file": "MooncakeConnectorScheduler.build_connector_meta",
+      "primary_anchor_written_by": null,
+      "required": true,
+      "module_level": false,
+      "primary": {
+        "rank": 1,
+        "match": "equal",
+        "anchor": "# Clear the list once workers start the transfers",
+        "op": "before",
+        "indent_relative_to_anchor": 4,
+        "walk": null,
+        "before_blank_lines": true,
+        "before_decorators": false,
+        "reads_from_line": null,
+        "keeps_line": false
+      },
+      "alternatives": [
+        {
+          "rank": 2,
+          "match": "equal",
+          "anchor": "self._reqs_need_recv.clear()",
+          "op": "before",
+          "indent_relative_to_anchor": 4,
+          "walk": null,
+          "before_blank_lines": true,
+          "before_decorators": false,
+          "reads_from_line": null,
+          "keeps_line": false
+        }
+      ]
+    },
+    {
+      "id": "C25",
+      "name": "producer offer",
+      "function": "MooncakeConnectorScheduler.request_finished",
+      "function_in_unpatched_file": "MooncakeConnectorScheduler.request_finished",
+      "primary_anchor_written_by": null,
+      "required": true,
+      "module_level": false,
+      "primary": {
+        "rank": 1,
+        "match": "equal",
+        "anchor": "self._reqs_need_send[request.request_id] = time.time()",
+        "op": "after",
+        "indent_relative_to_anchor": -4,
+        "walk": null,
+        "before_blank_lines": false,
+        "before_decorators": false,
+        "reads_from_line": null,
+        "keeps_line": false
+      },
+      "alternatives": [
+        {
+          "rank": 2,
+          "match": "prefix",
+          "anchor": "return delay_free_blocks, ",
+          "op": "before",
+          "indent_relative_to_anchor": 0,
+          "walk": null,
+          "before_blank_lines": true,
+          "before_decorators": false,
+          "reads_from_line": null,
+          "keeps_line": false
+        }
+      ]
+    },
+    {
+      "id": "C26",
+      "name": "pull offset counter",
+      "function": "MooncakeConnectorWorker.start_load_kv",
+      "function_in_unpatched_file": "MooncakeConnectorWorker.start_load_kv",
+      "primary_anchor_written_by": null,
+      "required": true,
+      "module_level": false,
+      "primary": {
+        "rank": 1,
+        "match": "prefix",
+        "anchor": "for shard_idx, remote_ports in enumerate(",
+        "op": "before",
+        "indent_relative_to_anchor": 0,
+        "walk": null,
+        "before_blank_lines": false,
+        "before_decorators": false,
+        "reads_from_line": null,
+        "keeps_line": false
+      },
+      "alternatives": []
+    },
+    {
+      "id": "C27",
+      "name": "add_request kwargs",
+      "function": "MooncakeConnectorWorker.start_load_kv",
+      "function_in_unpatched_file": "MooncakeConnectorWorker.start_load_kv",
+      "primary_anchor_written_by": null,
+      "required": true,
+      "module_level": false,
+      "primary": {
+        "rank": 1,
+        "match": "equal",
+        "anchor": "remote_block_ids_replicate_k=remote_block_ids_replicate_k_for_port,",
+        "op": "after",
+        "indent_relative_to_anchor": 0,
+        "walk": null,
+        "before_blank_lines": false,
+        "before_decorators": false,
+        "reads_from_line": null,
+        "keeps_line": false
+      },
+      "alternatives": [
+        {
+          "rank": 2,
+          "match": "prefix",
+          "anchor": "self.kv_recv_thread.add_request(",
+          "op": "before",
+          "indent_relative_to_anchor": 4,
+          "walk": {
+            "direction": "fwd",
+            "match": "equal",
+            "anchor": ")",
+            "may_stop_on_anchor_line": false
+          },
+          "before_blank_lines": false,
+          "before_decorators": false,
+          "reads_from_line": null,
+          "keeps_line": false
+        }
+      ]
+    },
+    {
+      "id": "C28",
+      "name": "pull offset increment",
+      "function": "MooncakeConnectorWorker.start_load_kv",
+      "function_in_unpatched_file": "MooncakeConnectorWorker.start_load_kv",
+      "primary_anchor_written_by": null,
+      "required": true,
+      "module_level": false,
+      "primary": {
+        "rank": 1,
+        "match": "prefix",
+        "anchor": "self.kv_recv_thread.add_request(",
+        "op": "after",
+        "indent_relative_to_anchor": 0,
+        "walk": {
+          "direction": "fwd",
+          "match": "equal",
+          "anchor": ")",
+          "may_stop_on_anchor_line": false
+        },
+        "before_blank_lines": false,
+        "before_decorators": false,
+        "reads_from_line": null,
+        "keeps_line": false
+      },
+      "alternatives": []
+    }
+  ]
+}

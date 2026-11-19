@@ -1,0 +1,18 @@
+== original OBS library
+   setup rc 0
+   python native_tid 461
+   put_batch rc 0
+   get ok True [4096, 4096, 4096, 4096]
+   client exit: 0
+   [BatchPutTiming] lines: 0
+   err: E1118 18:11:00.132890   461 transfer_metadata_plugin.cpp:292] GET http://127.0.0.1:8080/metadata?key=mooncake%2Fram%2F127.0.0.1%3A13295 http=404 body: metadata not found
+== replacement library (patch 04)
+   setup rc 0
+   python native_tid 540
+   put_batch rc 0
+   get ok True [4096, 4096, 4096, 4096]
+   client exit: 0
+   [BatchPutTiming] lines: 1
+   glog level+date=I<mmdd> time=18:11:07.047885 tid=540 source=client_service.cpp:3327]
+   [BatchPutTiming] keys=4 bytes=16384 phase1_start_batch_put_us=241 phase2_submit_transfers_us=9 phase3_wait_transfers_us=277 phase4_finalize_batch_put_us=120 total_us=648 timing_scope=normal_full status=ok complete=true failed_keys=0
+   err: E1118 18:11:07.043567   540 transfer_metadata_plugin.cpp:292] GET http://127.0.0.1:8080/metadata?key=mooncake%2Fram%2F127.0.0.1%3A13740 http=404 body: metadata not found

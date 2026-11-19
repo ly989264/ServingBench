@@ -1,0 +1,53 @@
+# Extra monkey-patch targets for t51-glm53-kit fieldcheck (tools/derive_targets.py --extra), against
+# inputs/targets_derived.txt of 62f789b. Format as derive_targets reads it: one name per line, "module: <dotted>".
+# Why each is needed is noted per block; none of these functions is changed by the ports, so the derivation
+# (functions whose body a port changes) cannot find them.
+
+# 11th source file of the vllm-ascend package (63036ac): D runs AsyncRecomputeScheduler. schedule/_schedule are
+# already in the list as names; the module is not.
+module: vllm_ascend.core.recompute_scheduler
+
+# wait_for_put chain: model_runner_v1.execute_model -> AscendStoreConnector.handle_preemptions
+# (ascend_store_connector.py:290) -> KVPoolWorker.handle_released_saves (pool_worker.py:3174) ->
+# wait_for_requests_saved. Replacing either skips stages.wait_for_put.
+handle_preemptions
+handle_released_saves
+module: vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.ascend_store_connector
+
+# The connector dispatch between the runner and the pool worker: start_load_kv / wait_for_save /
+# handle_preemptions reach KVPoolWorker through AscendMultiConnector (ascend_multi_connector.py:21) and vLLM's
+# MultiConnector (both unchanged by the ports). The names are in the list; the modules are not.
+bind_connector_metadata
+module: vllm_ascend.distributed.kv_transfer.ascend_multi_connector
+module: vllm.distributed.kv_transfer.kv_connector.v1.multi_connector
+
+# D's device-timing read point (C14): the async output's get_output() is called by the worker's
+# async_output_busy_loop / enqueue_output (multiproc_executor.py:1011 / :982-989). A patch that consumes the
+# output without get_output() delays D's worker_summary to the fallback read; nothing is lost.
+# vllm_ascend/patch/platform/patch_multiproc_executor.py (imported when DYNAMIC_EPLB or EXPERT_MAP_RECORD is set)
+# replaces MultiprocExecutor (:212) and the worker start-up in d4ad49796, not these two methods; a site change
+# to it is what this block is for.
+get_output
+enqueue_output
+async_output_busy_loop
+module: vllm.v1.executor.multiproc_executor
+
+# Whole-class replacement: patch_balance_schedule.py:897 shows the pattern (vllm.v1.core.sched.scheduler.Scheduler
+# = BalanceScheduler). Function names do not catch "module.Class = Other"; these are the classes whose methods
+# carry the measurement points.
+Scheduler
+AsyncScheduler
+RecomputeScheduler
+AsyncRecomputeScheduler
+NPUModelRunner
+AsyncGPUModelRunnerOutput
+AscendStoreConnector
+AscendMultiConnector
+KVPoolWorker
+KVPoolScheduler
+KVTransferThread
+KVCacheStoreSendingThread
+KVCacheStoreRecvingThread
+ChunkedTokenDatabase
+AscendConnectorMetadata
+MooncakeBackend

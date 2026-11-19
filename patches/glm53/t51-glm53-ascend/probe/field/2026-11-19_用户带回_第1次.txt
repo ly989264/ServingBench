@@ -1,0 +1,13 @@
+iterations 20, size 2048, matmuls 32; end event not yet done right after launch: 20/20
+device (event elapsed_time)        median 2.010 ms
+host perf_counter + synchronize    median 2.021 ms
+host launch only (no synchronize)  median 0.048 ms
+device vs synchronized: CLOSE (|diff| 0.010 ms, allowed 0.505 ms)
+
+# 第 2 次（用户在 glm53 容器里跑，11:33）
+torch 2.10.0a0, torch_npu 2.10.0.post4+git5dd8ef3, Ascend910_9392, aclgraph replay
+iterations 20, size 2048, matmuls 32; end event not yet done right after launch: 20/20
+device (event elapsed_time)        median 2.010 ms
+host perf_counter + synchronize    median 2.024 ms
+host launch only (no synchronize)  median 0.050 ms
+device vs synchronized: CLOSE (|diff| 0.014 ms, allowed 0.506 ms)

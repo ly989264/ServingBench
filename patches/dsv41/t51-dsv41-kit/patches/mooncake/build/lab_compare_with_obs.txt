@@ -1,0 +1,18 @@
+== version string new: 0.3.13 (git: 78566d45)
+== version string obs: 0.3.13 (git: 78566d45)
+== assertion strings new/obs: 0 / 0
+== [BatchPutTiming] new/obs: 2 / 0
+== NEEDED new:
+libzstd.so.1 libtransfer_engine.so libxxhash.so.0 libnuma.so.1 liburing.so.2 libascendcl.so libmooncake_common.so libyaml-cpp.so.0.7 libasio.so libibverbs.so.1 libgflags.so.2.2 libjsoncpp.so.25 ascend_transport.so libglog.so.0 libstdc++.so.6 libgcc_s.so.1 libc.so.6 ld-linux-aarch64.so.1
+== store.so takes 46 symbols from the store library; missing in new: 0
+== defined: obs 12719, new 12721, only obs 2, only new 4
+-- only obs:
+mooncake::Client::CollectResults(std::vector<mooncake::PutOperation, std::allocator<mooncake::PutOperation> > const&)
+mooncake::Client::BatchWriteWhenPreferSameNode(std::vector<mooncake::PutOperation, std::allocator<mooncake::PutOperation> >&, bool)
+-- only new:
+mooncake::DurationUsBetween(std::chrono::time_point<std::chrono::_V2::steady_clock, std::chrono::duration<long, std::ratio<1l, 1000000000l> > >, std::chrono::ti
+mooncake::Client::CollectResults(std::vector<mooncake::PutOperation, std::allocator<mooncake::PutOperation> > const&, unsigned long&)
+mooncake::Client::BatchWriteWhenPreferSameNode(std::vector<mooncake::PutOperation, std::allocator<mooncake::PutOperation> >&, bool, std::chrono::time_point<std:
+mooncake::Client::LogBatchWriteTiming(unsigned long, bool, unsigned long, unsigned long, std::chrono::time_point<std::chrono::_V2::steady_clock, std::chrono::du
+== undefined (imports): obs 724, new 724, only new 0
+-- imports only in new:

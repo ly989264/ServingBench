@@ -1,0 +1,16 @@
+# Patched-state baselines embedded in t51_glm53_check.py (glm53-6): the public trees with each final delivery applied.
+# vLLM: v0.30.0 (ced6857a) + t51-glm53-vllm 40152b2, patches/vllm (the files/ tree copied over the public tree)
+7e2ec359f5781ccd987fb9904f2581e15671b8b43c49f8a4dd615cf9e9aafe4a  t51-vllm-v0.30.0-pd-diag.patch
+0226c1ec0b9b4cc84a38881edd8dbfcde177f9b267718657b8260bc4cd9e9c36  SHA256SUMS.before
+5a7084855419155fecae1198225e93571c807fb15968f377b76b65e55aabb594  SHA256SUMS.after
+3bd291b64fafcb623e39c2e096dcc4ee8feb388cfcb1365dbe2b716a7796b206  NEW_FILES.txt
+#   25 runtime files, all under vllm/; SHA256SUMS.after 25/25 on the patched tree, SHA256SUMS.before 0 failures on v0.30.0
+# vllm-ascend: d4ad49796 + t51-glm53-ascend dc92d32, patches/vllm-ascend (11 files; identical to ef5bd17's)
+024a8b3e1cbbf36823fb6f60e9a204ca350f45524cec40d0856faa0a0f334e99  t51-vllm-ascend-d4ad49796-pd-diag.patch
+4c2d978a0017a2288fe99fd1401ba0215cd36490491e28db659d4436e5138e33  SHA256SUMS.after
+#   SHA256SUMS.after 11/11 on the patched tree
+# P/D connector (t51-glm53-p2d a9e9695): replayed on site, so judged by structure (p2d= on the strict line), not by a hash.
+#   Embedded: replay_p2d.py 02304c8f, extra_checks.py 2759c06f, expected p2d_extra line from the replacement f953b27c.
+# Mooncake: site original libmooncake_store.so 17610953 / 3bf82f8b0c5ab715 (field check f-1);
+#   replacement (Mooncake 78566d4 + patch 04 0625b51e, msgpack-c cpp-9.0.0, stripped and relinked like the site): 15402248 bytes
+3131784385846064327e858d6dcdb11a6c7674c2162964d52f9ed0e866b52bb8  libmooncake_store.so

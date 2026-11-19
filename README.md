@@ -29,6 +29,7 @@
 | `contracts/` | 《记录格式约定》glm5.3 版 1.3.3（补丁与面板二之间的接口）和 `[PD_DIAG]` 样例 |
 | `panel1/` | 面板一部署包源码（`pack/`）、打包脚本（`tools/build_pack.sh`）、离线测试 |
 | `panel2/` | 面板二部署包源码、更新脚本、诊断工具、手册源文件、离线测试 |
+| `patches/` | 补丁一侧：glm5.3 的 vLLM、vllm-ascend、MooncakeConnectorV1 诊断补丁，环境检测与现场核对脚本，Mooncake 替换库的构建；dsv4.1 版已暂停 |
 | `tools/` | `arrange_boards.py`、`make_inventories.py`、`panels_snapshot.py`、面板一的 `probe/diff/diag_panel1.py` |
 | `manuals/` | 在用手册索引和不在其他目录的手册（占位符版） |
 | `releases/` | 每个在用部署包的 sha256；包本身在 GitHub Release |
@@ -36,6 +37,6 @@
 
 ## 说明
 
-- **面板二源码没有带开发仓库的 git 历史**：历史中有现场值（用户目录、内网地址、本机路径），只导入了当前文件。本仓库的前两个提交分别是 v3 和 v3.1-extra 的源码，二者的差异可直接 `git diff`。面板一的开发目录本来没有 git。
+- **面板二源码和 `patches/` 都没有带开发仓库的 git 历史**：历史中有现场值（用户目录、内网地址、本机路径），只导入了当前文件；`patches/` 另去掉了测试输出、现场带回的输出和二进制，见 [patches/README.md](patches/README.md)。本仓库的前两个提交分别是 v3 和 v3.1-extra 的源码，二者的差异可直接 `git diff`。面板一的开发目录本来没有 git。
 - **大文件放 GitHub Release，不用 Git LFS**：免费账户的 LFS 额度为存储 1 GiB、流量每月 1 GiB，面板二离线包一个就有 398 MB；Release 资产单个上限 2 GiB。tag、资产和发布命令见 [releases/README.md](releases/README.md)。
-- 不在本仓库：本地实验室镜像本身和带密钥的实验室镜像、历史包与旧源码、vLLM / vllm-ascend / Mooncake 补丁（面板这边只放《记录格式约定》）、已填路径版、任何现场值。清单见 [docs/50-已知问题与待办.md](docs/50-已知问题与待办.md)。
+- 不在本仓库：本地实验室镜像本身和带密钥的实验室镜像、历史包与旧源码、已填路径版、任何现场值；T51 的 proxy 补丁尚未交付。清单见 [docs/50-已知问题与待办.md](docs/50-已知问题与待办.md)。
