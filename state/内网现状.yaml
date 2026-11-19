@@ -220,10 +220,11 @@ clusters:
       CLICKHOUSE_MIN_DISK_GB: "85"
       NODE_MIN_DISK_GB: "50"
       CLICKHOUSE_DATA_DIR: ""
-      PROXY_COLLECT: "1（面板手册第 17 步；是否已写入未核实）"
+      PROXY_COLLECT: "1（proxy 手册第 4 步；proxy 补丁和手册已交付，内网还没做，未核实）"
       PROXY_MACHINE: "<proxy机器>"
-      PROXY_LOG_DIR: "<proxy日志目录>"
-      MOONCAKE_LOG_COLLECT: "1（同上）"
+      PROXY_LOG_DIR: "/data/pd-diag/logs/proxy"
+      PULL_RSYNC_FLAGS: "--append --exclude=/proxy/（proxy 手册第 4 步）"
+      MOONCAKE_LOG_COLLECT: "1（面板手册第 17 步，只加 Mooncake 的 3 行；是否已写入未核实）"
       MOONCAKE_LOG_FILES: "<P节点1>=<P 实例日志文件>"
       MOONCAKE_TID_FALLBACK: "0"
     nodes:
@@ -235,8 +236,8 @@ clusters:
     vllm:
       versions: "vLLM v0.30.0；vllm-ascend d4ad49796（现场有本地改动）；MooncakeConnectorV1 + AscendStoreConnector"
       logcfg_before_patch: "D 机器 unset；P 机器检测时没有找到运行中的 vLLM，未得到"
-      patches: "vLLM、vllm-ascend、p2d 三件按打补丁手册分三批装入；可选的 Mooncake 替换库是否已换未核实；proxy 补丁不在打补丁手册内，是否已打未核实"
-    expected_segments: "47 段里 42 段有值；做了 Mooncake 部分后 45 段"
+      patches: "vLLM、vllm-ascend、p2d 三件按打补丁手册分三批装入；可选的 Mooncake 替换库是否已换未核实；proxy 补丁和手册已交付（proxy 补丁包 75fd49e8，proxy 手册 3925bbc7）；内网还没做，未核实"
+    expected_segments: "打补丁第 3 批做完 40 段有值；proxy 手册做完 42 段；做了 Mooncake 部分后 45 段（《执行顺序总表》）"
     grafana:
       boards: ["vllm-pd-request-test-glm53"]
       datasources: ["vllm-pd-clickhouse-test-glm53"]
@@ -471,7 +472,7 @@ unverified:
   - "Grafana 的页面端口、容器名和 GRAFANA_URL"
   - "glm53-1 面板二的 MOCK_RATE、mock 是否在跑、节点目录、CLICKHOUSE_DATA_DIR 的路径"
   - "glm53-1 清单的 vllm_ascend_patched；npu-exporter、node_exporter 的端口（镜像为 8082、9100）"
-  - "test-glm53 的 proxy 补丁与 PROXY_COLLECT、MOONCAKE_LOG_COLLECT 是否已开；Mooncake 替换库是否已换；P 实例的 TP"
+  - "test-glm53：proxy 补丁和手册已交付，内网还没做；proxy 补丁与 PROXY_COLLECT、MOONCAKE_LOG_COLLECT 是否已开未核实；Mooncake 替换库是否已换；P 实例的 TP"
   - "面板一部署包目录 vllm-pd-panel1-update-2 与 vllm-pd-panel1-update-1112 是否都在"
   - "旧面板一的残留（vLLM P/D 文件夹、数据源 Prometheus、旧数据卷）"
   - "Grafana 文件夹、看板、数据源的数量"

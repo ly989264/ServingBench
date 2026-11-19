@@ -12,9 +12,11 @@
 
 **做完是什么样子。**
 - 每个容器的检测脚本报 `verdict vllm=ok ascend=ok(site_local=<n>) p2d=ok mooncake=not_replaced`；做了可选的 Mooncake 部分以后，最后一项是 `mooncake=ok`。
-- 面板二 `test-glm53` 的看板：47 段里 42 段有值；做了 Mooncake 部分以后 45 段。
+- 面板二 `test-glm53` 的看板：第 3 批做完时 47 段里 40 段有值；做完 proxy 手册以后 42 段；再做 Mooncake 部分以后 45 段。段数不是判据。
 
-**总顺序：** 面板手册第 1–15 步 → 本手册 → 面板手册第 16–22 步。面板手册指《面板二：删除 test、安装 test-glm53 操作手册》，步骤号以它为准。
+**总顺序：** 见同一目录的《执行顺序总表》，那一页是唯一入口，行号以它为准。本手册第 1–21 步对应总表第 1、3–6 行；可选的 Mooncake 部分第 27–34 步对应第 11–12 行，要在面板手册第 17 步打开 Mooncake 采集来源以后再做；回滚的第 22–26 步、第 35 步见总表的回滚一节。
+
+面板手册指《面板二：删除 test、安装 test-glm53 操作手册》，步骤号以它为准。
 
 **要先准备好的现场值：**
 
@@ -469,9 +471,9 @@ D 的容器：
 | 做完第几批 | 有值的段（只有经过已打补丁实例的请求才有值） | 仍为空的段 |
 |---|---|---|
 | 第 1、2 批（D） | D 的 req_resolve、tokenizer、add_request、schedule 和 queue_time、alloc、other，start_load_kv 和 submit、wait_for_transfer，forward、sampling、detokenizer；D 第二步起的 schedule、alloc、other、forward、sampling、detokenizer | P 的全部段（P 还没打补丁）；P、D 的 lb_proxy（proxy 采集打开时有值） |
-| 第 3 批（P） | 上面这些，加上 P 的 req_resolve、tokenizer、add_request、schedule 和 queue_time、hash、lookup、alloc、other，wait_for_put，forward、sampling、detokenizer，后台 wait_for_save 和它的 5 个子段；P 的 start_load_kv 和 submit 只在命中缓存池的请求上有值；做了 Mooncake 部分的，后台 wait_for_save/put 下的 3 段 | P 的 api_gateway、P 的 start_load_kv/wait_for_transfer（按设计为空）；没做 Mooncake 部分时，put 下的 3 段 |
+| 第 3 批（P） | 上面这些，加上 P 的 req_resolve、tokenizer、add_request、schedule 和 queue_time、hash、lookup、alloc、other，wait_for_put，forward、sampling、detokenizer，后台 wait_for_save 和它的 5 个子段；P 的 start_load_kv 和 submit 只在命中缓存池的请求上有值；做了 Mooncake 部分的，后台 wait_for_save/put 下的 3 段 | P 的 api_gateway、P 的 start_load_kv/wait_for_transfer（按设计为空）；没做 Mooncake 部分时，put 下的 3 段；P、D 的 lb_proxy（做完 proxy 手册以后有值） |
 
-第 3 批做完以后：不做 Mooncake 部分时，47 段里 42 段有值；做了以后 45 段。第 5 步的 `grep` 显示 `**kwargs` 没有传下去时，P 的 add_request 段为空。
+第 3 批做完时 47 段里 40 段有值；做完 proxy 手册以后 42 段；再做 Mooncake 部分以后 45 段。段数不是判据。第 5 步的 `grep` 显示 `**kwargs` 没有传下去时，P 的 add_request 段为空。
 
 **不对时：** 这一批的实例在 `过滤器版本` 里不是 `…-19c` 那一版；最后一批做完以后，`check` 不是 `RESULT: OK`，或者这一批的实例不是 `…-19c` 那一版：这一批失败，带回全部输出。最后一批以前，只涉及还没重启批次（P）实例的 `FAIL` 项（没在写、旧版本两种）：不算这一批失败，带回全部输出。重启 10 分钟以后、这一批的实例收到过请求，D 的 forward、sampling、start_load_kv/wait_for_transfer 仍然全为空（第 3 批看 P 的 forward、sampling、schedule）：这一批失败。
 
@@ -551,7 +553,7 @@ P 的批（第 3 批）只比 TTFT（P 每个请求只出 1 个 token，TPOT 记
 
 ### 六、可选：替换 Mooncake 库
 
-前 26 步不依赖这一部分，可以以后单独做。不做时，P 侧「后台 wait_for_save → put」下的 3 个子段 submit、wait_for_transfer、finalize 为空，父段 put 仍有值。做完以后这 3 段有值，47 段里 45 段有值；各实例的 vLLM 日志多出 `[BatchPutTiming]` 行。
+前 26 步不依赖这一部分，可以以后单独做。不做时，P 侧「后台 wait_for_save → put」下的 3 个子段 submit、wait_for_transfer、finalize 为空，父段 put 仍有值。做完以后这 3 段有值；做完 proxy 手册以后，47 段里 45 段有值；各实例的 vLLM 日志多出 `[BatchPutTiming]` 行。
 
 **前提：** 第 1–21 步三批都已通过；第 13 步报 `mooncake=not_replaced`（不是 `BAD(other)`）；第 18 步在这一部分以前就量到的 `[BatchPutTiming]` 接近 0。不满足时先不做，带回。
 
@@ -715,7 +717,7 @@ P 的批（第 3 批）只比 TTFT（P 每个请求只出 1 个 token，TPOT 记
 
 {{B:grep -c 'complete=false'}}
 
-**应当看到：** 每个文件一行：文件名、`[BatchPutTiming]` 行数、其中 `complete=false` 的行数。P 机器（第 3 批）行数大于 0，`complete=false` 是 0；D 机器只在往缓存池保存时写这种行，不保存时两个数都是 0。第 3 批做完以后，看板上 P 侧后台 wait_for_save/put 下的 3 段 submit、wait_for_transfer、finalize 有值，47 段里 45 段有值。
+**应当看到：** 每个文件一行：文件名、`[BatchPutTiming]` 行数、其中 `complete=false` 的行数。P 机器（第 3 批）行数大于 0，`complete=false` 是 0；D 机器只在往缓存池保存时写这种行，不保存时两个数都是 0。第 3 批做完以后，看板上 P 侧后台 wait_for_save/put 下的 3 段 submit、wait_for_transfer、finalize 有值；做完 proxy 手册以后，47 段里 45 段有值。
 
 再照第 17、18 步量 30 分钟磁盘，按「判失败的条件」的磁盘项判。
 

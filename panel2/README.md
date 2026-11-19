@@ -11,7 +11,7 @@
 | `vllm-pd-grafana-panel2/` | 部署包源码（`bin/`、`scripts/`、`node/`、`clickhouse/`、`grafana/`、`segments.json`、`profiles/glm53`、`profiles/dsv41`） |
 | `update/` | 更新脚本的源文件。交付时 `tests/t41/pack_dist.sh` 写入 tar 的 sha256；已填路径版（`*_filled.py`，只改 `USER_DIR` 一行）不进 git |
 | `diag-kit/` | 独立诊断工具。README 与 `diag.conf.example` 中的节点地址和用户目录已换成占位符，与交付件不同 |
-| `docs/v3/`、`docs/v3.1-extra/` | 手册与说明书的源文件（占位符版）。`fill_guide.py` 需要环境变量 `USER_DIR`；`fill_guide_b.py` 从已填路径的更新脚本读取用户目录 |
+| `docs/v3/`、`docs/v3.1-extra/` | 手册与说明书的源文件（占位符版；`docs/v3.1-extra/` 中的面板手册、proxy 手册和《执行顺序总表》取自分支 v3.1-extra d58f47e）。`fill_guide.py` 需要环境变量 `USER_DIR`；`fill_guide_b.py` 从已填路径的更新脚本读取用户目录 |
 | `tests/` | 见下表 |
 
 ## 打包
@@ -32,4 +32,4 @@
 | `tests/v3/test_known_issues.py` | pytest | 81 项通过、4 项不通过：这是 v3 的测试，未随 v3.1-extra 更新（`VERSION` 与 `safety.py` 接口变了），开发仓库原样运行结果相同；在 v3 提交上为 84 过 1 不过 |
 | `tests/t41/e2e_v3.py`、`tests/t51/e2e_v31.py`、`tests/t51/e2e_ratio73.py` | Docker（一次性容器 Vector 0.61.0、ClickHouse 26.8.36.3，`--rm`） | 本次未运行 |
 
-需要实验室或真实日志、因此没有带入的测试：`tests/t32`、`tests/t33`（多容器的内网形态实验室）、`tests/t51/test_filter_candidate.py`、`tests/t51/test_filter_device.py`（需要两份真实日志，日志不进仓库；第二个提交里带进过，第三个提交删除）、`tests/t51/lab_native_sources.py`，以及所有 `results/` 目录。
+需要实验室或真实日志、因此没有带入的测试：`tests/t32`、`tests/t33`（多容器的内网形态实验室）、`tests/t51/test_filter_candidate.py`、`tests/t51/test_filter_device.py`（需要两份真实日志，日志不进仓库；第二个提交里带进过，第三个提交删除）、`tests/t51/lab_native_sources.py`、`tests/t53`（proxy 手册与执行顺序总表的实验室走查），以及所有 `results/` 目录。

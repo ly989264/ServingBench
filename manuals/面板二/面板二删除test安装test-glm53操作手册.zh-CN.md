@@ -12,7 +12,9 @@
 
 1. 本手册第一部分（第 1–15 步）：记下 test 的几项值，删 test，装 test-glm53 的监控机部分，做到 `add` 的 `RESULT: OK`；
 2. 打补丁手册：给 glm5.3 的 vLLM 打补丁，加挂载和两个环境变量，重启；
-3. 本手册第二部分（第 16–22 步）：看板归位，打开两个采集来源，测试。
+3. 本手册第 16 步：看板归位；
+4. 《glm5.3 测试集群 proxy 打补丁操作手册》：给 proxy 打补丁、只重启 proxy，并打开 test-glm53 的 proxy 采集来源；
+5. 本手册第 17–22 步：打开 Mooncake 采集来源，测试。
 
 **怎么用。** 每一步写明在哪台机器上做、命令、应当看到什么、不对时怎么办。看到的和「应当看到」不一样时停下，不做下一步，把这一步标「带回：」的输出带回来（文末有汇总清单）。除第 3、9 步在 glm5.3 的两台机器上做以外，都在监控机上做，用当初装面板的那个账号（注册表 `~/.vllm-pd-clusters.json` 在这个账号的家目录里）。第 1 步把常用路径写进变量文件，以后每一步的命令都以 `. ~/vllm-pd-test-glm53/vars.sh` 开头。
 
@@ -31,7 +33,7 @@
 | `<vLLM 容器名>` | 在 glm5.3 的每台机器上 `docker ps --format '{{.Names}}\t{{.Image}}'`，镜像是 vLLM 的那一个 |
 | 每个实例 `vllm serve --port` 的端口、每侧实例的 TP、Mooncake master 的地址 | 现场；第 13 步写进清单 |
 | `<模型名>` | glm5.3 的 `vllm serve --served-model-name`；不知道时填 `glm-5.3` |
-| `<proxy 机器地址>`、`<proxy 日志目录>`、`<P 实例日志文件>` | 打补丁手册；第 17 步用 |
+| `<P 实例日志文件>` | 打补丁手册；第 17 步用 |
 | SSH 账号、节点目录、三项磁盘门槛 | 不用事先查：第 2 步从 test 的 `deploy.env` 里记下 |
 | `<家目录>` | 监控机上执行本手册的那个账号的家目录（`echo ~`）；只出现在「应当看到」的输出里，不用填进命令 |
 
@@ -508,24 +510,25 @@ RESULT: OK（改了 3 项；回退：python3 arrange_boards.py undo <家目录>/
 
 **不对时：** `plan` 列出了 test-glm53 以外的项：不执行 `apply`，停下。带回：两条命令的输出。
 
-### 17. 打开 proxy、Mooncake 两个采集来源
+**第 16 步做完以后，先做《glm5.3 测试集群 proxy 打补丁操作手册》，再做第 17 步。**
+
+### 17. 打开 Mooncake 采集来源
 
 **在哪台机器：** 监控机。
 
-在 test-glm53 的 `deploy.env` 末尾加 6 行，再重启拉取程序。三个值从打补丁手册取：
+proxy 采集来源已经在《glm5.3 测试集群 proxy 打补丁操作手册》第 4 步打开（`PROXY_COLLECT`、`PROXY_MACHINE`、`PROXY_LOG_DIR`、`PULL_RSYNC_FLAGS` 4 项，proxy 的记录写在 proxy 所在机器的 `/data/pd-diag/logs/proxy`），这里不再加。在 test-glm53 的 `deploy.env` 末尾加 Mooncake 的 3 行，再重启拉取程序。值从打补丁手册取：
 
-- `<proxy 机器地址>`：proxy 所在机器；`<proxy 日志目录>`：给 proxy 设的 `PD_PROXY_DIAG_DIR` 在宿主机上的路径；
 - `<P 实例日志文件>`：每个 P 实例 vLLM 日志文件（标准错误重定向到的那个文件）的宿主机路径，写成 `<P 机器地址>=/宿主机/路径/文件名`；一台机器几个实例时路径之间用分号，几台机器之间用逗号。
 
 ```bash
-. ~/vllm-pd-test-glm53/vars.sh && printf '\nPROXY_COLLECT=1\nPROXY_MACHINE=%s\nPROXY_LOG_DIR=%s\nMOONCAKE_LOG_COLLECT=1\nMOONCAKE_LOG_FILES=%s\nMOONCAKE_TID_FALLBACK=0\n' '<proxy 机器地址>' '<proxy 日志目录>' '<P 实例日志文件>' >> "$D/deploy.env"
+. ~/vllm-pd-test-glm53/vars.sh && printf '\nMOONCAKE_LOG_COLLECT=1\nMOONCAKE_LOG_FILES=%s\nMOONCAKE_TID_FALLBACK=0\n' '<P 实例日志文件>' >> "$D/deploy.env"
 ```
 
 ```bash
 . ~/vllm-pd-test-glm53/vars.sh && cd "$D" && bin/puller.sh restart && bin/puller.sh status
 ```
 
-**应当看到：** 每台机器一行 `OK … 上次成功 <n> 秒前`，另有 proxy 机器一行和 `mooncake` 一行，最后 `RESULT: OK`：
+**应当看到：** 每台机器一行 `OK … 上次成功 <n> 秒前`，另有 proxy 机器一行（proxy 打补丁手册第 4 步加的）和 `mooncake` 一行，最后 `RESULT: OK`：
 
 ```
 RESULT:   OK（集群   test-glm53：注册表里没有重复，端口空闲或属于本集群）
@@ -539,7 +542,7 @@ OK   mooncake   _native   上次成功   1.9   秒前
 RESULT:   OK
 ```
 
-**不对时：** 某一行不是 `OK`：带回 `bin/puller.sh status` 的输出。
+**不对时：** 某一行不是 `OK`：带回 `bin/puller.sh status` 的输出。没有 proxy 机器那一行：proxy 打补丁手册还没做，先做完那本手册再回到这一步。
 
 ### 18. 升级安全检查
 

@@ -25,4 +25,4 @@
 | 变更怎么做、怎么发布 | `docs/30-变更与发布.md`、`releases/README.md` |
 | 已知问题、待办、只在本地的文件 | `docs/50-已知问题与待办.md` |
 | 某个概念在哪个文件实现 | `docs/60-文件地图.md` |
-| 内网操作手册 | `manuals/README.md` |
+| 内网操作手册 | `manuals/README.md`；glm5.3 上线从 `manuals/执行顺序总表.zh-CN.md` 开始 |

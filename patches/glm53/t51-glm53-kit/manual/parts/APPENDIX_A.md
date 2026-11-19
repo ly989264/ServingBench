@@ -232,7 +232,7 @@
 ### A.4 Mooncake 部分
 
 - **前提：第 1–21 步三批都已通过。** 第 13 步检测脚本报的是 `verdict vllm=ok ascend=ok(site_local=<n>) p2d=ok mooncake=not_replaced`，即现场原装的 Mooncake 库（小核对 f-1 带回的那一份）。第 13 步报 `mooncake=BAD(other)` 的，不做这一步，把那一行带回来。第 18 步在这一步以前就量到 `[BatchPutTiming]` 行的，也先不做，把这些行带回来。
-- **换了以后多了什么：** P 侧「后台 wait_for_save → put」下面的 3 个子段 submit、wait_for_transfer、finalize 有值，47 段里 45 段有值（第 19 步）。各实例的 vLLM 日志里多出 `[BatchPutTiming]` 行，由现场自己轮转（A.3 结论三）。
+- **换了以后多了什么：** P 侧「后台 wait_for_save → put」下面的 3 个子段 submit、wait_for_transfer、finalize 有值；做完 proxy 手册以后，47 段里 45 段有值（第 19 步）。各实例的 vLLM 日志里多出 `[BatchPutTiming]` 行，由现场自己轮转（A.3 结论三）。
 - **只换一个文件。** `<Mooncake 目录>/libmooncake_store.so` 换成增量包的 `lib/libmooncake_store.so`。store 模块、`libtransfer_engine.so`、`libmooncake_common.so`、`libasio.so`、`ascend_transport.so` 和自带的系统库都不动。
 - **每个容器先跑换库前的核对（第 28 步），是最后一道关。** 最后一行是 `mc_pre result=ok_replace` 才往下做；其余结果都停下，不换任何一个容器，把输出带回来。
 - **原库必须备份、拷回监控机（第 29 步）。** 现场的原库是现场自己构建的，增量包里没有这一份，丢了无法重建。备份拷到监控机、核对通过以后，才做第 30 步；回滚（第 35 步）用监控机上的这一份。

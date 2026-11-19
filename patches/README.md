@@ -1,6 +1,6 @@
 # 补丁一侧：glm5.3 的诊断补丁与检测脚本
 
-面板二的数据来自这些补丁：它们在节点上的 vLLM、vllm-ascend、Mooncake 里写出 `[PD_DIAG]` 记录和 `[BatchPutTiming]` 行，格式由《记录格式约定》（`contracts/记录格式约定-glm5.3-v1.3.3.zh-CN.md`）规定，面板二按约定解析。补丁不属于面板二的部署包，在节点容器里另行安装（打补丁手册见 `manuals/补丁/`）。
+面板二的数据来自这些补丁：它们在节点上的 vLLM、vllm-ascend、Mooncake 里写出 `[PD_DIAG]` 记录和 `[BatchPutTiming]` 行，格式由《记录格式约定》（`contracts/记录格式约定-glm5.3-v1.3.3.zh-CN.md`）规定，面板二按约定解析。补丁不属于面板二的部署包，在节点容器和 proxy 机器上另行安装；先看 `manuals/执行顺序总表.zh-CN.md`（唯一入口），手册在 `manuals/补丁/`。
 
 规则（`docs/40-规则.md` P4）：补丁必须在检测到的目标环境上验证（调用路径比对、目标版本内部 API 存在性检查），不得带入其他版本的残留。
 
@@ -13,17 +13,18 @@
 | `glm53/t51-glm53-vllm/` | 42c730a（2026-11-19） | 同事补丁 01（vLLM v0.32.0 诊断埋点）在 vLLM v0.30.0 上的等价移植；调用路径比对、启动检查、现场本地补丁影响的模拟 |
 | `glm53/t51-glm53-ascend/` | 9dad4b6（2026-11-19） | 同事补丁 02 移植到 vllm-ascend `d4ad49796`（`kv_p2p/mooncake_connector.py` 除外），加「等 put 完成」计时和 `pool_load` 映射记录；联合检查 |
 | `glm53/t51-glm53-p2d/` | 7936bb0（2026-11-19） | `MooncakeConnectorV1`（`kv_p2p/mooncake_connector.py`）的 D 读 KV 诊断记录；在 CPU 版 vLLM 0.30 上的端到端脚本 |
-| `glm53/t51-glm53-kit/` | 913b4f0（2026-11-19） | 环境检测脚本（`detect/`）、现场核对（`fieldcheck/`）、Mooncake 替换库的构建与换库前核对（`mooncake/`）、日志量估算（`volume/`）、打补丁手册的源文件（`manual/`）、《记录格式约定》原文（`CONTRACT.zh-CN.md`） |
+| `glm53/t51-glm53-kit/` | 2c407ee（2026-11-20） | 环境检测脚本（`detect/`）、现场核对（`fieldcheck/`）、Mooncake 替换库的构建与换库前核对（`mooncake/`）、日志量估算（`volume/`）、打补丁手册的源文件（`manual/`）、《记录格式约定》原文（`CONTRACT.zh-CN.md`） |
+| `glm53/t51-glm53-proxy-kit/` | 面板二开发仓库分支 v3.1-extra d58f47e 的 `dist-proxy-patch/t51-glm53-proxy-kit.tar.gz`（75fd49e8）解开后的文件；这份补丁的源码只以这个包的形式保存 | vLLM 代理示例 `load_balance_proxy_server_example.py` 的 `[PD_DIAG]` 补丁（`main/` 与 `v0.30/` 两版，各带离线测试）、只读检查 `t51_proxy_check.py`、启停脚本 |
 | `glm53/t51-glm53-patchkit/` | 207d7a4（2026-11-19） | 打补丁包 `t51-glm53-patch-kit.tar`（d21cc319）的组装目录：上面几个仓库的补丁文件、检测脚本、《操作说明 A》；`tools/make_tar.sh` 出包 |
 | `dsv41/t51-dsv41-kit/` | 305a553（2026-11-19） | **已暂停**（用户决定 T51 只做 glm5.3）。dsv4.1 版的检测脚本、补丁与说明，只放文本源码 |
 
-开发侧 `t51-glm53-kit` 在 913b4f0 之后又有 4 个只改打补丁手册文字的提交（执行顺序总表，属 T51 的 proxy 补充），等 proxy 补充交付后一并更新。
 
 ## 已交付的包（GitHub Release）
 
 | tag | 资产 | 用在 | 组装 |
 |---|---|---|---|
 | `glm53-patch-kit-d21cc319` | `t51-glm53-patch-kit.tar`（5.7 MB） | glm5.3 测试集群（test-glm53 的两台机器）的 P、D 容器；《操作说明 A》第 1–10 步 | `glm53/t51-glm53-patchkit/tools/make_tar.sh` |
+| `glm53-proxy-kit-75fd49e8` | `t51-glm53-proxy-kit.tar.gz`（111 KB） | test-glm53 的 proxy 机器；《glm5.3 测试集群 proxy 打补丁操作手册》 | 面板二开发仓库 v3.1-extra `dist-proxy-patch/` |
 | `glm53-mooncake-kit-6d70978c` | `t51-glm53-mooncake-kit.tar`（15 MB，含替换用的 `libmooncake_store.so`） | 同上；《操作说明 A》第 11 步（可延后） | `glm53/t51-glm53-kit/mooncake/increment/` |
 
 sha256 与交付说明见 `releases/<tag>/`。
@@ -38,7 +39,6 @@ sha256 与交付说明见 `releases/<tag>/`。
 | Mooncake 替换库的二进制（`*.so.xz`） | 二进制；glm5.3 用的那一份在 Mooncake 增量包里（Release） |
 | `t51-dsv41-kit/patches/vllm/01-vllm-v0.32.0-diagnostics.patch` | 同事的原始补丁 01，其中有个人目录；dsv4.1 交付包本来也不含它 |
 | 同事的原始补丁包（pd-diag-patches-20261116，针对 vllm-ascend v0.32.0rc1） | 只作参考，不在任何开发仓库 |
-| T51 的 proxy 补丁、proxy 手册、执行顺序总表 | 尚未交付；交付后加入 `glm53/` 和 `manuals/` |
 
 ## 与来源不同的 4 处
 
