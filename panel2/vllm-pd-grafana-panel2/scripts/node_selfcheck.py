@@ -162,7 +162,19 @@ def run_sample(a, F, cfg_path, mapping, seg, tmp):
         t = json.loads(line)
         if t["segs"]:       # a request with no per-step sums (it ended before its first step) has nothing to compare
             truth[t["request_id"]] = t["segs"]
-    diff = sum(1 for rid, segs in truth.items() if sums.get(rid) != segs)
+    # Only the sums the truth has: a segment definition of v3.1-extra (profiles/) adds sums of its own (the candidate
+    # step, wait for put) that the sample's truth does not know; the end-to-end tests check those.
+    # C15 (profiles/glm53): a rule that reads the device time only (a list of paths, all *.device_duration_ns) must stay
+    # empty on the sample, whose records have the host time only: a value there would be a silent fallback to the host
+    # time, which C15 rules out. Those sums are checked for being empty instead of against the truth (host time).
+    device_only = sorted(x["id"] for x in json.load(open(mapping, encoding="utf-8")).get("accumulate", [])
+                         if isinstance(x.get("value"), list) and x["value"]
+                         and all(isinstance(v, str) and v.endswith(".device_duration_ns") for v in x["value"]))
+
+    def cmp(d):
+        return {k: v for k, v in d.items() if k not in device_only}
+    diff = sum(1 for rid, segs in truth.items()
+               if cmp({k: v for k, v in (sums.get(rid) or {}).items() if k in segs}) != cmp(segs))
     errors = max((c.get("errors", 0) for c in checks), default=None)
     line = "样本 %d 行，用时 %.1f 秒：请求级记录写出 %d / 应有 %d，累计 %d 个请求，与真值不同 %d 个，自检行出错数 %s，文件 %s" % (
         n, took, got, want, len(sums), diff, errors, " ".join(roles))
@@ -170,6 +182,14 @@ def run_sample(a, F, cfg_path, mapping, seg, tmp):
         ok(line)
     else:
         bad(line)
+    if device_only:
+        with_value = [rid for rid, segs in sums.items() if any(segs.get(k) for k in device_only)]
+        dline = "只取设备时间的 %s：样本里只有 host 时间，应为空，%d 个请求%s" % (
+            "、".join(device_only), len(sums), "全为空" if not with_value else "里 %d 个有值（%s…）" % (len(with_value), with_value[0]))
+        if with_value:
+            bad(dline)
+        else:
+            ok(dline)
     # Hot reload of the mapping.
     before = handler._cfg.version
     raw = json.load(open(m2, encoding="utf-8"))

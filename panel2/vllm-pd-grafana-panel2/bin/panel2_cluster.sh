@@ -156,6 +156,15 @@ cmd_add() {
   [ ${#sets[@]} -eq 0 ] || set_env "$D/deploy.env" "${sets[@]}"
   [ -z "$mode" ] || set_env "$D/deploy.env" "NODE_MODE=$mode"
   cmp -s "$inv" "$D/inventory.json" || cp "$inv" "$D/inventory.json" || fail "拷不了清单到 $D/inventory.json"
+  # v3.1-extra: the cluster's own segment definitions (deploy.env SEGMENTS_PROFILE, a folder of profiles/), else the pack's.
+  local prof; prof=$(bash -c 'set -a; . "$1" >/dev/null 2>&1; echo "${SEGMENTS_PROFILE:-}"' _ "$D/deploy.env")
+  if [ -n "$prof" ]; then
+    case $prof in *[!a-z0-9_-]*) fail "deploy.env 的 SEGMENTS_PROFILE=$prof 只能用小写字母、数字、- 和 _" ;; esac
+    [ -f "$PACK_DIR/profiles/$prof/segments.json" ] || fail "deploy.env 的 SEGMENTS_PROFILE=$prof：包里没有 profiles/$prof/segments.json"
+    cmp -s "$PACK_DIR/profiles/$prof/segments.json" "$D/segments.json" || cp "$PACK_DIR/profiles/$prof/segments.json" "$D/segments.json" \
+      || fail "拷不了 profiles/$prof/segments.json 到 $D"
+    echo "段定义：profiles/$prof/segments.json（deploy.env 的 SEGMENTS_PROFILE）"
+  fi
 
   echo
   echo "==== 集群 $c：查注册表、端口和清单"

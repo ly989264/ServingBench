@@ -6,8 +6,28 @@ What it does in each process, driven by segments.json (the same file the monitor
   - per-step records matched by an "accumulate" rule (event plus top-level fields such as scope or phase) are not
     written; the value at the rule's path (for example stages.forward.duration_ns) is added up per request and written
     as one cumulative line per request every few seconds (event "pd_seg_partial"); a null value adds nothing;
+    v3.1-extra: the rule's value may be a list of paths, of which the first that is not null is taken (a device time,
+    else the host time); the self-check line counts per rule the records whose value came from a later path
+    ("acc_fallback", {rule id: count}; only when segments.json has such a rule); a list of one path (a device time
+    only, no fallback) counts instead the records that have the path's parent object but no value at the path (the
+    step's stage is there, its device time is not: the step adds nothing, the segment stays empty for it);
+    v3.1-extra, only when segments.json has "missing_execution_id": "own_step_first_null": a matched record with no
+    execution_id counts as a step of its own and makes the rule's first-step value of its requests unknown (first_ns
+    null; when it is a request's first record, the request's first step is unknown: first_exec null, every first_ns
+    null); the self-check line counts these records ("exec_missing"). Without the key a record with no execution_id
+    takes its record_id as the step, as in v3;
   - request-level records matched by a "passthrough" rule are written unchanged to this process's own files;
   - worker lines of TP ranks other than 0 are dropped;
+  - v3.1-extra, only when segments.json has a "candidate" section: a request's first-candidate step (the step that
+    started its KV load: on D the read from P, on P a load from the cache pool) does not name the request, so its values
+    (the Worker's submit; the EngineCore's lookup, alloc and other) are kept per execution_id for a while (hold_steps,
+    hold_seconds) and added to the requests that records of the same process name for that execution_id (candidate.map:
+    D's pd_transfer_summary[link] in the EngineCore, D's pd_transfer_summary[task] and P's pool_task[load_submit] in the
+    Worker), whichever comes first; a request that the step's own record already names is not added again. The sums go
+    into the request's pd_seg_partial line under the candidate rules' ids. Each process does this on its own, so it holds
+    for TP > 1, where the Worker of rank 0 and the EngineCore are different processes. The self-check line counts the
+    named pairs (cand_maps), the values added (cand_applied), steps whose named requests did not get every value before
+    the step left the buffer (cand_unpaired), and steps pushed out by hold_steps before hold_seconds (cand_evicted_full);
   - every minute it writes one self-check line (event "pd_filter_selfcheck");
   - when segments.json changes on disk it is read again, without restarting vLLM.
 Any error is caught and counted here; nothing is raised into vLLM.
@@ -33,6 +53,7 @@ Written for Python 3.9 and later; standard library only.
 """
 
 import atexit
+import collections
 import hashlib
 import json
 import logging
@@ -193,12 +214,21 @@ class _Config:
         self.keep_ranks = frozenset(int(x) for x in roles.get("keep_tp_rank", [0]))
         self.ranked = frozenset(roles.get("ranked_roles", ["worker", "pool"]))
         self.acc = {}
+        self.acc_lists = []     # v3.1-extra: ids of the rules whose value is a list of paths
         acc_rules = set()
         for a in raw.get("accumulate", []):
             if a["key"] not in ("request_id", "request_ids"):
                 raise ValueError("segments.json: accumulate key must be request_id or request_ids")
-            spec = (a["id"], a["role"], a["key"], _where(a), a.get("empty_key", "drop_and_count"),
-                    tuple(a.get("value", "duration_ns").split(".")))
+            value = a.get("value", "duration_ns")
+            if isinstance(value, list):
+                if not value or not all(isinstance(v, str) and v for v in value):
+                    raise ValueError("segments.json: accumulate value must be a path or a list of paths")
+                paths = tuple(tuple(v.split(".")) for v in value)
+                if a["id"] not in self.acc_lists:
+                    self.acc_lists.append(a["id"])
+            else:
+                paths = (tuple(value.split(".")),)
+            spec = (a["id"], a["role"], a["key"], _where(a), a.get("empty_key", "drop_and_count"), paths)
             self.acc.setdefault(a["event"], []).append(spec)
             acc_rules.add((a["event"], spec[3]))
         # "passthrough": a list of event names (every record of the event) or {"event", "where"} rules.
@@ -223,7 +253,21 @@ class _Config:
         self.pass_rules = {}
         for event, where in sorted(rules - acc_rules):
             self.pass_rules.setdefault(event, []).append(where)
-        self.events = frozenset(self.acc) | frozenset(self.pass_rules)
+        # v3.1-extra: first-candidate steps (module docstring). Absent: nothing of it runs.
+        cand = raw.get("candidate") or {}
+        self.cand_map, self.cand_acc = {}, {}
+        for m in cand.get("map", []):
+            self.cand_map.setdefault(m["event"], []).append(_where(m))
+        for a in cand.get("accumulate", []):
+            self.cand_acc.setdefault(a["event"], []).append(
+                (a["id"], a["role"], _where(a), tuple(a.get("value", "duration_ns").split("."))))
+        mode = raw.get("missing_execution_id")
+        if mode not in (None, "own_step_first_null"):
+            raise ValueError("segments.json: missing_execution_id must be own_step_first_null")
+        self.exec_strict = mode == "own_step_first_null"
+        self.cand_steps = int(cand.get("hold_steps", 8192))
+        self.cand_seconds = float(cand.get("hold_seconds", 120))
+        self.events = frozenset(self.acc) | frozenset(self.pass_rules) | frozenset(self.cand_map) | frozenset(self.cand_acc)
 
 
 class _Acc:
@@ -238,13 +282,14 @@ class _Acc:
 
 class _Req:
     __slots__ = ("role", "rid", "part", "seq", "acc", "dirty", "seen", "first_mono", "last_mono", "tp_rank", "proc",
-                 "first_exec")
+                 "first_exec", "first_unknown")
 
     def __init__(self, role, rid, part, tp_rank, proc):
         self.role, self.rid, self.part, self.tp_rank, self.proc = role, rid, part, tp_rank, proc
         # The request's first step in this role: the first execution_id of any accumulated record that names it,
         # whether or not that record has a value. "first" sums are taken at this step only.
         self.first_exec = None
+        self.first_unknown = False      # v3.1-extra, missing_execution_id: the first record had no execution_id
         self.seq = 0
         self.acc = {}
         self.dirty = False
@@ -275,6 +320,7 @@ class PdDiagHandler(logging.Handler):
         self._log_dir_arg = log_dir
         self._pid = None
         self._counts = {}
+        self._fallback = None       # v3.1-extra: {accumulate rule id: records whose value came from a later path}
         self._cfg = None
         self._cfg_mtime = None
         self._cfg_errors = 0
@@ -311,6 +357,12 @@ class PdDiagHandler(logging.Handler):
         self._counts = dict.fromkeys(
             ("seen", "written", "dropped", "no_event", "rank_dropped", "accumulated", "empty_key_dropped", "errors",
              "partials_written", "evicted", "forced", "config_reloads", "version_dropped"), 0)
+        if self._cfg is not None and (self._cfg.cand_map or self._cfg.cand_acc):
+            self._counts.update(cand_maps=0, cand_applied=0, cand_unpaired=0, cand_evicted_full=0)
+        self._fallback = dict.fromkeys(self._cfg.acc_lists, 0) if self._cfg is not None and self._cfg.acc_lists else None
+        if self._cfg is not None and self._cfg.exec_strict:
+            self._counts["exec_missing"] = 0
+        self._cand = collections.OrderedDict()
         now = time.monotonic()
         self._next_flush = now
         self._next_check = now + (self._cfg.selfcheck_s if self._cfg else 60)
@@ -327,7 +379,18 @@ class PdDiagHandler(logging.Handler):
             # Close the running sums under the old version before switching.
             self._flush_partials(force_all=True, reason="config_change")
             self._reqs = {}
+            self._cand = collections.OrderedDict()
             self._counts["config_reloads"] += 1
+            if cfg.cand_map or cfg.cand_acc:
+                for k in ("cand_maps", "cand_applied", "cand_unpaired", "cand_evicted_full"):
+                    self._counts.setdefault(k, 0)
+            if cfg.exec_strict:
+                self._counts.setdefault("exec_missing", 0)
+            if cfg.acc_lists:
+                if self._fallback is None:
+                    self._fallback = {}
+                for k in cfg.acc_lists:
+                    self._fallback.setdefault(k, 0)
         self._cfg = cfg
 
     def _log_dir(self):
@@ -386,6 +449,8 @@ class PdDiagHandler(logging.Handler):
         if cfg.record_version is not None and obj.get("version") != cfg.record_version:
             c["version_dropped"] += 1
             return
+        if event in cfg.cand_acc or event in cfg.cand_map:
+            self._candidate(cfg, event, obj, role, tp_rank, proc)
         specs = cfg.acc.get(event)
         if specs and self._accumulate_obj(specs, obj, role, tp_rank, proc):
             c["accumulated"] += 1
@@ -414,14 +479,32 @@ class PdDiagHandler(logging.Handler):
     def _accumulate_obj(self, specs, obj, role, tp_rank, proc):
         """Adds the record's values to its requests. True when an accumulate rule matched the record, which is then
         not written, also when its value is null or it names no request."""
-        exe = obj.get("execution_id") or obj.get("record_id")
+        strict = self._cfg.exec_strict
+        if strict:
+            exe = obj.get("execution_id")
+            if not (isinstance(exe, str) and exe):
+                exe = None
+        else:
+            exe = obj.get("execution_id") or obj.get("record_id")
         mono = obj.get("timestamp_ns")
         matched = False
-        for acc_id, acc_role, key, where, empty, path in specs:
+        for acc_id, acc_role, key, where, empty, paths in specs:
             if not _where_ok(obj, where):
                 continue
+            if strict and exe is None and not matched:
+                self._counts["exec_missing"] += 1       # once per record
             matched = True
-            value = _get_path(obj, path)
+            value = _get_path(obj, paths[0])
+            fell_back = False
+            left_empty = (value is None and len(paths) == 1 and len(paths[0]) > 1
+                          and isinstance(_get_path(obj, paths[0][:-1]), dict))
+            if value is None and len(paths) > 1:
+                # a list of paths: the first that is not null; a later one is counted below once the record counts
+                for p in paths[1:]:
+                    value = _get_path(obj, p)
+                    if value is not None:
+                        fell_back = True
+                        break
             has = isinstance(value, int) and not isinstance(value, bool)
             if key == "request_ids":
                 ids = obj.get("request_ids")
@@ -440,6 +523,8 @@ class PdDiagHandler(logging.Handler):
                     self._counts["empty_key_dropped"] += 1
                     continue
                 ids = (rid,)
+            if ((fell_back and has) or left_empty) and self._fallback is not None:
+                self._fallback[acc_id] = self._fallback.get(acc_id, 0) + 1
             now = time.monotonic()
             for rid in ids:
                 st = self._reqs.get((role, rid))
@@ -448,7 +533,13 @@ class PdDiagHandler(logging.Handler):
                         self._force_oldest()
                     st = _Req(role, rid, "%s-%d-%d" % (self._run, os.getpid(), time.monotonic_ns()), tp_rank, proc)
                     self._reqs[(role, rid)] = st
-                if st.first_exec is None:
+                if strict:
+                    if st.first_exec is None and not st.first_unknown:
+                        if exe is None:
+                            st.first_unknown = True     # the first step is not in the log: every first value unknown
+                        else:
+                            st.first_exec = exe
+                elif st.first_exec is None:
                     st.first_exec = exe
                 st.seen = now
                 if not has:
@@ -456,11 +547,16 @@ class PdDiagHandler(logging.Handler):
                 a = st.acc.get(acc_id)
                 if a is None:
                     a = st.acc[acc_id] = _Acc()
-                if exe != a.last_exec:
+                if strict and exe is None:
+                    a.steps += 1            # a step of its own
+                    a.first = None          # which step it was is not in the log: the first-step value is unknown
+                elif exe != a.last_exec:
                     a.steps += 1
                     a.last_exec = exe
                 a.total += value
-                if exe == st.first_exec:
+                if strict and st.first_unknown:
+                    a.first = None
+                elif a.first is not None and exe == st.first_exec:
                     a.first += value
                 st.dirty = True
                 if isinstance(mono, int):
@@ -468,6 +564,83 @@ class PdDiagHandler(logging.Handler):
                         st.first_mono = mono
                     st.last_mono = mono
         return matched
+
+    # ---- first-candidate steps (v3.1-extra) -------------------------------------------------------------------------
+
+    def _candidate(self, cfg, event, obj, role, tp_rank, proc):
+        """Keeps a step's candidate values and the requests named for its execution_id; adds each value to each request
+        once. Only reads the record: what happens to it afterwards (accumulated, written, dropped) is as before."""
+        exe = obj.get("execution_id")
+        if not isinstance(exe, str) or not exe:
+            return
+        now = time.monotonic()
+        ent = self._cand.get(exe)
+        changed = False
+        for acc_id, acc_role, where, path in cfg.cand_acc.get(event, ()):
+            if not _where_ok(obj, where):
+                continue
+            value = _get_path(obj, path)
+            if not isinstance(value, int) or isinstance(value, bool):
+                continue
+            if ent is None:
+                ent = self._cand_entry(exe, now)
+            ids = obj.get("request_ids")
+            ent["vals"][(role, acc_id)] = (value, frozenset(ids) if isinstance(ids, list) else frozenset(), tp_rank, proc)
+            changed = True
+        for where in cfg.cand_map.get(event, ()):
+            rid = obj.get("request_id")
+            if _where_ok(obj, where) and isinstance(rid, str) and rid:
+                if ent is None:
+                    ent = self._cand_entry(exe, now)
+                if rid not in ent["rids"]:
+                    ent["rids"].add(rid)
+                    self._counts["cand_maps"] += 1
+                    changed = True
+                break
+        if changed:
+            self._cand_apply(ent)
+
+    def _cand_entry(self, exe, now):
+        cfg = self._cfg
+        while self._cand:
+            k, old = next(iter(self._cand.items()))
+            if len(self._cand) < cfg.cand_steps and now - old["t"] <= cfg.cand_seconds:
+                break
+            self._cand.popitem(last=False)
+            if now - old["t"] <= cfg.cand_seconds:
+                self._counts["cand_evicted_full"] += 1     # pushed out by hold_steps before hold_seconds ran out
+            # requests were named for this step but not every value reached them (a value never came in this process)
+            if old["rids"] and (not old["vals"] or len(old["done"]) < len(old["rids"]) * len(old["vals"])):
+                self._counts["cand_unpaired"] += 1
+        ent = {"t": now, "vals": {}, "rids": set(), "done": set()}
+        self._cand[exe] = ent
+        return ent
+
+    def _cand_apply(self, ent):
+        for rid in ent["rids"]:
+            for (role, acc_id), (value, ids, tp_rank, proc) in ent["vals"].items():
+                key = (rid, role, acc_id)
+                if key in ent["done"]:
+                    continue
+                ent["done"].add(key)
+                if rid in ids:
+                    continue        # the step's own record names the request: its sums already have this step
+                st = self._reqs.get((role, rid))
+                if st is None:
+                    if len(self._reqs) >= self._cfg.max_requests:
+                        self._force_oldest()
+                    st = _Req(role, rid, "%s-%d-%d" % (self._run, os.getpid(), time.monotonic_ns()), tp_rank, proc)
+                    self._reqs[(role, rid)] = st
+                st.seen = time.monotonic()
+                a = st.acc.get(acc_id)
+                if a is None:
+                    a = st.acc[acc_id] = _Acc()
+                a.steps += 1
+                a.total += value
+                if self._cfg.exec_strict and st.first_unknown:
+                    a.first = None
+                st.dirty = True
+                self._counts["cand_applied"] += 1
 
     def _force_oldest(self):
         oldest = min(self._reqs.values(), key=lambda s: s.seen)
@@ -570,6 +743,8 @@ class PdDiagHandler(logging.Handler):
 
     def _selfcheck(self):
         row = dict(self._counts)
+        if self._fallback is not None:
+            row["acc_fallback"] = dict(self._fallback)
         row.update(event="pd_filter_selfcheck", version=1, config_version=self._cfg.version if self._cfg else None,
                    config_errors=self._cfg_errors, last_config_error=self._last_cfg_error or None,
                    instance=self._instance, host=self._host, pid=os.getpid(), inflight=len(self._reqs),

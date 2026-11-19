@@ -35,7 +35,7 @@ sys.path.insert(0, HERE)
 import criteria as C  # noqa: E402
 
 PACK_LOG_DIR = "/var/log/pd-diag"   # line.log_dir of the pack's segments.json, before deploy.env replaces it
-UPGRADE_FROM = ("v2.1",)            # --pre-upgrade: the versions this pack upgrades from (and rolls back to)
+UPGRADE_FROM = ("v3",)              # --pre-upgrade: the versions this pack upgrades from (and rolls back to)
 TABLES = ("phase_line", "diag_event", "filter_selfcheck", "filter_file", "filter_other")
 NOT_IN_SUMS = ("deploy.env", "inventory.json", "segments.json")
 
@@ -257,12 +257,22 @@ def item_version_files(c, o, pre):
         o.add("WARN", "版本和文件：%s 里没有 SHA256SUMS，没有逐个核对文件" % c.dir)
         return
     bad = []
+    # v3.1-extra: with SEGMENTS_PROFILE the cluster's segments.json is profiles/<profile>/segments.json of the pack
+    prof = c.get("SEGMENTS_PROFILE")
+    listed = {}
+    for line in open(sums, encoding="utf-8"):
+        parts = line.split()
+        if len(parts) == 2:
+            n_ = parts[1].lstrip("*")
+            listed[n_[2:] if n_.startswith("./") else n_] = parts[0]
     for line in open(sums, encoding="utf-8"):
         parts = line.split()
         if len(parts) != 2:
             continue
         name = parts[1].lstrip("*")
         name = name[2:] if name.startswith("./") else name
+        if name == "segments.json" and prof and not pre:
+            parts = [listed.get("profiles/%s/segments.json" % prof, "（包里没有 profiles/%s）" % prof), name]
         if name in ("deploy.env", "inventory.json") or name.startswith(("generated/", "offline/")):
             continue
         p = os.path.join(c.dir, name)
@@ -285,7 +295,8 @@ def item_version_files(c, o, pre):
         o.add("WARN" if pre else "FAIL", "版本和文件：%d 个文件和 SHA256SUMS 不同%s：%s" % (
             len(bad), "，升级会换成包里的" if pre else "", " ".join(bad[:12]) + (" …" if len(bad) > 12 else "")))
     else:
-        o.add("OK", "版本和文件：文件都和 SHA256SUMS 相同（segments.json 只差 log_dir 和 keep_hours）")
+        o.add("OK", "版本和文件：文件都和 SHA256SUMS 相同（segments.json 只差 log_dir 和 keep_hours%s）" % (
+            "；它是 profiles/%s/segments.json" % prof if prof and not pre else ""))
 
 
 def item_containers(c, o):

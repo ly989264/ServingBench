@@ -40,8 +40,13 @@ class Node:
         # {"acc": ..., "part": ...} (the filter's per-request sums), or {"event": ..., "ranges": ..., "total": ..., "part":
         # "first" | "rest"} (the range of a request-level record's per-call list whose execution_id is the request's first
         # step, and the total minus it); null means the log has nothing for the segment, and it stays empty.
+        # Under "proxy" (v3.1-extra) only {"proxy": <field>}: a field of the proxy's line for the request (vllm_pd.proxy_line).
         self.src = raw.get("src")
         for s in self.src or []:
+            if phase == "proxy":
+                if set(s) != {"proxy"} or not re.fullmatch(r"[a-z][a-z0-9_]*_ms", str(s["proxy"])):
+                    raise SystemExit("segments.json：%s 在 proxy 下，src 只能写 {\"proxy\": \"<proxy 行的 *_ms 字段>\"}" % where)
+                continue
             if ("event" in s) == ("acc" in s):
                 raise SystemExit("segments.json：%s 的 src 每一项要写 event 或 acc 之一" % where)
             if "acc" in s and s.get("part", "total") not in ("total", "first", "rest"):
@@ -107,7 +112,7 @@ class Tree:
         self.raw = raw
         self.acc_ids = []
         # Sums the filter keeps per request: accumulated per-step spans, and durations made from two paired point events.
-        for a in raw.get("accumulate", []):
+        for a in raw.get("accumulate", []) + (raw.get("candidate") or {}).get("accumulate", []):
             if a["id"] not in self.acc_ids:
                 self.acc_ids.append(a["id"])
         self.request_fields = raw.get("request", {})
@@ -169,6 +174,17 @@ class Tree:
         for k, spec in self.request_fields.items():
             if spec.get("event") == "core_summary" and k not in out:
                 out.append(k)
+        return out
+
+    def proxy_sourced(self):
+        """[(column, field of the proxy line)] for the proxy segments that read the proxy's line (v3.1-extra); [] when none
+        does, and then nothing about the proxy differs from v3."""
+        out = []
+        for role in ("prefill", "decode"):
+            for n in self.nodes(role, "proxy"):
+                for s in n.src or []:
+                    if (n.column, s["proxy"]) not in out:
+                        out.append((n.column, s["proxy"]))
         return out
 
     def summary_columns(self):

@@ -3,7 +3,7 @@
 # Usage: bin/clear_data.sh --yes [--all] [--with-mirror]
 #   default  phase_line and diag_event (the request data) and the collector's samples of unparsed lines; the filter's
 #            file records (filter_file, filter_selfcheck, filter_other) stay, so nothing has to be restarted afterwards.
-#   --all    all five tables (switching environments). The mock is never started again. In mock mode the puller is not
+#   --all    all tables (switching environments; v3.1-extra's proxy_line and proxy_selfcheck too, when they exist). The mock is never started again. In mock mode the puller is not
 #            either: bin/panel2_cluster.sh add starts both once deploy.env and inventory.json are changed. In vllm mode
 #            (after add --mode vllm) the puller is started again as usual.
 #   mock mode: stops the mock (from here, design 2.3), deletes the logs it wrote on each node (node_mock.sh clean),
@@ -36,10 +36,10 @@ mode=${NODE_MODE:-mock}
 if [ "$mode" = vllm ] && [ -n "$mirror" ]; then
   fail "vllm 模式下不清镜像（节点上的文件属于 vLLM，镜像删了会被原样拉回）。只清请求数据：bin/clear_data.sh --yes"
 fi
-tables="phase_line diag_event"
-[ -n "$all" ] && tables="phase_line diag_event filter_selfcheck filter_file filter_other"
-what="请求数据（phase_line、diag_event）和解析失败样本，保留过滤器的文件记录"
-[ -n "$all" ] && what="五张表（phase_line、diag_event、filter_selfcheck、filter_file、filter_other）和解析失败样本"
+tables="phase_line diag_event proxy_line"
+[ -n "$all" ] && tables="phase_line diag_event proxy_line filter_selfcheck filter_file filter_other proxy_selfcheck"
+what="请求数据（phase_line、diag_event；v3.1-extra 有 proxy_line 时也清）和解析失败样本，保留过滤器的文件记录"
+[ -n "$all" ] && what="全部表（phase_line、diag_event、filter_selfcheck、filter_file、filter_other；有 proxy_line、proxy_selfcheck 时也清）和解析失败样本"
 [ -n "$yes" ] || fail "这会清空面板二的$what。确认后执行：bin/clear_data.sh --yes${all:+ --all}"
 if [ "$mode" = vllm ]; then
   if [ -n "$all" ]; then echo "vllm 模式：清$what；不清镜像，不动节点和 vLLM"

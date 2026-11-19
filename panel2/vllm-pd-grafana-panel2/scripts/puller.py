@@ -4,6 +4,10 @@
 Offsets, new files and reading from where it stopped are Vector's job; copying is rsync's. This is only the small loop around them: a thread per
 machine so that one machine cannot hold up another, a timeout on each run, no second run while one is going, and the time of the last success.
 Settings come from the environment (bin/lib.sh loads deploy.env).
+v3.1-extra adds two optional sources, both off by default:
+  PROXY_COLLECT=1     the proxy's log folder PROXY_LOG_DIR on PROXY_MACHINE, mirrored the same way into PULL_DIR/_proxy/<machine>;
+  MOONCAKE_LOG_COLLECT=1  Mooncake's timing lines from MOONCAKE_LOG_FILES, fetched and paired with the pool's save records
+                      (scripts/native_put.py) into PULL_DIR/_native/<machine>/<instance>.
 """
 import atexit
 import http.server
@@ -23,6 +27,7 @@ import time
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from inventory_tool import load as load_inventory, node_machines  # noqa: E402
 from names import Names, NamesError  # noqa: E402
+import native_put  # noqa: E402
 
 ENV = os.environ
 INTERVAL = float(ENV.get("PULL_INTERVAL_S") or 10)
@@ -86,11 +91,12 @@ def folder_name(addr):
 
 
 class Machine(threading.Thread):
-    def __init__(self, addr, sources):
+    def __init__(self, addr, sources, base=None, kind="node"):
         super().__init__(daemon=True)
         self.addr, self.sources = addr, sources
+        self.base, self.kind = base or PULL_DIR, kind
         self.name_ = ""
-        self.state_file = STATE / (addr.replace(":", "_") + ".json")
+        self.state_file = STATE / (("proxy-" if kind == "proxy" else "") + addr.replace(":", "_") + ".json")
         self.last_ok = json.loads(self.state_file.read_text()).get("last_ok", 0.0) if self.state_file.exists() else 0.0
         self.last_error = ""
         self.bytes = self.errors = 0
@@ -112,7 +118,7 @@ class Machine(threading.Thread):
                 raise RuntimeError("SSH 连不上")
         multi = len(self.sources) > 1
         for i, source in enumerate(self.sources):
-            target = PULL_DIR / self.name_ / ("d%d" % i if multi else "")
+            target = self.base / self.name_ / ("d%d" % i if multi else "")
             target.mkdir(parents=True, exist_ok=True)
             code, out, err = self.rsync(source, target)
             if code == 23 and "No such file" in err and ("change_dir" in err or "link_stat" in err):
@@ -145,6 +151,8 @@ class Machine(threading.Thread):
 
 class Handler(http.server.BaseHTTPRequestHandler):
     machines = []
+    native = None
+    native_ok = [0.0]
 
     def log_message(self, *args):
         pass
@@ -152,8 +160,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         now = time.time()
         if self.path.startswith("/status"):
-            body = json.dumps([{"addr": m.addr, "node": m.name_, "last_ok": m.last_ok, "age": round(now - m.last_ok, 1) if m.last_ok else None,
-                                "bytes": m.bytes, "error": m.last_error} for m in self.machines], ensure_ascii=False)
+            rows = [{"addr": m.addr, "node": m.name_, "kind": m.kind, "last_ok": m.last_ok, "age": round(now - m.last_ok, 1) if m.last_ok else None,
+                     "bytes": m.bytes, "error": m.last_error} for m in self.machines]
+            if self.native is not None:
+                n = self.native.status()
+                rows.append({"addr": "mooncake", "node": "_native", "kind": "mooncake", "last_ok": self.native_ok[0],
+                             "age": round(now - self.native_ok[0], 1) if self.native_ok[0] else None, "bytes": 0,
+                             "error": "; ".join("%s: %s" % kv for kv in sorted(n["errors"].items()))[:200], "counts": n["counts"]})
+            body = json.dumps(rows, ensure_ascii=False)
             kind = "application/json"
         else:
             out = []
@@ -162,12 +176,45 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 out.append("# TYPE %s %s" % (metric, kind_))
                 for m in self.machines:
                     out.append('%s{machine="%s",node="%s"} %s' % (metric, m.addr, m.name_, value(m)))
+            if self.native is not None:
+                for k, v in sorted(self.native.status()["counts"].items()):
+                    out.append("# TYPE vllm_puller_mooncake_%s_total counter" % k)
+                    out.append("vllm_puller_mooncake_%s_total %s" % (k, v))
             body = "\n".join(out) + "\n"
             kind = "text/plain; version=0.0.4"
         self.send_response(200)
         self.send_header("Content-Type", kind)
         self.end_headers()
         self.wfile.write(body.encode())
+
+
+def native_loop(nat, ok):
+    """Mooncake's timing lines: fetch from every source (at most PULL_CONCURRENCY machines at a time), then pair them."""
+    last_clean = 0.0
+    while True:
+        started = time.time()
+        threads = []
+        for addr in nat.sources:
+            def one(a=addr):
+                with LIMIT:
+                    try:
+                        nat.fetch(a)
+                    except Exception as e:  # noqa: BLE001
+                        nat.errors[a] = str(e)[:200]
+            t = threading.Thread(target=one, daemon=True)
+            t.start()
+            threads.append(t)
+        for t in threads:
+            t.join(TIMEOUT)
+        try:
+            nat.run_once()
+            ok[0] = time.time()
+            if time.time() - last_clean > 600:
+                nat.clean()
+                last_clean = time.time()
+        except Exception as e:  # noqa: BLE001
+            nat.errors["associate"] = str(e)[:200]
+        time.sleep(max(1.0, INTERVAL - (time.time() - started)))
 
 
 def main():
@@ -179,11 +226,27 @@ def main():
         raw = ENV.get("NODE_LOG_DIR_RAW") or "$HOME/vllm-pd-diag/logs"
         sources = ["~/" + raw[6:] if raw.startswith("$HOME/") else raw]
     ms = [Machine(a, sources) for a in node_machines(inv)]
+    if ENV.get("PROXY_COLLECT") == "1":
+        if not ENV.get("PROXY_MACHINE") or not ENV.get("PROXY_LOG_DIR"):
+            raise SystemExit("错误：PROXY_COLLECT=1 时要填 PROXY_MACHINE 和 PROXY_LOG_DIR")
+        raw = ENV["PROXY_LOG_DIR"]
+        ms.append(Machine(ENV["PROXY_MACHINE"], ["~/" + raw[6:] if raw.startswith("$HOME/") else raw], PULL_DIR / "_proxy", "proxy"))
     Handler.machines = ms
     for m in ms:
         m.start()
+    if ENV.get("MOONCAKE_LOG_COLLECT") == "1":
+        try:
+            nat = native_put.Puller(ENV, str(PULL_DIR), str(STATE), folder_name, ssh_options, run)
+        except ValueError as e:
+            raise SystemExit("错误：%s" % e)
+        if not nat.sources:
+            raise SystemExit("错误：MOONCAKE_LOG_COLLECT=1 时要填 MOONCAKE_LOG_FILES")
+        Handler.native = nat
+        threading.Thread(target=native_loop, args=(nat, Handler.native_ok), daemon=True).start()
     addr = ("0.0.0.0", int(ENV.get("PULLER_METRICS_PORT") or 9598))
-    print("拉取程序已启动：%d 台机器，每 %g 秒一轮，读 %s，镜像到 %s" % (len(ms), INTERVAL, ",".join(sources), PULL_DIR), flush=True)
+    print("拉取程序已启动：%d 台机器，每 %g 秒一轮，读 %s，镜像到 %s%s%s" % (
+        len(ms), INTERVAL, ",".join(sources), PULL_DIR, "；proxy %s:%s" % (ENV.get("PROXY_MACHINE"), ENV.get("PROXY_LOG_DIR")) if ENV.get("PROXY_COLLECT") == "1" else "",
+        "；Mooncake 计时行 %d 个来源" % sum(len(v) for v in Handler.native.sources.values()) if Handler.native else ""), flush=True)
     http.server.ThreadingHTTPServer(addr, Handler).serve_forever()
 
 

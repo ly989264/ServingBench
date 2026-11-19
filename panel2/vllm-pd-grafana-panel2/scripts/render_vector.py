@@ -15,6 +15,11 @@ What the collector does with a line of the mirror /pull/<machine>/<instance>/<ro
   - every row gets the config_id of this segments.json (records of the line format it reads) or of the node's filter
     (its sums), which the dashboard's queries select on;
   - the filter's self-check lines go to vllm_pd.filter_selfcheck, file-open lines to vllm_pd.filter_file.
+v3.1-extra, only when segments.json reads them or deploy.env collects them (otherwise the output is v3's):
+  - /pull/_native/<machine>/<instance>/native.*.log: the puller's pd_native_put records (Mooncake's timing paired with the
+    pool's save records, scripts/native_put.py), read like the node files (role native, process save);
+  - /pull/_proxy/<machine>/<instance>/proxy.*.log: the proxy's line per request (pd_proxy_request) into vllm_pd.proxy_line,
+    its self-check lines into vllm_pd.proxy_selfcheck; /pull/_proxy and /pull/_mooncake are kept out of the node files' source.
 Generated; edit segments.json and run bin/apply_segments.sh instead of editing the output.
 """
 import json
@@ -30,6 +35,47 @@ from segtree import Tree, range_name  # noqa: E402
 API_EVENT = "api_summary"
 PREFIXES = r"^(?:chatcmpl-|cmpl-|resp[-_])"
 PROC_OF_ROLE = {"api": "api", "engine": "engine", "worker": "worker", "pool": "save"}
+NATIVE_EVENT = "pd_native_put"
+# v3.1-extra: the proxy's files (proxy patch), /pull/_proxy/<machine>/<instance>/proxy.<start>.<pid>.<seq>.log, same line format.
+PROXY_PARSE = r'''
+file_path = string!(.file)
+m = parse_regex!(file_path, r'^/pull/_proxy/(?P<node>[^/]+)/(?:d[0-9]+/)?(?P<dir>[^/]+)/proxy\.[0-9]{8}T[0-9]{6}\.[0-9]+\.[0-9]{4}\.log$')
+h = parse_regex!(string!(.message), r'^(?P<ts>[0-9T:.+-]+) \((?P<proc>[^ ]+) pid=(?P<pid>[0-9]+)\) (?P<level>[A-Z]+) \[[^\]]*\] \[PD_DIAG\] (?P<json>\{.*\})$')
+ev = object!(parse_json!(h.json))
+t = parse_timestamp!(h.ts, "%Y-%m-%dT%H:%M:%S%.3f%:z")
+. = {"ev": ev, "node": m.node, "instance": m.dir, "pid": to_int!(h.pid), "event": string!(ev.event)}
+.ts = format_timestamp!(t, "%Y-%m-%d %H:%M:%S%.3f", timezone: "UTC")
+.model = "@@MODEL@@"
+'''
+PROXY_ROW = r'''
+e = .ev
+r = {"ts": .ts, "model": .model, "node": .node, "instance": .instance, "pid": .pid}
+for_each(["request_id", "client_request_id", "api", "status", "p_addr", "d_addr"]) -> |_i, k| {
+  v = get(e, [k]) ?? null
+  if is_string(v) { r = set!(r, [k], v) }
+}
+for_each(["stream", "include_usage"]) -> |_i, k| {
+  v = get(e, [k]) ?? null
+  if is_boolean(v) {
+    b = 0
+    if v == true { b = 1 }
+    r = set!(r, [k], b)
+  }
+}
+for_each(["http_status", "n", "retries", "recompute_retries", "p_http_retries", "d_http_retries", "retry_ms", "api_gateway_ms",
+          "proxy_to_p_ms", "p_total_ms", "proxy_to_d_ms", "d_first_ms", "d_total_ms", "ttft_ms", "e2e_ms"]) -> |_i, k| {
+  v = get(e, [k]) ?? null
+  if is_integer(v) || is_float(v) { r = set!(r, [k], v) }
+}
+if !is_string(r.request_id) || r.request_id == "" { abort }
+. = r
+'''
+PROXY_SELFCHECK_ROW = r'''
+e = .ev
+. = {"ts": .ts, "node": .node, "instance": .instance, "pid": .pid, "queued": e.queued, "queue_full": e.queue_full,
+     "written": e.written, "errors": e.errors, "queue_len": e.queue_len, "last_error": e.last_error}
+if !is_string(.last_error) { .last_error = "" }
+'''
 # What the collector container runs with sh -c (bin/central_up.sh starts it; scripts/compare.py checks it in docker inspect).
 # The small loop removes dead-letter files older than 7 days, once at start and then hourly, so they cannot grow without limit.
 RUN_SCRIPT = ('while true; do find /var/lib/vector -maxdepth 1 -name "dead-letter-*.jsonl" -mtime +7 -delete 2>/dev/null; '
@@ -159,14 +205,36 @@ def strategies(tree, raw, cols):
     return out
 
 
+SHARED_PICK = r'''members_c9 = []
+if includes(%s, .event) && !is_string(.internal) {
+  mm = array(.ev.members) ?? []
+  members_c9 = filter(mm) -> |_i, m| { is_object(m) && is_string(m.request_id) && m.request_id != "" }
+}
+'''
+SHARED_SPLIT = r'''if length(members_c9) > 0 {
+  base = .
+  rows_c9, err_c9 = map_values(members_c9) -> |m| {
+    i = replace(string(m.request_id) ?? "", r'@@PREFIXES@@', "")
+    x_ = i
+    a_ = ""
+    r, err = parse_regex(i, r'^(?P<x>.+)-(?P<att>[0-9a-f]{8})$')
+    if err == null { x_ = string(r.x) ?? i; a_ = string(r.att) ?? "" }
+    merge(base, {"internal": m.request_id, "x": x_, "attempt_id": a_})
+  }
+  if err_c9 == null { . = rows_c9 }
+}
+'''
+
+
 def build(env, data_dir, conf_dir, placeholders=False):
     tree = Tree()
     raw = tree.raw
     cols = collect(tree, raw)
-    acc_ids = []
-    for a in raw.get("accumulate", []):
-        if a["id"] not in acc_ids:
-            acc_ids.append(a["id"])
+    acc_ids = list(tree.acc_ids)      # the accumulate rules, and in v3.1-extra the candidate-step rules
+    proxy_cols = tree.proxy_sourced()
+    native = NATIVE_EVENT in {ev for (_, ev) in cols} or env.get("MOONCAKE_LOG_COLLECT") == "1"
+    extra_dirs = bool(proxy_cols) or native or env.get("PROXY_COLLECT") == "1"
+    proc_of = dict(PROC_OF_ROLE, native="save") if native else PROC_OF_ROLE
     passthrough = {x if isinstance(x, str) else x["event"] for x in raw.get("passthrough", [])} | {ev for (_, ev) in cols}
     addr = env.get("CLICKHOUSE_ADDR", "")
     port = "8123" if addr == env.get("CLICKHOUSE_CONTAINER") else env.get("CLICKHOUSE_HTTP_PORT", "8123")
@@ -197,7 +265,7 @@ def build(env, data_dir, conf_dir, placeholders=False):
 
     parse = r'''
 file_path = string!(.file)
-m = parse_regex!(file_path, r'^/pull/(?P<node>[^/]+)/(?:d[0-9]+/)?(?P<dir>[^/]+)/(?P<role>api|engine|worker|pool)\.[0-9]{8}T[0-9]{6}\.[0-9]+\.[0-9]{4}\.log$')
+m = parse_regex!(file_path, r'^/pull/@@NATIVE_DIR@@(?P<node>[^/]+)/(?:d[0-9]+/)?(?P<dir>[^/]+)/(?P<role>api|engine|worker|pool@@NATIVE_ROLE@@)\.[0-9]{8}T[0-9]{6}\.[0-9]+\.[0-9]{4}\.log$')
 h = parse_regex!(string!(.message), r'^(?P<ts>[0-9T:.+-]+) \((?P<proc>[^ ]+) pid=(?P<pid>[0-9]+)\) (?P<level>[A-Z]+) \[[^\]]*\] \[PD_DIAG\] (?P<json>\{.*\})$')
 ev = object!(parse_json!(h.json))
 t = parse_timestamp!(h.ts, "%Y-%m-%dT%H:%M:%S%.3f%:z")
@@ -214,7 +282,8 @@ if !match(inst, r'^[PD][0-9]+$') {
 if starts_with(inst, "P") { .side = "prefill" } else if starts_with(inst, "D") { .side = "decode" }
 if .side == "" { abort }
 .model = "@@MODEL@@"
-'''.replace("@@MODEL@@", model)
+'''.replace("@@MODEL@@", model).replace("@@NATIVE_DIR@@", "(?:_native/)?" if native else "").replace(
+        "@@NATIVE_ROLE@@", "|native" if native else "")
 
     ids = r'''
 # The request key X: <prefix>-<X>-<8 hex> inside vLLM (request_id), <prefix>-<X> at the API (external_req_id);
@@ -253,8 +322,12 @@ if is_string(.ev.observation_id) { .observation_id = .ev.observation_id }
     w("enrichment_tables:\n  inventory:\n    type: file\n    file:\n      path: %s\n      encoding:\n        type: csv\n    schema:\n      addr: string\n      name: string"
       % vrl_str(conf_dir + "/inventory.csv"))
     w("sources:\n  vector_metrics:\n    type: internal_metrics\n    scrape_interval_secs: 5\n  timing:\n    type: file\n"
-      "    include: [\"/pull/**/*.log\"]\n    read_from: beginning\n    ignore_older_secs: 604800\n    max_line_bytes: 1048576\n"
-      "    fingerprint:\n      strategy: checksum\n      lines: 1\n    oldest_first: true")
+      "    include: [\"/pull/**/*.log\"]\n%s    read_from: beginning\n    ignore_older_secs: 604800\n    max_line_bytes: 1048576\n"
+      "    fingerprint:\n      strategy: checksum\n      lines: 1\n    oldest_first: true" % (
+          "    exclude: [\"/pull/_proxy/**\", \"/pull/_mooncake/**\"]\n" if extra_dirs else ""))
+    if proxy_cols:
+        w("  proxy_files:\n    type: file\n    include: [\"/pull/_proxy/**/*.log\"]\n    read_from: beginning\n    ignore_older_secs: 604800\n"
+          "    max_line_bytes: 1048576\n    fingerprint:\n      strategy: checksum\n      lines: 1\n    oldest_first: true")
     w("transforms:")
 
     def remap(name, inputs, source, extra=""):
@@ -262,7 +335,16 @@ if is_string(.ev.observation_id) { .observation_id = .ev.observation_id }
             name, json.dumps(inputs), extra, "\n".join("      " + x for x in source.strip("\n").splitlines())))
 
     remap("parse", ["timing"], parse, "    drop_on_error: true\n    reroute_dropped: true\n")
-    w("  dead_letter_sample:\n    type: throttle\n    inputs: [parse.dropped]\n    threshold: 10\n    window_secs: 60")
+    w("  dead_letter_sample:\n    type: throttle\n    inputs: %s\n    threshold: 10\n    window_secs: 60" % (
+        "[parse.dropped, proxy_parse.dropped]" if proxy_cols else "[parse.dropped]"))
+    if proxy_cols:
+        remap("proxy_parse", ["proxy_files"], PROXY_PARSE.replace("@@MODEL@@", model), "    drop_on_error: true\n    reroute_dropped: true\n")
+        w("  proxy_kind:\n    type: route\n    inputs: [proxy_parse]\n    route:\n"
+          "      request: '.event == \"pd_proxy_request\"'\n      selfcheck: '.event == \"pd_proxy_selfcheck\"'")
+        remap("proxy_row", ["proxy_kind.request"], PROXY_ROW, "    drop_on_abort: true\n")
+        remap("proxy_selfcheck_row", ["proxy_kind.selfcheck"], PROXY_SELFCHECK_ROW)
+        # The proxy file's first line (pd_file_open) names the file for the collector's fingerprint only; it is not a
+        # filter's file and stays out of vllm_pd.filter_file, which the checks read as the nodes' instances.
     w("  by_kind:\n    type: route\n    inputs: [parse]\n    route:\n"
       "      file_open: '.event == \"pd_file_open\"'\n      selfcheck: '.event == \"pd_filter_selfcheck\"'\n"
       "      partial: '.event == \"pd_seg_partial\"'\n      event: '%s'" % (
@@ -286,7 +368,7 @@ if !is_integer(.end_ns) { .end_ns = null }
 if !is_string(.execution_id) { .execution_id = null }
 ''')
     # Sparse phase_line rows from the events a segment reads.
-    remap("phase_src", ["by_kind.event"], ids + r'''
+    phase_src = ids + r'''
 if !includes(%s, .event) { abort }
 .proc = get(value: %s, path: [string!(.role)]) ?? "api"
 .scope = .ev.scope
@@ -313,8 +395,14 @@ if length(subs) > 0 {
   base = .
   . = map_values(subs) -> |l| { merge(base, {"x": replace(string(l.external_req_id) ?? "", r'%s', "")}) }
 }
-''' % (json.dumps(mapped), json.dumps(PROC_OF_ROLE), to_rows, json.dumps(record_version), vrl_str(cfg), vrl_str(API_EVENT), PREFIXES),
-          "    drop_on_abort: true\n")
+''' % (json.dumps(mapped), json.dumps(proc_of), to_rows, json.dumps(record_version), vrl_str(cfg), vrl_str(API_EVENT), PREFIXES)
+    shared = raw.get("shared_members") or []
+    if shared:
+        # v3.1-extra, C9: a record of these events that names no single request (a cache-pool task shared by several)
+        # counts in full for every request of its members[], as a shared step does; one row per member.
+        phase_src = phase_src.replace("del(.ev)\ndel(.raw)\n", SHARED_PICK % json.dumps(shared) + "del(.ev)\ndel(.raw)\n", 1) + SHARED_SPLIT.replace(
+            "@@PREFIXES@@", PREFIXES)
+    remap("phase_src", ["by_kind.event"], phase_src, "    drop_on_abort: true\n")
     w("  phase_split:\n    type: route\n    inputs: [phase_src]\n    route:\n"
       "      api: '.event == %s && is_string(.observation_id) && is_string(.x)'\n"
       "      direct: '!(.event == %s && is_string(.observation_id) && is_string(.x))'" % (vrl_str(API_EVENT), vrl_str(API_EVENT)))
@@ -355,7 +443,7 @@ del(.observation_id)
 del(.task_id)
 del(.proc_name)
 del(.pid)
-''' % json.dumps(PROC_OF_ROLE), "    drop_on_abort: true\n")
+''' % json.dumps(proc_of), "    drop_on_abort: true\n")
     remap("selfcheck_row", ["by_kind.selfcheck"], r'''
 e = .ev
 . = {"ts": .ts, "node": .node, "instance": .instance, "pid": e.pid, "config_version": e.config_version,
@@ -364,7 +452,10 @@ e = .ev
      "partials_written": e.partials_written, "evicted": e.evicted, "forced": e.forced, "config_reloads": e.config_reloads,
      "config_errors": e.config_errors, "inflight": e.inflight, "python": e.python, "files": e.files, "role": .role,
      "instance_source": e.instance_source, "dp_rank_argv": e.dp_rank_argv, "version_dropped": e.version_dropped}
-''')
+''' + ("""if is_integer(e.cand_maps) { .cand_maps = e.cand_maps; .cand_applied = e.cand_applied; .cand_unpaired = e.cand_unpaired; .cand_evicted_full = e.cand_evicted_full }
+""" if raw.get("candidate") else "") + ("""if is_object(e.acc_fallback) { .acc_fallback = e.acc_fallback }
+""" if any(isinstance(a.get("value"), list) for a in raw.get("accumulate", [])) else "") + ("""if is_integer(e.exec_missing) { .exec_missing = e.exec_missing }
+""" if raw.get("missing_execution_id") else ""))
     # Anything that is neither a request-level event nor the filter's own lines: on a node whose filter works there is none.
     remap("other_row", ["by_kind._unmatched"], r'''
 . = {"ts": .ts, "node": .node, "instance": .instance, "role": .role, "pid": .pid, "event": .event}
@@ -389,6 +480,9 @@ e = .ev
     sink("ch_selfcheck", ["selfcheck_row"], "filter_selfcheck")
     sink("ch_file", ["file_row"], "filter_file")
     sink("ch_other", ["other_row"], "filter_other")
+    if proxy_cols:
+        sink("ch_proxy", ["proxy_row"], "proxy_line")
+        sink("ch_proxy_selfcheck", ["proxy_selfcheck_row"], "proxy_selfcheck")
     w("  dead_letter:\n    type: file\n    inputs: [dead_letter_sample]\n    path: %s\n    encoding:\n      codec: json"
       % vrl_str(data_dir + "/dead-letter-%Y-%m-%d.jsonl"))
     w("  metrics:\n    type: prometheus_exporter\n    inputs: [vector_metrics]\n    address: \"0.0.0.0:9598\"")

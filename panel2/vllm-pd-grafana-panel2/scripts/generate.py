@@ -25,6 +25,7 @@ from segtree import PACK, Tree, range_name  # noqa: E402
 
 TABLE = "vllm_pd.phase_line"
 LINE = "vllm_pd.phase_line_cur"
+PROXY = "vllm_pd.proxy_line"     # v3.1-extra: one row per request from the proxy's line, read when a proxy segment has a src
 EVENT = "vllm_pd.diag_event"
 SEL = "${instance:singlequote}"
 REQ_FILTER = f"s.model = '$model' AND (s.p_instance IN ({SEL}) OR s.d_instance IN ({SEL}))"
@@ -91,7 +92,10 @@ def col(alias, name):
 def side_total(tree, role, alias="s"):
     """P 合计 / D 合计: each side's API server, from receiving the request to the last byte (api_summary[http] end_ns - start_ns)."""
     own = col(alias, "p_total_ms" if role == "prefill" else "d_total_ms")
-    head = "+".join(f"ifNull({col(alias, n.column)}, 0)" for n in tree.sides[role]["proxy"]) or "0"
+    # Segments measured by the proxy (v3.1-extra, a src on the proxy line) stay out of the total: P 合计 and D 合计 are the
+    # API server's own (decision C5). Those without a src are always empty, as in v3.
+    sourced = {c for c, _ in tree.proxy_sourced()}
+    head = "+".join(f"ifNull({col(alias, n.column)}, 0)" for n in tree.sides[role]["proxy"] if n.column not in sourced) or "0"
     return f"if({own} > 0, {head} + {own}, NULL)"
 
 
@@ -102,14 +106,35 @@ def alias_of(node, alias):
 
 # ---- one row per request: the anchor every panel starts from --------------------------------------------------------
 
+# The proxy line's fields the per-request JSON reads (v3.1-extra), with the names the anchor gives them.
+PROXY_JSON = (("px_client_request_id", "anyIf(client_request_id, client_request_id != '')"), ("px_retries", "max(retries)"),
+              ("px_ttft_ms", "max(ttft_ms)"), ("px_e2e_ms", "max(e2e_ms)"), ("px_retry_ms", "max(retry_ms)"))
+
+
 def anchor(tree, where_rows, having="1"):
-    """One row per request key X, from the API rows of both sides. Columns of the proxy stay empty."""
+    """One row per request key X, from the API rows of both sides. Columns of the proxy stay empty, except those of
+    segments that read the proxy's line (v3.1-extra): they come from vllm_pd.proxy_line, joined by the request key."""
+    sourced = tree.proxy_sourced()
     proxy = []
     for role in ("prefill", "decode"):
         for n in tree.sides[role]["proxy"]:
-            if n.column not in proxy:
+            if n.column not in proxy and n.column not in {c for c, _ in sourced}:
                 proxy.append(n.column)
     nulls = "".join(f", CAST(NULL AS Nullable(Float32)) AS {c}" for c in proxy)
+    inner = api_anchor(nulls, where_rows, having)
+    if not sourced:
+        return inner
+    cols = ", ".join(f"px.{c} AS {c}" for c, _ in sourced)
+    aggs = ", ".join(f"max({f}) AS {c}" for c, f in sourced)
+    extra = ", ".join(f"{e} AS {n}" for n, e in PROXY_JSON)
+    return (
+        f"(SELECT a.*, {cols}, px.px_found AS px_found, {', '.join(f'px.{n} AS {n}' for n, _ in PROXY_JSON)} FROM {inner} AS a\n"
+        f"  LEFT JOIN (SELECT request_id, {aggs}, toUInt8(1) AS px_found, {extra} FROM {PROXY} WHERE {where_rows} GROUP BY request_id) AS px"
+        " ON px.request_id = a.request_id)"
+    )
+
+
+def api_anchor(nulls, where_rows, having):
     return (
         "(SELECT *, t_min AS ts FROM (SELECT request_id, min(ts) AS t_min, any(model) AS model,\n"
         "    anyIf(instance, role = 'prefill') AS p_instance, anyIf(instance, role = 'decode') AS d_instance,\n"
@@ -171,7 +196,9 @@ def rows_of(tree, role):
     def add(node):
         procs = node.procs()
         source = "summary" if node.phase == "proxy" else "fold"
-        rows.append(Row(tree_label(node), source, value_expr(node), procs, node.optional, node.phase != "background", node.phase == "tpot", node.columns_below()))
+        # A proxy segment with a src is measured outside the API server's total (C5): no share of it.
+        share = node.phase != "background" and not (node.phase == "proxy" and node.src)
+        rows.append(Row(tree_label(node), source, value_expr(node), procs, node.optional, share, node.phase == "tpot", node.columns_below()))
         for c in node.children:
             add(c)
 
@@ -659,9 +686,13 @@ def json_group(nodes, alias, rest=False):
     return "tuple(" + ", ".join(p[0] for p in pairs) + ")", "Tuple(" + ", ".join(f"{n.id} {p[1]}" for n, p in zip(nodes, pairs)) + ")"
 
 
+PROXY_PATHS = ["client_request_id", "route.retries", "latency_ms.e2e", "latency_ms.ttft", "latency_ms.retry_ms"]
+
+
 def not_collected(tree):
-    """JSON paths that are null in every document: proxy fields, and segments the patch has no timer for."""
-    out = ["session_id", "client_request_id", "route.retries", "latency_ms.e2e", "latency_ms.ttft", "latency_ms.retry_ms"]
+    """JSON paths that are null in every document: proxy fields (only when no segment reads the proxy's line; otherwise
+    they are listed per document, see views_sql), and segments the patch has no timer for."""
+    out = ["session_id"] + ([] if tree.proxy_sourced() else PROXY_PATHS)
     groups = (("ttft.p", "prefill", ("proxy", "ttft")), ("ttft.d", "decode", ("proxy", "ttft")),
               ("tpot.d", "decode", ("tpot",)), ("background.p", "prefill", ("background",)), ("background.d", "decode", ("background",)))
     groups = [g for g in groups if any(tree.sides[g[1]][ph] for ph in g[2])]
@@ -697,14 +728,27 @@ def views_sql(tree):
     n = "round(toFloat64(%s), 3)"
     happened = "nullIf(round(toFloat64(%s), 3), 0)"
     missing = "[" + ", ".join("'%s'" % m for m in not_collected(tree)) + "]"
+    if tree.proxy_sourced():
+        # v3.1-extra: the proxy's own numbers (C5: only here and in the proxy segments), null without a proxy line.
+        px = {"cid": "if(s.px_found = 1, nullIf(toString(s.px_client_request_id), ''), NULL)",
+              "retries": "if(s.px_found = 1, toNullable(toUInt8(least(ifNull(s.px_retries, 0), 255))), NULL)",
+              "e2e": "if(s.px_found = 1, toNullable(round(toFloat64(s.px_e2e_ms), 3)), NULL)",
+              "starts": "if(s.px_found = 1, 'proxy', 'instance')",
+              "ttft": "if(s.px_found = 1, toNullable(round(toFloat64(s.px_ttft_ms), 3)), NULL)",
+              "retry": "if(s.px_found = 1, toNullable(round(toFloat64(s.px_retry_ms), 3)), NULL)"}
+        missing_px = "if(s.px_found = 1, [], [%s])" % ", ".join("'%s'" % m for m in PROXY_PATHS)
+    else:
+        px = {"cid": "CAST(NULL AS Nullable(String))", "retries": "CAST(NULL AS Nullable(UInt8))", "e2e": "CAST(NULL AS Nullable(Float64))",
+              "starts": "'instance'", "ttft": "CAST(NULL AS Nullable(Float64))", "retry": "CAST(NULL AS Nullable(Float64))"}
+        missing_px = None
     expr = (
-        "tuple('vllm_pd.request.v2', s.request_id, CAST(NULL AS Nullable(String)), CAST(NULL AS Nullable(String)), toString(s.model), "
+        f"tuple('vllm_pd.request.v2', s.request_id, CAST(NULL AS Nullable(String)), {px['cid']}, toString(s.model), "
         "concat(replaceOne(toString(coalesce(s.p_ts, s.d_ts, s.ts)), ' ', 'T'), 'Z'), "
-        "tuple(nullIf(toString(s.p_instance), ''), nullIf(toString(s.d_instance), ''), CAST(NULL AS Nullable(UInt8))), "
+        f"tuple(nullIf(toString(s.p_instance), ''), nullIf(toString(s.d_instance), ''), {px['retries']}), "
         "tuple(toString(s.status), toString(s.finish_reason), s.http_status), "
         "tuple(s.prompt_tokens, s.cached_tokens, s.output_tokens), "
-        f"tuple(CAST(NULL AS Nullable(Float64)), 'instance', CAST(NULL AS Nullable(Float64)), {happened % 's.tpot_ms'}, "
-        f"{n % side_total(tree, 'prefill')}, {n % side_total(tree, 'decode')}, CAST(NULL AS Nullable(Float64)), "
+        f"tuple({px['e2e']}, {px['starts']}, {px['ttft']}, {happened % 's.tpot_ms'}, "
+        f"{n % side_total(tree, 'prefill')}, {n % side_total(tree, 'decode')}, {px['retry']}, "
         f"tuple(tuple({n % 's.p_e2e_ms'}, {n % 's.p_ttft_ms'}), tuple({n % 's.d_e2e_ms'}, {n % 's.d_ttft_ms'}, {happened % 's.tpot_ms'}))), "
         f"tuple({pv}, {dv}), "
         f"tuple(d.steps_rest, {rv}), "
@@ -712,7 +756,7 @@ def views_sql(tree):
         f"tuple(if(s.p_total_ms > 0, {n % ('s.p_total_ms - (' + p_l1 + ')')}, NULL), if(s.d_first_ms > 0, {n % ('s.d_first_ms - (' + d_l1 + ')')}, NULL)), "
         f"tuple({recorded('prefill', 'p')}, {recorded('decode', 'd')}), "
         "greatest(ifNull(p.attempts, 0), ifNull(d.attempts, 0)), "
-        f"arrayConcat({missing}, if(ifNull(p.lines, 0) = {len(REQUEST_PROCS)}, [], [concat('prefill: ', toString(ifNull(p.lines, 0)), "
+        f"arrayConcat({missing}, {missing_px + ', ' if missing_px else ''}if(ifNull(p.lines, 0) = {len(REQUEST_PROCS)}, [], [concat('prefill: ', toString(ifNull(p.lines, 0)), "
         f"' of {len(REQUEST_PROCS)} processes')]), "
         f"if(ifNull(d.lines, 0) = {len(REQUEST_PROCS)}, [], [concat('decode: ', toString(ifNull(d.lines, 0)), ' of {len(REQUEST_PROCS)} processes')])))"
     )
@@ -839,6 +883,49 @@ TTL toDate(ts) + INTERVAL {ttl} DAY
 SETTINGS ttl_only_drop_parts = 1;"""
 
 
+# v3.1-extra: the proxy's line (proxy patch, event pd_proxy_request), one row per request; times in ms on the proxy's clock.
+PROXY_TABLE = """CREATE TABLE IF NOT EXISTS vllm_pd.proxy_line
+(
+    ts DateTime64(3, 'UTC'), request_id String CODEC(ZSTD(1)), client_request_id String DEFAULT '' CODEC(ZSTD(1)),
+    model LowCardinality(String), node LowCardinality(String), instance LowCardinality(String), pid UInt32,
+    api LowCardinality(String) DEFAULT '', status LowCardinality(String) DEFAULT '', http_status Nullable(UInt16),
+    stream Nullable(UInt8), include_usage Nullable(UInt8), n Nullable(UInt16), p_addr LowCardinality(String) DEFAULT '',
+    d_addr LowCardinality(String) DEFAULT '', retries Nullable(UInt16), recompute_retries Nullable(UInt16),
+    p_http_retries Nullable(UInt16), d_http_retries Nullable(UInt16), retry_ms Nullable(Float32), api_gateway_ms Nullable(Float32),
+    proxy_to_p_ms Nullable(Float32), p_total_ms Nullable(Float32), proxy_to_d_ms Nullable(Float32), d_first_ms Nullable(Float32),
+    d_total_ms Nullable(Float32), ttft_ms Nullable(Float32), e2e_ms Nullable(Float32),
+    INDEX idx_request_id request_id TYPE bloom_filter(0.001) GRANULARITY 1
+)
+ENGINE = MergeTree
+PARTITION BY toDate(ts)
+ORDER BY (ts, request_id)
+TTL toDate(ts) + INTERVAL {ttl} DAY
+SETTINGS ttl_only_drop_parts = 1;"""
+PROXY_SELFCHECK_TABLE = """CREATE TABLE IF NOT EXISTS vllm_pd.proxy_selfcheck
+(
+    ts DateTime64(3, 'UTC'), node LowCardinality(String), instance LowCardinality(String), pid UInt32,
+    queued UInt64, queue_full UInt64, written UInt64, errors UInt64, queue_len UInt64, last_error String DEFAULT ''
+)
+ENGINE = MergeTree
+PARTITION BY toDate(ts)
+ORDER BY (node, instance, ts)
+TTL toDate(ts) + INTERVAL {ttl} DAY
+SETTINGS ttl_only_drop_parts = 1;"""
+
+
+# v3.1-extra: the filter's counts of first-candidate pairings (segments.json "candidate"), in its self-check line.
+CAND_COUNTS = (("cand_maps", "UInt64"), ("cand_applied", "UInt64"), ("cand_unpaired", "UInt64"), ("cand_evicted_full", "UInt64"))
+# v3.1-extra, C14: per accumulate rule whose value is a list of paths, how many records took a later path.
+FALLBACK_COUNTS = (("acc_fallback", "Map(String, UInt64)"),)
+# v3.1-extra: records with no execution_id (segments.json "missing_execution_id").
+EXEC_COUNTS = (("exec_missing", "UInt64"),)
+
+
+def acc_lists(raw):
+    """Ids of the accumulate rules whose value is a list of paths (the first that is not null)."""
+    return [a["id"] for a in raw.get("accumulate", []) if isinstance(a.get("value"), list)]
+
+
 def line_columns(tree):
     """(name, type) of every value column of phase_line beyond the base ones."""
     out = []
@@ -877,13 +964,16 @@ SETTINGS ttl_only_drop_parts = 1;""",
         FILE_TABLE.format(ttl=SUMMARY_TTL_DAYS),
         OTHER_TABLE.format(ttl=SUMMARY_TTL_DAYS),
     ]
+    if tree.proxy_sourced():
+        out += [PROXY_TABLE.format(ttl=SUMMARY_TTL_DAYS), PROXY_SELFCHECK_TABLE.format(ttl=SUMMARY_TTL_DAYS)]
     for c, t in cols + [("api_start_ts", "Nullable(DateTime64(3, 'UTC'))"), ("api_end_ts", "Nullable(DateTime64(3, 'UTC'))"),
                         ("config_id", "LowCardinality(String) DEFAULT ''"), ("first_exec", "String DEFAULT '' CODEC(ZSTD(1))"),
                         ("core_mono_ns", "Nullable(Int64)")]:
         out.append(f"ALTER TABLE {TABLE} ADD COLUMN IF NOT EXISTS {c} {t};")
     # Columns added after the first version of the self-check table, for a ClickHouse that keeps an earlier install's data.
     for c, t in (("instance_source", "LowCardinality(String)"), ("dp_rank_argv", "Nullable(Int32)"),
-                 ("pair_unmatched", "UInt64"), ("pair_negative", "UInt64"), ("version_dropped", "UInt64")):
+                 ("pair_unmatched", "UInt64"), ("pair_negative", "UInt64"), ("version_dropped", "UInt64")) + CAND_COUNTS * bool(tree.raw.get("candidate")) + \
+            FALLBACK_COUNTS * bool(acc_lists(tree.raw)) + EXEC_COUNTS * bool(tree.raw.get("missing_execution_id")):
         out.append(f"ALTER TABLE vllm_pd.filter_selfcheck ADD COLUMN IF NOT EXISTS {c} {t};")
     # Retention follows deploy.env every time this runs (EVENT_TTL_DAYS, SUMMARY_TTL_DAYS).
     out.append(f"ALTER TABLE {TABLE} MODIFY TTL toDate(ts) + INTERVAL {SUMMARY_TTL_DAYS} DAY;")
@@ -891,6 +981,9 @@ SETTINGS ttl_only_drop_parts = 1;""",
     out.append(f"ALTER TABLE vllm_pd.filter_selfcheck MODIFY TTL toDate(ts) + INTERVAL {SUMMARY_TTL_DAYS} DAY;")
     out.append(f"ALTER TABLE vllm_pd.filter_file MODIFY TTL toDate(ts) + INTERVAL {SUMMARY_TTL_DAYS} DAY;")
     out.append(f"ALTER TABLE vllm_pd.filter_other MODIFY TTL toDate(ts) + INTERVAL {SUMMARY_TTL_DAYS} DAY;")
+    if tree.proxy_sourced():
+        out.append(f"ALTER TABLE {PROXY} MODIFY TTL toDate(ts) + INTERVAL {SUMMARY_TTL_DAYS} DAY;")
+        out.append(f"ALTER TABLE vllm_pd.proxy_selfcheck MODIFY TTL toDate(ts) + INTERVAL {SUMMARY_TTL_DAYS} DAY;")
     return "\n".join(out) + "\n"
 
 
