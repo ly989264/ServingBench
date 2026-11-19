@@ -1,0 +1,10 @@
+# 面板二诊断工具 MANIFEST：每行一个文件的 sha256 和相对本目录的路径（不含本文件）
+# 校验：grep -E '^[0-9a-f]{64}  ' MANIFEST.txt | sha256sum -c
+3a1e91cb29f8369baad431e9522d8be161e1f77d2605a1790551e1751b54db47  README.zh-CN.md
+6b8f267b30003f579420b2e02f352b40692e58719b03b7e33d0a25b7cde69933  diag.conf.example
+cbd6ee81a6bde4ee7b84a905dfbb04ff9b0c0c8de344808bc5a26d3ed3f699f9  diag.py
+dc1756a25178b14aa708ca7f02ba27fa249ab83eb87c64776c2a052039f967b4  diag.sh
+04285af8c68a7650d1410781b5348075c4a8ea0e0760ac72fca05308d24d35d7  profiles/rc1-2026-11-16-D.json
+e2c532d3a8cd4dc793d0e24b7031ea887883caa099d08be19aca4d054ad39232  profiles/rc1-2026-11-16-P.json
+391df215b92eed75d52f94d516417b013f6eb4072258bface9ae9ed914b89b0a  profiles/server-2026-11-12.json
+b556340d9dd96c09330f91fe035f4408f8b79dbc9902abc598f9a473d678d3f9  tools/check_pd_diag_format.py

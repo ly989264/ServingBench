@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "disable_existing_loggers": false,
+  "formatters": {
+    "vllm": {
+      "()": "pd_diag_logfilter.VllmTextFormatter",
+      "datefmt": "%m-%d %H:%M:%S"
+    }
+  },
+  "filters": {
+    "no_pd_diag": {
+      "()": "pd_diag_logfilter.DropPdDiag"
+    }
+  },
+  "handlers": {
+    "vllm": {
+      "class": "logging.StreamHandler",
+      "formatter": "vllm",
+      "level": "INFO",
+      "stream": "ext://sys.stdout",
+      "filters": ["no_pd_diag"]
+    },
+    "pd_diag": {
+      "()": "pd_diag_logfilter.PdDiagHandler",
+      "level": "INFO"
+    }
+  },
+  "loggers": {
+    "vllm": {
+      "handlers": ["vllm", "pd_diag"],
+      "level": "INFO",
+      "propagate": false
+    }
+  }
+}
