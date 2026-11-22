@@ -19,7 +19,7 @@
 
 只用一条路径：`tests/t41/build_pack.sh <输出目录> [提交]` 从一个提交 `git archive` 出部署包，`tests/t41/pack_dist.sh` 组装交付目录（tar、sha256、更新脚本、手册）。`build_pack.sh` 已在本仓库布局下运行过；`pack_dist.sh` 没有：它是 v3 交付时写的，其中 `git show <提交>:update/…` 的路径按开发仓库根目录写（本仓库为 `panel2/update/…`），并依赖不进 git 的已填路径文件，下次出交付目录前要先改（`docs/50-已知问题与待办.md` K72）。v3.1-extra 的交付目录不是用它组装的。demo 目录的 `tools/build_panel2_pack.sh` 已废弃，不在本仓库。
 
-2026-11-19 核对：用本仓库的两个提交分别出包，包内文件与在用的两个 tar 逐文件相同，只有 `MANIFEST.txt` 的构建时间和来源提交一行不同——v3 提交对应 glm53-1 的 3e98c2b4（原件 built 2026-11-16 from 765a0fc），v3.1-extra 提交对应 test-glm53 的 e3885b93（原件 built 2026-11-19 from 7ef24eb）。
+2026-11-19 核对：用本仓库的两个提交分别出包，包内文件与在用的两个 tar 逐文件相同，只有 `MANIFEST.txt` 的构建时间和来源提交一行不同——v3 提交对应 glm53-1 的 3e98c2b4（原件 built 2026-11-16 from 765a0fc），v3.1-extra 提交对应 test-glm53 的 e3885b93（原件 built 2026-11-19 from 7ef24eb）。2026-11-22 核对：用同步 v3.4-extra 以后的本仓库 `tests/t41/build_pack.sh <输出目录> HEAD` 出包，包内文件与 `b883692a` 逐文件相同，只有 `MANIFEST.txt` 第 3 行（构建时间和来源提交）不同。
 
 ## 测试
 
