@@ -2,6 +2,7 @@
 # 列：上一层文件夹  集群名（部署包里的名字）  子文件夹  [看板标题里显示的名字]
 # 子文件夹就是这个集群的模型文件夹（MODEL_GROUP）。第 4 列只在显示名和集群名不同时写：
 # arrange_boards.py 把这个集群面板一两张看板标题末尾的「（集群名）」改成「（第 4 列）」。
+# 上一层文件夹写 - 表示顶层：看板直接放进以第 3 列为名的顶层文件夹，第 3 列仍是这个集群的模型文件夹。
 GLM-5.3        glm53-0        glm53-0
 GLM-5.3        glm53-1        glm53-1
 GLM-5.3        test           glm53-1
@@ -11,3 +12,4 @@ dsv4.1-flash   dsv41-flash-2  dsv4.1-flash-2  dsv4.1-flash-2
 dsv4.1-flash   dsv41-flash-3  dsv4.1-flash-3  dsv4.1-flash-3
 dsv4.1-flash   dsv41-flash-4  dsv4.1-flash-4  dsv4.1-flash-4
 dsv4.1-flash   dsv41-flash-5  dsv4.1-flash-5  dsv4.1-flash-5
+-              test-glm53     GLM-5.3-test

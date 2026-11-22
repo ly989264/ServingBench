@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Put each cluster's Grafana dashboards into the two-level folders of boards_layout.txt, and keep each cluster's
-model folder (MODEL_GROUP) equal to its subfolder.
+model folder (MODEL_GROUP) equal to its subfolder. A layout line whose first column is - puts the cluster's
+dashboards into a top-level folder instead: its third column, which is then the cluster's model folder.
 
 Usage:
     python3 arrange_boards.py folder <cluster>
@@ -14,16 +15,19 @@ plan    read-only: lists what apply would change, one line each, and the folders
 apply   for every cluster of the layout that the registry has:
           1. its model folder: the registry's model_group and MODEL_GROUP in the deploy.env of each of its panels are
              set to its subfolder (the deploy packs then find that title, and their checks stay as they are);
-          2. the folders: the top-level folder and the subfolder are created when missing;
+          2. the folders: the top-level folder and the subfolder (for a - line: the top-level folder of its third
+             column) are created when missing;
           3. its dashboards (by UID, from the registry) are moved into the subfolder; with a fourth layout column the
              cluster name at the end of its two panel-1 titles is replaced by that name;
-          4. top-level folders named like a subfolder of the layout, and subfolders of a cluster that is no longer
-             registered, are deleted when they are empty (no dashboard, subfolder, alert rule or library panel).
+          4. top-level folders named like a subfolder of the layout, subfolders of a cluster that is no longer
+             registered, and the folders the dashboards of a - line are moved out of, are deleted when they are empty
+             (no dashboard, subfolder, alert rule or library panel).
         Before changing anything it copies the registry and the deploy.env files into
         ~/vllm-pd-arrange-backup/<time>/ and records every change there (manifest.json). Running it again when
         everything is in place changes nothing and makes no backup.
 undo    puts back what one apply changed, from its backup folder: dashboards (folder and title), model folders,
-        and the folders it created when they are empty again. Items changed since are reported and left alone.
+        and the folders it created when they are empty again. A folder apply deleted is created again (same title,
+        same parent, new uid) when a dashboard moves back into it. Items changed since are reported and left alone.
 state   read-only: one line per registered cluster's model folder, per file of its panels (sha256, first 8
         characters), per dashboard (version, folder, title) and per running container (start time). Two outputs
         compared with diff show what changed in between.
@@ -54,6 +58,7 @@ LAYOUT = os.path.join(HERE, "boards_layout.txt")
 CLUSTER_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?$")  # the rule of the deploy packs' names.py
 NAME_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,62}[A-Za-z0-9])?$")  # folder titles: written into deploy.env as they are
 GRAFANA_KEYS = ("GRAFANA_URL", "GRAFANA_USER", "GRAFANA_PASSWORD", "GRAFANA_TOKEN")
+TOP = "-"  # first layout column of a cluster whose dashboards go into a top-level folder
 FILES = {"panel1": ("deploy.env", "prometheus/prometheus.yml", "prometheus/inventory.json"), "panel2": ("deploy.env", "inventory.json")}
 
 
@@ -89,6 +94,8 @@ def load_layout(path=LAYOUT):
             raise Bad("对照表第 %d 行：写成 上一层文件夹 集群名 子文件夹 [标题里的名字]" % no)
         parent, cluster, child = w[:3]
         title = w[3] if len(w) == 4 else None
+        if parent == TOP:
+            parent = None  # the dashboards go into the top-level folder named child
         if not CLUSTER_RE.match(cluster):
             raise Bad("对照表第 %d 行：集群名 %s 不合规" % (no, cluster))
         for x in (parent, child, title):
@@ -97,12 +104,12 @@ def load_layout(path=LAYOUT):
         if cluster in seen:
             raise Bad("对照表第 %d 行：集群 %s 在第 %d 行已经有了" % (no, cluster, seen[cluster]))
         if parent_of.setdefault(child, parent) != parent:
-            raise Bad("对照表第 %d 行：子文件夹 %s 已经放在 %s 下" % (no, child, parent_of[child]))
+            raise Bad("对照表第 %d 行：子文件夹 %s 已经%s" % (no, child, "放在 %s 下" % parent_of[child] if parent_of[child] else "写成顶层文件夹"))
         seen[cluster] = no
         rows.append({"parent": parent, "cluster": cluster, "child": child, "title": title})
     if not rows:
         raise Bad("对照表 %s 是空的" % path)
-    if set(parent_of) & {r["parent"] for r in rows}:
+    if set(parent_of) & {r["parent"] for r in rows if r["parent"] is not None}:
         raise Bad("对照表里有的名字既是上一层文件夹又是子文件夹")
     return rows
 
@@ -304,7 +311,7 @@ def compute(g, rows, reg):
     top = g.top()
     parents = {}
     for r in rows:
-        if r["parent"] in parents:
+        if r["parent"] is None or r["parent"] in parents:
             continue
         same = [f for f in top if f["title"] == r["parent"]]
         if len(same) > 1:
@@ -313,16 +320,27 @@ def compute(g, rows, reg):
         parents[r["parent"]] = same[0]["uid"] if same else None
     needed = []
     for r in present:
-        if r["parent"] not in needed:
+        if r["parent"] is not None and r["parent"] not in needed:
             needed.append(r["parent"])
     for p in needed:
         if parents[p] is None:
             acts.append({"kind": "mkdir", "title": p, "parent": None, "line": "建 文件夹 %s（顶层）" % p})
+    tops = {}  # the top-level folder of each - line: title -> uid (None: to be created)
+    for r in present:
+        if r["parent"] is not None or r["child"] in tops:
+            continue
+        same = [f for f in top if f["title"] == r["child"]]
+        if len(same) > 1:
+            raise Bad("顶层有 %d 个名为 %s 的文件夹（uid %s）：先在 Grafana 里把它们合成一个；什么都没有改"
+                      % (len(same), r["child"], "、".join(f["uid"] for f in same)))
+        tops[r["child"]] = same[0]["uid"] if same else None
+        if not same:
+            acts.append({"kind": "mkdir", "title": r["child"], "parent": None, "line": "建 文件夹 %s（顶层）" % r["child"]})
     kids = {p: g.children(u) for p, u in parents.items() if u}
     children = {}
     for r in present:
         key = (r["parent"], r["child"])
-        if key in children:
+        if r["parent"] is None or key in children:
             continue
         same = [f for f in kids.get(r["parent"], []) if f["title"] == r["child"]]
         if len(same) > 1:
@@ -331,9 +349,12 @@ def compute(g, rows, reg):
         children[key] = same[0]["uid"] if same else None
         if not same:
             acts.append({"kind": "mkdir", "title": r["child"], "parent": r["parent"], "line": "建 文件夹 %s/%s" % key})
-    leaving = {}
+    leaving, sources = {}, []
     for r in present:
-        target = children[(r["parent"], r["child"])]
+        if r["parent"] is None:
+            target, shown_target = tops[r["child"]], "%s（顶层）" % r["child"]
+        else:
+            target, shown_target = children[(r["parent"], r["child"])], "%s/%s" % (r["parent"], r["child"])
         for uid, panel1 in board_uids(clusters[r["cluster"]]):
             b = g.board(uid)
             if b is None:
@@ -350,7 +371,9 @@ def compute(g, rows, reg):
             if target is None or here != target or new_title != title:
                 if target is None or here != target:
                     leaving[here] = leaving.get(here, 0) + 1
-                line = "挪 看板 %s「%s」：%s → %s/%s" % (uid, title, g.path_of(here), r["parent"], r["child"])
+                    if r["parent"] is None and here and here not in sources:
+                        sources.append(here)
+                line = "挪 看板 %s「%s」：%s → %s" % (uid, title, g.path_of(here), shown_target)
                 if target is not None and here == target:
                     line = "改 看板 %s 的标题「%s」" % (uid, title)
                 if new_title != title:
@@ -358,13 +381,17 @@ def compute(g, rows, reg):
                 acts.append({"kind": "move", "uid": uid, "from": here, "from_path": g.path_of(here), "old_title": title, "new_title": new_title,
                              "parent": r["parent"], "child": r["child"], "line": line})
     child_titles = {r["child"] for r in rows}
-    in_use = {u for u in list(parents.values()) + list(children.values()) if u}
+    in_use = {u for u in list(parents.values()) + list(children.values()) + list(tops.values()) if u}
     cands = [(f, f["title"]) for f in top if f["title"] in child_titles and f["uid"] not in in_use]
     for p, u in parents.items():
         registered = {r["child"] for r in present if r["parent"] == p}
         for f in kids.get(p, []):
             if f["title"] in child_titles and f["title"] not in registered:
                 cands.append((f, "%s/%s" % (p, f["title"])))
+    for u in sources:  # the folders the dashboards of a - line leave
+        f = g.folder(u)
+        if f and u not in in_use and u not in {c["uid"] for c, _ in cands}:
+            cands.append(({"uid": u, "title": f["title"], "parentUid": f.get("parentUid") or ""}, g.path_of(u)))
     for f, shown in cands:
         c = g.counts(f["uid"])
         rest = dict(c, dashboard=c.get("dashboard", 0) - leaving.get(f["uid"], 0))
@@ -469,7 +496,9 @@ def cmd_apply(args):
             man["created"].append({"uid": uid, "title": a["title"], "parent": a["parent"]})
         elif a["kind"] == "move":
             target = created.get((a["parent"], a["child"]))
-            if target is None:
+            if target is None and a["parent"] is None:
+                target = next(f["uid"] for f in g.top() if f["title"] == a["child"])
+            elif target is None:
                 puid = created.get((None, a["parent"])) or next(f["uid"] for f in g.top() if f["title"] == a["parent"])
                 target = next(f["uid"] for f in g.children(puid) if f["title"] == a["child"])
             b = g.board(a["uid"])

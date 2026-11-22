@@ -6,7 +6,7 @@
 #             <用户目录> = 监控机上放部署包和更新脚本的个人目录（更新脚本的 USER_DIR）；
 #             ~ = 监控机上执行账号的家目录。现场值只放在 local/，不进 git。
 #
-# 状态时点：T51 两份内网手册执行完以后（2026-11-19）。test 已删除，test-glm53 已装在原来那两台机器上。
+# 状态时点：2026-11-22。test-glm53 做完 T51、T56（v3.2-extra）、T58（v3.3-extra）；v3.4-extra（T64）与 glm53-1 线上升级驱动（T53）已交付、未执行，见 pending_changes。
 #
 # 字段含义：
 #   as_of            状态时点
@@ -34,7 +34,7 @@
 #   unverified       未核实的事项
 
 schema_version: 1
-as_of: "2026-11-19"
+as_of: "2026-11-22"
 state_basis: "T51 两份手册（面板手册第 1-22 步、打补丁手册）执行完以后。2026-11-19 21:4x 时内网做到面板手册第 13 步、打补丁手册第 3 步，此后的带回输出未见"
 
 basis_values:
@@ -111,9 +111,33 @@ packages:
     built: "2026-11-19T08:48:35Z"
     config_id: "pd-diag-v3.1-extra-glm53-2026-11-19c"
     location: "<用户目录>/vllm-pd-panel2-v3.1-extra/（解在 pack/vllm-pd-grafana-panel2/）"
+    used_by: []
+    status: "已被 v3.2-extra、v3.3-extra 取代（test-glm53 原地升级）"
+    basis: "manual（面板手册第 1、11 步）"
+  - name: "面板二 v3.2-extra 部署包与更新脚本"
+    file: "vllm-pd-grafana-panel2.tar.gz、vllm_pd_update_pack2_v32extra.py"
+    version: "v3.2-extra"
+    sha256_8: "d77528d4"
+    config_id: "pd-diag-v3.2-extra-glm53-2026-11-20a"
+    location: "<用户目录>/vllm-pd-panel2-update-v3.2-extra/、<用户目录>/vllm-pd-update-v3.2-extra/"
+    used_by: []
+    status: "已被 v3.3-extra 取代"
+    basis: "manual（T56 升级手册）"
+  - name: "面板二 v3.3-extra 部署包与更新脚本"
+    file: "vllm-pd-grafana-panel2.tar.gz、vllm_pd_update_pack2_v33extra.py"
+    version: "v3.3-extra"
+    sha256_8: "d071644c"
+    config_id: "pd-diag-v3.3-extra-glm53-2026-11-20a"
+    location: "<用户目录>/vllm-pd-panel2-update-v3.3-extra/、<用户目录>/vllm-pd-update-v3.3-extra/"
     used_by: ["test-glm53"]
     status: "在用"
-    basis: "manual（面板手册第 1、11 步）"
+    basis: "manual（T58 升级手册）；用户 2026-11-21 报做完"
+  - name: "glm5.3 补丁包与 Mooncake 增量包"
+    file: "t51-glm53-patch-kit.tar（d21cc319）、t56-glm53-patch-kit.tar（0d2bc9a8）、t58-glm53-patch-kit.tar（4f59ea87）、t51-glm53-mooncake-kit.tar（6d70978c）、t58-glm53-mooncake-kit.tar（e3e338d5）、t51-glm53-proxy-kit.tar.gz（c08056fe）"
+    location: "<用户目录>/vllm-pd-patch-glm53/"
+    used_by: ["test-glm53"]
+    status: "T58 版与 Mooncake v2 在用；proxy 为 c08056fe"
+    basis: "manual（T51 打补丁手册、proxy 手册、T56、T58 升级手册）"
   - name: "面板二离线包"
     file: "vllm-pd-grafana-panel2-offline-aarch64.tar.gz"
     sha256_8: "14c00e3a"
@@ -126,7 +150,7 @@ packages:
     files: ["arrange_boards.py", "boards_layout.txt", "clusters.txt", "make_inventories.py", "SHA256SUMS"]
     location: "<用户目录>/vllm-pd-boards-clusters/"
     repo_path: "tools/"
-    note: "每次 add、更新、回滚以后执行一次 arrange_boards.py apply；boards_layout.txt 在内网为 10 行（仓库 9 行加 test-glm53 一行）"
+    note: "每次 add、更新、回滚以后执行一次 arrange_boards.py apply；boards_layout.txt 在内网为 10 行（T45 的 9 行加 T51 面板手册第 16 步的 test-glm53 一行）；v3.4-extra 更新第 5 步换成仓库 tools/ 现在的 arrange_boards.py 与 boards_layout.txt（test-glm53 放在顶层 GLM-5.3-test）"
     status: "在用"
     basis: "T45 交付；面板手册第 16 步"
   - name: "包一 v1.0 更新脚本"
@@ -185,11 +209,11 @@ clusters:
     display_name: "test-glm53"
     panels: ["panel2"]
     purpose: "glm5.3 测试集群；面板二读打过补丁的 vLLM 的真实日志，验证 L1/L2/L3 段"
-    history: "原面板二集群 test（v3，vllm，同两台机器）先删除、数据不留，再用 v3.1-extra 包全新安装"
+    history: "原面板二集群 test（v3，vllm，同两台机器）先删除、数据不留，再用 v3.1-extra 包全新安装（T51）；T56 升到 v3.2-extra，T58 升到 v3.3-extra（整集群各停一次）"
     model_group: "test-glm53"
     grafana_folder: "GLM-5.3/test-glm53"
     package:
-      panel2: {version: "v3.1-extra", sha256_8: "e3885b93", built: "2026-11-19T08:48:35Z", config_id: "pd-diag-v3.1-extra-glm53-2026-11-19c", segments_profile: "glm53"}
+      panel2: {version: "v3.3-extra", sha256_8: "d071644c", config_id: "pd-diag-v3.3-extra-glm53-2026-11-20a", segments_profile: "glm53", segments: "56 段 + 3 行对照", basis: "manual（T58 升级手册）；用户 2026-11-21 报做完"}
     mode: "vllm"
     port_base: 18110
     port_base_basis: "manual_and_mirror：面板手册第 12 步 names.py alloc 复用 test 空出的 18110；内网以该步输出为准"
@@ -220,12 +244,12 @@ clusters:
       CLICKHOUSE_MIN_DISK_GB: "85"
       NODE_MIN_DISK_GB: "50"
       CLICKHOUSE_DATA_DIR: ""
-      PROXY_COLLECT: "1（proxy 手册第 4 步；proxy 补丁和手册已交付，内网还没做，未核实）"
+      PROXY_COLLECT: "1（proxy 手册第 4 步；proxy 行已在库里：T64 查询 01a/01b，2026-11-21）"
       PROXY_MACHINE: "<proxy机器>"
       PROXY_LOG_DIR: "/data/pd-diag/logs/proxy"
       PULL_RSYNC_FLAGS: "--append --exclude=/proxy/（proxy 手册第 4 步）"
-      MOONCAKE_LOG_COLLECT: "1（面板手册第 17 步，只加 Mooncake 的 3 行；是否已写入未核实）"
-      MOONCAKE_LOG_FILES: "<P节点1>=<P 实例日志文件>"
+      MOONCAKE_LOG_COLLECT: "1（面板手册第 17 步；现值未核实）"
+      MOONCAKE_LOG_FILES: "T58 起 Mooncake 计时写在 P 机器节点目录 logs/mooncake/mc.*.log，写法按 T58 升级手册第二部分"
       MOONCAKE_TID_FALLBACK: "0"
     nodes:
       machines: 2
@@ -236,8 +260,8 @@ clusters:
     vllm:
       versions: "vLLM v0.30.0；vllm-ascend d4ad49796（现场有本地改动）；MooncakeConnectorV1 + AscendStoreConnector"
       logcfg_before_patch: "D 机器 unset；P 机器检测时没有找到运行中的 vLLM，未得到"
-      patches: "vLLM、vllm-ascend、p2d 三件按打补丁手册分三批装入；可选的 Mooncake 替换库是否已换未核实；proxy 补丁和手册已交付（proxy 补丁包 75fd49e8，proxy 手册 3925bbc7）；内网还没做，未核实"
-    expected_segments: "打补丁第 3 批做完 40 段有值；proxy 手册做完 42 段；做了 Mooncake 部分后 45 段（《执行顺序总表》）"
+      patches: "T58 版（补丁包 4f59ea87，检测应报 ok(t58)、diag_level=3(default)，未设 PD_DIAG_LEVEL）；Mooncake 替换库 T51 换 v1（2026-11-20，测试集群 .comment 例外），T58 换 v2（e3e338d5，未见带回）；proxy 现场改文件路径（c08056fe，手册 ce5ddf80）"
+    expected_segments: "glm5.3 段定义 v3.2-extra 起 56 段 + 3 行对照；T51 时按设计为空的是 P api_gateway、P start_load_kv/wait_for_transfer"
     grafana:
       boards: ["vllm-pd-request-test-glm53"]
       datasources: ["vllm-pd-clickhouse-test-glm53"]
@@ -245,7 +269,7 @@ clusters:
       - "没有面板一；自己的只告警 Prometheus 手工起，网络与镜像取自 vllm-pd-prometheus-glm53-1，不归 panel2_cluster.sh remove 管，不是 Grafana 数据源"
       - "6 个共用值取自 glm53-1 面板二的 deploy.env（--env-from）"
       - "与已删除的 test 用同两台机器、同一个节点目录 /data/pd-diag"
-    basis: "manual（《面板二：删除 test、安装 test-glm53 操作手册》第 1-22 步），节点为 intranet_output"
+    basis: "manual（《面板二：删除 test、安装 test-glm53 操作手册》第 1-22 步；T56、T58 升级手册），节点为 intranet_output"
 
   - name: "glm53-0"
     display_name: "glm53-0"
@@ -464,15 +488,19 @@ lab_mirror:
     - {item: "数据", mirror: "空库起，只有 mock 或替身数据", intranet: "真实历史"}
   basis: "T45 镜像同步记录（2026-11-18）；T52 摸底（2026-11-19）；T51 任务记录"
 
+pending_changes:
+  - {change: "面板二 v3.4-extra（T64）", effect: "test-glm53 换成 v3.4-extra（else 行、sum/sum 占比、标题行、段名去括号、只有 D 记录的请求也进表，config_id 不变）；删 glm53-1 的 mock 面板二及 12 台节点上的 ~/vllm-timing、空的 ~/vllm-pd-diag；test-glm53 看板挪到顶层 GLM-5.3-test", manual: "manuals/面板二/glm53-test面板二更新到v3.4-extra操作手册.zh-CN.md", release: "panel2-v3.4-extra-b883692a", status: "未执行（用户 2026-11-22）"}
+  - {change: "glm53-1 线上升级驱动（T53）", effect: "测试集群演练后，对 glm53-1 由监控机一个脚本经 SSH（root）并行做面板二接入和整集群打补丁", manual: "manuals/glm53-1线上/glm53-1面板二接入与整集群打补丁_一页手册.zh-CN.md", release: "glm53-drive-5b06d729", status: "未执行；在 v3.4-extra 之后"}
+
 unverified:
-  - "内网是否已做完面板手册第 14-22 步和打补丁手册（2026-11-19 21:4x 时做到面板手册第 13 步、打补丁手册第 3 步）"
+  - "T51 面板手册第 14-22 步、T56、T58 升级手册的逐步带回输出没有全部见到（T58 为用户 2026-11-21 报做完）"
   - "test-glm53 的端口基数（手册与走查为 18110，以第 12 步输出为准）"
   - "glm53-0、glm53-2、dsv41-flash-1…5 的端口基数 18120…18180（按镜像同步时的添加顺序推得）"
   - "glm53-0、glm53-2 的机器数和实例布局"
   - "Grafana 的页面端口、容器名和 GRAFANA_URL"
   - "glm53-1 面板二的 MOCK_RATE、mock 是否在跑、节点目录、CLICKHOUSE_DATA_DIR 的路径"
   - "glm53-1 清单的 vllm_ascend_patched；npu-exporter、node_exporter 的端口（镜像为 8082、9100）"
-  - "test-glm53：proxy 补丁和手册已交付，内网还没做；proxy 补丁与 PROXY_COLLECT、MOONCAKE_LOG_COLLECT 是否已开未核实；Mooncake 替换库是否已换；P 实例的 TP"
+  - "test-glm53：PROXY_COLLECT、MOONCAKE_LOG_COLLECT 的现值；Mooncake v2 是否已换；P 实例的 TP"
   - "面板一部署包目录 vllm-pd-panel1-update-2 与 vllm-pd-panel1-update-1112 是否都在"
   - "旧面板一的残留（vLLM P/D 文件夹、数据源 Prometheus、旧数据卷）"
   - "Grafana 文件夹、看板、数据源的数量"
