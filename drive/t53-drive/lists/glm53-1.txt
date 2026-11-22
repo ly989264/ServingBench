@@ -1,0 +1,28 @@
+# glm53-1（线上）的机器清单。把 <…> 换成现场的值；# 后面是说明，脚本不读。
+CLUSTER=glm53-1
+MODEL_GROUP=glm53-1                     # 看板分层表里 glm53-1 的模型文件夹（放在 GLM-5.3 下面）
+ENV_FROM=<总目录>/vllm-pd-grafana-panel2/test-glm53/deploy.env   # 取共用的 6 项：用演练装好的 test-glm53
+MODEL_NAME=<served-model-name>
+MOONCAKE=replace                        # 换 Mooncake 库（不写也是 replace）；① 的结果和 glm53-test 那次不同就停
+PROXY=on                                # proxy 打补丁（不写也是 on）
+PROXY_NEW=<工作目录>/kits/proxy_new.py
+PROXY_NEW_SHA256=<改好的 proxy 文件的 sha256>
+PROXY_ORIG_SHA256=<它对应的原文件的 sha256>
+KITS=<工作目录>/kits
+ARRANGE_DIR=<工作目录>/看板分层与加集群
+STATE=<工作目录>/state
+# 地址               角色    端口（D 一台 16 个，写成 起-止）
+<P 机器 1 地址>      P       <端口>
+<P 机器 2 地址>      P       <端口>
+<P 机器 3 地址>      P       <端口>
+<P 机器 4 地址>      P       <端口>
+<P 机器 5 地址>      P       <端口>
+<P 机器 6 地址>      P       <端口>
+<P 机器 7 地址>      P       <端口>
+<P 机器 8 地址>      P       <端口>
+<D 机器 1 地址>      D       <起>-<止>
+<D 机器 2 地址>      D       <起>-<止>
+<D 机器 3 地址>      D       <起>-<止>
+<D 机器 4 地址>      D       <起>-<止>
+# proxy 所在机器的地址（要和上面某一行相同）  proxy  端口  容器  容器里的 proxy 文件
+<proxy 机器地址>     proxy   <端口>   <proxy 容器>   <容器里 proxy 文件的绝对路径>
