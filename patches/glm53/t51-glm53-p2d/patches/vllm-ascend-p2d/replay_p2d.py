@@ -10,9 +10,11 @@ Standard library only (Python 3.9+). The input file is never modified. Steps, in
 1. Facts: structural facts of the input that the inserted code relies on (calls, loops, returns, names) are
    compared with the vllm-ascend d4ad49796 original. A difference in a "stop" fact means the replayed
    diagnostics could record wrong values, so nothing is written (exit 3). "note" facts are only printed.
-2. Changes C01..C28 are located by anchor lines, never by line numbers. Each change has a primary anchor and
-   possibly alternatives, tried in order; an alternative must match exactly one line inside its function. Any
-   change none of whose anchors matches exactly once stops the run (exit 2), naming the change.
+2. Changes C01..C29 are located by anchor lines, never by line numbers. They are applied in file order;
+   C29 (the moment the request is marked done, added for T56) sits between C14 and C15, so the numbers of
+   C15..C28 are those of the T51 version. Each change has a primary anchor and possibly alternatives, tried
+   in order; an alternative must match exactly one line inside its function. Any change none of whose
+   anchors matches exactly once stops the run (exit 2), naming the change.
 3. Checks on the result: it parses; the READ goes through _transfer_batch; the inserted records sit in the
    intended loops and branches; no function uses a name that it did not use before and that is not defined
    (exit 4).
@@ -21,6 +23,15 @@ Standard library only (Python 3.9+). The input file is never modified. Steps, in
 
 Exit codes: 0 written or check passed, 1 usage or I/O, 2 anchor, 3 stop fact, 4 result check, 5 py_compile,
 6 input already patched.
+
+T58 adds the diagnostics level (pd_diagnostics.diag_level(), read once per receiving thread; level 1 leaves out
+four request-level fields) inside code the patch already inserts: the anchors, facts and change numbers are
+those of T56.
+
+Upgrading a file that already carries the T51 or T56 p2d diagnostics (replay_p2d.py 02304c8f, 9b12baa6): exit 6
+says which. Restore the original kept when T51 was applied, prove it with the script of the version on site
+(t51/ or t56/: its replay of the backup must give the current file byte for byte), then replay this script on
+the backup (field_check/操作说明A_T58).
 """
 
 import argparse
@@ -36,8 +47,10 @@ import tempfile
 
 BASE = "vllm-ascend d4ad49796, vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py"
 BASE_SHA256 = "4e476a50afb5a7f13c274c071efc909ee823577383843b04e952bbdad21d1453"
-PATCHED_SHA256 = "f953b27c3e53c125e6d931bb35d698b5e39662485b972e056447ef9b09a61909"
+PATCHED_SHA256 = "01ce3b2a7dd5cdb10b630daa43c805d72f7d518407494d5199559ee78072c1de"
 MARKER = "from vllm.v1.metrics import pd_diagnostics as diag"
+T56_MARKER = "kv_load_envelope_ns"  # written by T56 and later; its absence after MARKER means T51
+T58_MARKER = "_pd_diag_level"  # written only by this version (T58)
 
 # --- BEGIN GENERATED TEXTS (tools/regen_replay_texts.py, from the replacement file) ---
 TEXT_HELPERS = '''MAX_TRANSFER_NATIVE_CALLS = 64
@@ -95,9 +108,42 @@ def _pd_stage_end(req_meta: dict[str, Any], name: str | None = None, *, failed: 
     for key in [name] if name is not None else list(open_stages):
         started = open_stages.pop(key, None)
         if started is not None:
-            _pd_record_stage(task, key, started, ended, failed)'''
+            _pd_record_stage(task, key, started, ended, failed)
+
+
+def _pd_mark_request_done(req_meta: dict[str, Any]) -> None:
+    """Note when the task tracker marked the request done: the end of the KV-load envelope. Never raises."""
+    try:
+        task = _pd_task(req_meta)
+        if task is not None:
+            task["request_done_ns"] = time.monotonic_ns()
+    except Exception:
+        pass
+
+
+# Request-level fields left out at diagnostics level 1; the per-task records keep their own timings.
+_PD_LEVEL2_REQUEST_FIELDS = (
+    "task_max_queue_wait_ns",
+    "task_max_meta_fetch_ns",
+    "task_max_prepare_ns",
+    "transfer_envelope_ns",
+)
+
+
+def _pd_diag_level() -> int:
+    """This process's diagnostics level: pd_diagnostics.diag_level() when the vLLM patch has it, else 3.
+
+    Only 1, 2 and 3 are levels; any other value, or any error, is 3. Call once at initialization and keep it.
+    """
+    try:
+        level_of = getattr(diag, "diag_level", None)
+        level = level_of() if callable(level_of) else 3
+        return level if type(level) is int and level in (1, 2, 3) else 3
+    except Exception:
+        return 3'''
 
 TEXT_RECEIVER_STATE = '''self.pd_connector_id = diag.new_id("pd_connector")
+self.pd_diag_level = _pd_diag_level()
 self.pd_request_tasks: dict[str, dict[str, Any]] = {}'''
 
 TEXT_ADD_REQUEST_PARAMS = '''pd_execution_id: str | None = None,
@@ -136,6 +182,11 @@ with self.request_task_counts_lock:
             "failed_bytes": 0,
             "transfer_start_ns": None,
             "transfer_end_ns": None,
+            "first_queued_ns": None,
+            "request_done_ns": None,
+            "task_max_queue_wait_ns": None,
+            "task_max_meta_fetch_ns": None,
+            "task_max_prepare_ns": None,
             "tracker_completed": False,
             "native_calls_dropped": 0,
         }
@@ -214,6 +265,8 @@ TEXT_REFORMAT_STAGE = '''with self._pd_reformat_stage(req_meta, {arg}):
 
 TEXT_REFORMAT_FAILURE = '''outcome["status"], outcome["error_type"] = "failed", type({exc}).__name__'''
 
+TEXT_REQUEST_DONE = '''_pd_mark_request_done(req_meta)'''
+
 TEXT_RECEIVER_METHODS = '''def _pd_reformat_stage(self, req_meta: dict[str, Any], request_id: str):
     """Time the post-pull reformat only when this request stashed reformat work."""
     with self.pending_reformat_lock:
@@ -263,6 +316,7 @@ def _pd_finish_task(
             failed_bytes=task["failed_bytes"],
             transfer_status=task["transfer_status"],
             tracker_completed=tracker_completed,
+            request_done_ns=task.get("request_done_ns"),
             native_calls=task["native_calls"],
             native_calls_limit=MAX_TRANSFER_NATIVE_CALLS,
             native_call_count=task["native_call_count"],
@@ -283,6 +337,20 @@ def _pd_finish_task(
             for key in ("submitted_bytes", "succeeded_bytes", "failed_bytes"):
                 summary[key] += task[key]
             summary["native_calls_dropped"] += task["native_calls_dropped"]
+            # Envelope ends and per-task maxima, merged under the same lock as the counts above.
+            if summary["first_queued_ns"] is None or task["queued_ns"] < summary["first_queued_ns"]:
+                summary["first_queued_ns"] = task["queued_ns"]
+            if task.get("request_done_ns") is not None:
+                summary["request_done_ns"] = task["request_done_ns"]
+            if self.pd_diag_level >= 2:
+                stages = task["associated_stages"]
+                for key, value in (
+                    ("task_max_queue_wait_ns", start_ns - task["queued_ns"]),
+                    ("task_max_meta_fetch_ns", (stages.get("meta_fetch") or {}).get("duration_ns")),
+                    ("task_max_prepare_ns", (stages.get("prepare") or {}).get("duration_ns")),
+                ):
+                    if value is not None and (summary[key] is None or value > summary[key]):
+                        summary[key] = value
             if summary["pending_tasks"] == 0 and summary["final_task_queued"]:
                 completed = self.pd_request_tasks.pop(req_meta["request_id"])
         if completed is not None:
@@ -293,12 +361,11 @@ def _pd_finish_task(
             )
             # A request can span several executions and remote engines. Task events
             # carry those identities; do not attribute the whole request to the last.
-            diag.emit(
-                "pd_transfer_summary",
-                **{
+            fields = dict(
+                {
                     key: value
                     for key, value in completed.items()
-                    if key not in ("transfer_start_ns", "transfer_end_ns")
+                    if key not in ("transfer_start_ns", "transfer_end_ns", "first_queued_ns", "request_done_ns")
                 },
                 status=request_status,
                 scope="request_generation",
@@ -316,9 +383,19 @@ def _pd_finish_task(
                     else None
                 ),
                 timing_scope="native_read_envelope_not_task_sum_or_pure_wait",
+                kv_load_envelope_ns=(
+                    completed["request_done_ns"] - completed["first_queued_ns"]
+                    if completed["request_done_ns"] is not None and completed["first_queued_ns"] is not None
+                    else None
+                ),
+                kv_load_timing_scope="first_task_queued_to_request_marked_done",
                 complete=not completed["native_calls_dropped"],
                 incomplete=bool(completed["native_calls_dropped"]),
             )
+            if self.pd_diag_level < 2:
+                for key in _PD_LEVEL2_REQUEST_FIELDS:
+                    del fields[key]
+            diag.emit("pd_transfer_summary", **fields)
     except Exception:
         pass
 
@@ -366,7 +443,7 @@ def _transfer_batch(
         task["transfer_end_ns"] = end_ns
         with self.request_task_counts_lock:
             summary = self.pd_request_tasks.get(req_meta["request_id"])
-            if summary is not None:
+            if summary is not None and self.pd_diag_level >= 2:
                 if summary["transfer_start_ns"] is None:
                     summary["transfer_start_ns"] = start_ns
                 else:
@@ -524,6 +601,9 @@ CHANGES = [
     dict(id="C14", site_function=f"{T}._handle_request", anchor_written_by="C13", name="reformat failure", function=f"{T}._handle_request_body", text=TEXT_REFORMAT_FAILURE, alts=[
         A("regex", r"^\s*with self\._pd_reformat_stage\(req_meta, \w+\):\s*$", "after", indent=4,
           walk=("fwd", "prefix", "except Exception"), capture=(r"except\s+Exception\s+as\s+(\w+)\s*:", "exc"))]),
+    dict(id="C29", site_function=f"{T}._handle_request", name="request marked done", function=f"{T}._handle_request_body", text=TEXT_REQUEST_DONE, alts=[
+        A("equal", "self.task_tracker.update_done_task_count(request_id)", "after"),
+        A("prefix", "self.task_tracker.update_done_task_count(", "after")]),
     dict(id="C15", name="receiver methods", function=T, text=TEXT_RECEIVER_METHODS, alts=[
         A("prefix", "def _send_done_signal_to_free_remote_port(", "before", before_decorators=True),
         A("prefix", "def _transfer_kv_cache_all_groups(", "before", before_decorators=True),
@@ -763,6 +843,22 @@ def self_assigned(func):
     return names
 
 
+def _update_done_after_last_task(func):
+    """The update_done_task_count call is a one-line statement in the block of `if <x>:` where <x> is the name bound
+    to the result of self._mark_request_task_done(...): it runs once, when the last task of the request is done."""
+    parent = parents(func)
+    done_names = {ast.unparse(n.targets[0]) for n in own_nodes(func) if isinstance(n, ast.Assign) and len(n.targets) == 1
+                  and isinstance(n.value, ast.Call) and ast.unparse(n.value.func) == "self._mark_request_task_done"}
+    found = calls(func, "self.task_tracker.update_done_task_count")
+    if len(found) != 1:
+        return False
+    call = found[0]
+    stmt = parent.get(call)
+    block = parent.get(stmt)
+    return (isinstance(stmt, ast.Expr) and call.lineno == call.end_lineno and isinstance(block, ast.If)
+            and stmt in block.body and ast.unparse(block.test) in done_names)
+
+
 def compute_facts(source):
     tree = ast.parse(source)
     funcs = functions(tree)
@@ -820,6 +916,7 @@ def compute_facts(source):
                      "self._send_done_recv_signal", "self._mark_failed_recv_request", "self.task_tracker.update_done_task_count",
                      "self.request_queue.task_done"):
             put(f"handle_request.calls.{name}", len(calls(h, name)))
+        put("handle_request.update_done_after_last_task", _update_done_after_last_task(h))
         handlers = [n for n in own_nodes(h) if isinstance(n, ast.ExceptHandler)]
         put("handle_request.except_handlers", sorted(
             f"{ast.unparse(n.type) if n.type else '<bare>'} as {n.name}" for n in handlers))
@@ -879,6 +976,7 @@ CRITERIA = [
     ("F29", "request_finished.delay_free_returns", 1, "stop", "request_finished 只有一处返回 kv_transfer_params（return delay_free_blocks, ...），producer offer 插在它之前"),
     ("F30", "request_finished.returns_at_body_level", True, "stop", "这一处返回在函数体最外层，offer 不会落进某个分支"),
     ("F31", "reqmeta.is_dataclass", True, "stop", "ReqMeta 仍是 dataclass；pd_execution_id 作为最后一个带默认值的字段加入"),
+    ("F32", "handle_request.update_done_after_last_task", True, "stop", "task_tracker.update_done_task_count 是一行语句，在 if <_mark_request_task_done 的结果>: 的块里，即请求最后一个任务完成时才调用；C29 紧跟其后记下 request_done_ns，kv_load_envelope_ns 的终点就是这一刻"),
 ]
 NOTES = [
     ("N01", "functions.lines", "note", "各函数的行数。现场改过的函数行数不同属于正常；只打印和原版不同的函数，供核对哪 13 个函数改过"),
@@ -953,9 +1051,13 @@ def check_result(before, after):
     funcs = functions(tree)
     if after.count(MARKER) != 1:
         problems.append("pd_diagnostics import present %d times" % after.count(MARKER))
-    for name in ("_pd_task", "_pd_record_stage", "_pd_transfer_stage", "_pd_stage_begin", "_pd_stage_end"):
+    for name in ("_pd_task", "_pd_record_stage", "_pd_transfer_stage", "_pd_stage_begin", "_pd_stage_end",
+                 "_pd_mark_request_done", "_pd_diag_level"):
         if name not in funcs:
             problems.append(f"module-level helper {name} missing")
+    i = funcs.get(f"{T}.__init__")
+    if i is None or "pd_diag_level" not in self_assigned(i):
+        problems.append(f"{T}.__init__ does not set self.pd_diag_level")
     f = funcs.get(f"{T}._transfer_kv_cache_all_groups")
     if f is None or calls(f, "self.engine.batch_transfer_sync_read") or len(calls(f, "self._transfer_batch")) != 1:
         problems.append("the READ in _transfer_kv_cache_all_groups does not go through exactly one _transfer_batch")
@@ -965,6 +1067,8 @@ def check_result(before, after):
     h = funcs.get(f"{T}._handle_request_body")
     if h is not None and len(calls(h, "self._transfer_kv_cache_all_groups")) != 1:
         problems.append("_handle_request_body does not call _transfer_kv_cache_all_groups once")
+    if h is not None and not _done_mark_follows_update(h):
+        problems.append("_pd_mark_request_done(req_meta) is not the statement right after update_done_task_count")
     b = funcs.get("MooncakeConnectorScheduler.build_connector_meta")
     if b is not None:
         parent = parents(b)
@@ -997,6 +1101,24 @@ def check_result(before, after):
     return problems
 
 
+def _done_mark_follows_update(func):
+    parent = parents(func)
+    marks = calls(func, "_pd_mark_request_done")
+    updates = calls(func, "self.task_tracker.update_done_task_count")
+    if len(marks) != 1 or len(updates) != 1:
+        return False
+    mark_stmt, update_stmt = parent.get(marks[0]), parent.get(updates[0])
+    block = parent.get(update_stmt)
+    if block is None or parent.get(mark_stmt) is not block or ast.unparse(marks[0]) != "_pd_mark_request_done(req_meta)":
+        return False
+    for field in ("body", "orelse", "finalbody"):
+        body = getattr(block, field, None)
+        if isinstance(body, list) and update_stmt in body:
+            i = body.index(update_stmt)
+            return i + 1 < len(body) and body[i + 1] is mark_stmt
+    return False
+
+
 def _loop(node, parent):
     while node in parent and not isinstance(node, ast.For):
         node = parent[node]
@@ -1023,7 +1145,7 @@ def _directly_before_loop(init, parent, call_stmt):
 
 def replay(source, force=None, report=None):
     if MARKER in source:
-        raise ReplayError(6, "the input already imports pd_diagnostics; refusing to apply twice")
+        raise ReplayError(6, _already_patched(source))
     lines = source.split("\n")
     for change in CHANGES:
         rank = apply_change(lines, change, (force or {}).get(change["id"]))
@@ -1038,6 +1160,14 @@ def replay(source, force=None, report=None):
     if problems:
         raise ReplayError(4, "; ".join(problems))
     return result
+
+
+def _already_patched(source):
+    if T58_MARKER in source:
+        return "the input already has these p2d diagnostics (T58); refusing to apply twice"
+    version, script = ("T56", "t56/replay_p2d.py 9b12baa6") if T56_MARKER in source else ("T51", "t51/replay_p2d.py 02304c8f")
+    return (f"the input already has the {version} p2d diagnostics; restore the original kept when T51 was applied, "
+            f"check it with the {version} script ({script}), then replay this script on it (field_check/操作说明A_T58)")
 
 
 def sha256(data):
@@ -1093,9 +1223,13 @@ def export_criteria(path):
         "base_function_lines": BASE_FUNCTION_LINES,
         "after_replay_checks": [
             "the result parses (ast.parse) and compiles (py_compile)",
-            "pd_diagnostics is imported once; the five module-level helpers exist",
+            "pd_diagnostics is imported once; the seven module-level helpers exist (T56 adds _pd_mark_request_done, "
+            "T58 _pd_diag_level)",
+            "(T58) KVCacheRecvingThread.__init__ sets self.pd_diag_level",
             "_transfer_kv_cache_all_groups has no direct batch_transfer_sync_read and exactly one _transfer_batch",
             "_handle_request_body, _pd_reformat_stage, _pd_finish_task, _transfer_batch exist in KVCacheRecvingThread",
+            "(T56) in _handle_request_body, _pd_mark_request_done(req_meta) is the statement right after "
+            "update_done_task_count",
             "the consumer link is created in the same loop as add_new_req",
             "the producer offer is a body-level statement of request_finished before the delay_free_blocks return",
             "pd_offset = 0 is right before the loops that call add_request, and pd_offset += 1 is in the block of that call",
@@ -1142,7 +1276,7 @@ def main():
         return 1
     print(f"replay_p2d: input={args.path} sha256={sha256(source)} same_as_d4ad49796={sha256(source) == BASE_SHA256}")
     if MARKER in source:
-        print("replay_p2d: FAILED (exit 6): the input already imports pd_diagnostics; nothing written", file=sys.stderr)
+        print(f"replay_p2d: FAILED (exit 6): {_already_patched(source)}; nothing written", file=sys.stderr)
         return 6
     try:
         facts = compute_facts(source)

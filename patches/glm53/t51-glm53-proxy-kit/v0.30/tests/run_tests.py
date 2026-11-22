@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Tests of the proxy patch against fake P and D servers on this machine (no vLLM, no NPU).
 
-Usage: python run_tests.py <work dir>      (needs fastapi, httpx and uvicorn; the work dir is created and filled)
+Usage: python run_tests.py <work dir> [--base <file>] [--patched <file>]
+       (needs fastapi, httpx and uvicorn; the work dir is created and filled). The two files default to this kit's
+       base/ and patched file; --base and --patched test another pair, such as a site's own file and its patched copy.
+       --base none: no original file; run 1 and the comparisons with it are skipped (printed as SKIP), the rest runs.
 
 Runs, each with a fresh proxy process:
   1. off-base     the unpatched file (base/), the reference;
@@ -23,6 +26,9 @@ import socket
 import subprocess
 import sys
 import time
+
+import argparse
+import hashlib
 
 import httpx
 
@@ -243,21 +249,36 @@ def unit_checks(work):
 
 
 def main():
-    work = pathlib.Path(sys.argv[1]).resolve()
+    global BASE, PATCHED
+    ap = argparse.ArgumentParser()
+    ap.add_argument("work")
+    ap.add_argument("--base")
+    ap.add_argument("--patched")
+    a = ap.parse_args()
+    BASE = None if a.base == "none" else pathlib.Path(a.base).resolve() if a.base else BASE
+    PATCHED = pathlib.Path(a.patched).resolve() if a.patched else PATCHED
+    for label, f in (("base", BASE), ("patched", PATCHED)):
+        if f is None:
+            print("base=none (no original file: run 1 and the comparisons with it are skipped)", flush=True)
+            continue
+        print("%s=%s sha256=%s" % (label, f, hashlib.sha256(f.read_bytes()).hexdigest()), flush=True)
+    work = pathlib.Path(a.work).resolve()
     if work.exists():
         shutil.rmtree(work)
     work.mkdir(parents=True)
 
     # ---- off: three runs, same requests ----
     views = {}
-    for label, script, extra in (("off-base", BASE, {}),
+    for label, script, extra in ((("off-base", BASE, {}),) if BASE is not None else ()) + (
                                  ("off-unset", PATCHED, {"PD_PROXY_DIAG_DIR": str(work / "logs-off-unset")}),
                                  ("off-zero", PATCHED, {"PD_PROXY_DIAG": "0", "PD_PROXY_DIAG_DIR": str(work / "logs-off-zero")})):
         res, seen, _ = run(label, script, extra, work)
         views[label] = normalised_view(res, seen)
         (work / (label + ".view.json")).write_text(json.dumps(views[label], indent=1, ensure_ascii=False))
     for label in ("off-unset", "off-zero"):
-        for name in views["off-base"]:
+        if BASE is None:
+            print("SKIP %s: same as unpatched (no original file)" % label)
+        for name in views.get("off-base", {}):
             a, b = views["off-base"][name], views[label][name]
             check("%s %s: same as unpatched (client status, body; P/D headers and bodies)" % (label, name), a == b,
                   json.dumps({"base": a, label: b}, ensure_ascii=False)[:600])

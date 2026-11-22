@@ -118,16 +118,20 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--vllm-base", required=True, help="tree root containing vllm/ (v0.30.0)")
     ap.add_argument("--ascend-base", required=True, help="tree root containing vllm_ascend/ (d4ad49796)")
-    ap.add_argument("--vllm-kit", help="v0.30.0 tree with the T51 vLLM port applied (baseline v0.30.0+port)")
-    ap.add_argument("--ascend-kit", help="d4ad49796 tree with the T51 vllm-ascend port applied (baseline d4ad49796+port)")
+    ap.add_argument("--vllm-kit", action="append", default=[],
+                    help="[LABEL=]tree: v0.30.0 with a vLLM port applied (baseline v0.30.0+LABEL; repeat for T51, T56)")
+    ap.add_argument("--ascend-kit", action="append", default=[],
+                    help="[LABEL=]tree: d4ad49796 with a vllm-ascend port applied (baseline d4ad49796+LABEL)")
     ap.add_argument("--vllm-export-list", help="file with one path per line (default: built-in list)")
     ap.add_argument("--ascend-export-list", help="file with one path per line (default: built-in list)")
     ap.add_argument("--proxy", required=True)
     ap.add_argument("--record", action="append", default=[], help="LABEL=record.json from wheel_record.py")
-    ap.add_argument("--p2d-replay", help="t51-glm53-p2d replay_p2d.py, embedded byte for byte (structural check of the replayed connector)")
+    ap.add_argument("--p2d-replay", action="append", default=[],
+                    help="[LABEL=]replay_p2d.py, embedded byte for byte (structural check of the replayed connector; repeat per version)")
     ap.add_argument("--p2d-extra", help="t51-glm53-p2d extra_checks.py, embedded byte for byte")
-    ap.add_argument("--p2d-patched", help="the p2d replacement mooncake_connector.py: its extra_line() is the expected value on site")
-    ap.add_argument("--mc-replacement", help="the delivered libmooncake_store.so (its sha16 and size: store=replacement)")
+    ap.add_argument("--p2d-patched", action="append", default=[],
+                    help="[LABEL=]the p2d replacement mooncake_connector.py: its extra_line() is the expected value on site")
+    ap.add_argument("--mc-replacement", action="append", default=[], help="LABEL=libmooncake_store.so of a delivered replacement (its sha16 and size: store=replacement(LABEL)); several allowed (v1, v2)")
     ap.add_argument("--mc-site-sha16", help="sha16 of the site's libmooncake_store.so as the field check saw it")
     ap.add_argument("--mc-site-size", type=int)
     ap.add_argument("--mc-siblings", help="directory with the lab build's libtransfer_engine.so, libmooncake_common.so, libasio.so, ascend_transport.so")
@@ -141,12 +145,26 @@ def main():
     vllm = {"base_label": "v0.30.0", "base": {"files": v_files, "funcs": v_funcs}, "alts": {}, "focus": v_export}
     ascend = {"base_label": "d4ad49796", "base": {"files": a_files, "funcs": a_funcs}, "alts": {}, "focus": a_export}
     kit_text = {"vllm": {}, "vllm_ascend": {}}
-    if a.vllm_kit:
-        vllm["alts"]["v0.30.0+port"] = kit_alt(v_files, a.vllm_kit, "vllm")
-        kit_text["vllm"] = originals(a.vllm_kit, sorted(vllm["alts"]["v0.30.0+port"]["files"]))
-    if a.ascend_kit:
-        ascend["alts"]["d4ad49796+port"] = kit_alt(a_files, a.ascend_kit, "vllm_ascend")
-        kit_text["vllm_ascend"] = originals(a.ascend_kit, sorted(ascend["alts"]["d4ad49796+port"]["files"]))
+
+    def labelled(items, default):
+        out = []
+        for item in items:
+            label, _, path = item.partition("=") if "=" in item else (default, "", item)
+            out.append((label, path))
+        return out
+
+    for pkg, ref, base_files, items, top in (("vllm", vllm, v_files, a.vllm_kit, "vllm"),
+                                              ("vllm_ascend", ascend, a_files, a.ascend_kit, "vllm_ascend")):
+        kits = labelled(items, "port")
+        for label, path in kits:
+            key = "%s+%s" % (ref["base_label"], label)
+            ref["alts"][key] = kit_alt(base_files, path, top)
+            texts = originals(path, sorted(ref["alts"][key]["files"]))
+            for rel, text in texts.items():
+                if len(kits) == 1:
+                    kit_text[pkg][rel] = text
+                else:
+                    kit_text[pkg].setdefault(rel, {})[label] = text
 
     pdata = chk.read_bytes(a.proxy)
     ex_dir = os.path.join(a.ascend_base, "examples", "external_online_dp")
@@ -174,15 +192,29 @@ def main():
     }
     if a.p2d_replay and a.p2d_extra and a.p2d_patched:
         import base64, hashlib
-        raw, xraw = open(a.p2d_replay, "rb").read(), open(a.p2d_extra, "rb").read()
+        xraw = open(a.p2d_extra, "rb").read()
         ns = {"__name__": "t51_embedded_extra_checks", "__file__": "extra_checks.py"}
         exec(compile(xraw.decode("utf-8"), "extra_checks.py", "exec"), ns)
-        patched = open(a.p2d_patched, encoding="utf-8").read()
-        out["p2d"] = {"replay_b64": base64.b64encode(raw).decode(), "replay_sha256": hashlib.sha256(raw).hexdigest(),
-                      "extra_b64": base64.b64encode(xraw).decode(), "extra_sha256": hashlib.sha256(xraw).hexdigest(),
-                      "extra_expected": ns["extra_line"](patched), "patched_sha16": chk.sha16(patched.encode())}
+        replays = dict(labelled(a.p2d_replay, "t51"))
+        patcheds = dict(labelled(a.p2d_patched, "t51"))
+        if set(replays) != set(patcheds):
+            raise SystemExit("--p2d-replay and --p2d-patched must name the same versions: %s / %s" % (sorted(replays), sorted(patcheds)))
+        versions = {}
+        for label in sorted(replays):
+            raw = open(replays[label], "rb").read()
+            patched = open(patcheds[label], encoding="utf-8").read()
+            versions[label] = {"replay_b64": base64.b64encode(raw).decode(), "replay_sha256": hashlib.sha256(raw).hexdigest(),
+                               "extra_b64": base64.b64encode(xraw).decode(), "extra_sha256": hashlib.sha256(xraw).hexdigest(),
+                               "extra_expected": ns["extra_line"](patched), "patched_sha16": chk.sha16(patched.encode())}
+        if len(versions) == 1:
+            out["p2d"] = next(iter(versions.values()))
+        else:
+            out["p2d_versions"] = versions
     if a.mc_replacement:
-        out["mooncake_replacement"] = {"sha16": chk.file_sha16(a.mc_replacement), "size": os.path.getsize(a.mc_replacement)}
+        out["mooncake_replacements"] = []
+        for item in a.mc_replacement:
+            label, path = item.split("=", 1) if "=" in item else ("", item)
+            out["mooncake_replacements"].append({"label": label, "sha16": chk.file_sha16(path), "size": os.path.getsize(path)})
     if a.mc_site_sha16:
         out["mooncake_site_original"] = {"sha16": a.mc_site_sha16, "size": a.mc_site_size}
     if a.mc_siblings:
@@ -196,8 +228,8 @@ def main():
     print(
         "vllm files %d funcs-files %d export %d; ascend files %d funcs-files %d export %d; kit alts %s/%s; mooncake refs %d; p2d %s; mc_replacement %s; siblings %d"
         % (len(v_files), len(v_funcs), len(v_export), len(a_files), len(a_funcs), len(a_export),
-           list(vllm["alts"]), list(ascend["alts"]), len(mooncake), (out.get("p2d") or {}).get("replay_sha256", "-")[:8],
-           (out.get("mooncake_replacement") or {}).get("sha16", "-"), len(out.get("mooncake_lab_siblings") or {}))
+           list(vllm["alts"]), list(ascend["alts"]), len(mooncake), ",".join("%s:%s" % (k, v["replay_sha256"][:8]) for k, v in sorted((out.get("p2d_versions") or ({"t51": out["p2d"]} if out.get("p2d") else {})).items())) or "-",
+           ",".join("%s:%s" % (r["label"], r["sha16"]) for r in out.get("mooncake_replacements") or []) or "-", len(out.get("mooncake_lab_siblings") or {}))
     )
 
 

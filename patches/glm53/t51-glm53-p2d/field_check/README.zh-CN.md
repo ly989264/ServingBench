@@ -1,11 +1,24 @@
 # 现场核对：在现场的 mooncake_connector.py 上重放 p2d 埋点
 
-本目录给现场核对和操作说明 A 用。三份文件都从 `patches/vllm-ascend-p2d/replay_p2d.py` 导出，不是手抄：
+本目录给现场核对和操作说明 A 用。
+
+**版本。** 现在是 T58 版：`replay_p2d.py` 的 sha256 为 `e62795bd63b146eb6813865d039d574d1fff067e1654f56f02a4458ca5e4a9e7`，29 处改动，32 条判据。
+- T58 只改补丁自己插进去的代码（粒度，见 `patches/vllm-ascend-p2d/README.zh-CN.md` 第 3 节末尾），锚点、判据、改动编号都和 T56 版相同；重放后的检查多两条（第 3 节）。
+- 升级 T56 版（或 T51 版）的现场文件，以及从原文件直接打，见 `操作说明A_T58_p2d补丁.zh-CN.md`。T56 版脚本（`9b12baa6`）放在 `patches/vllm-ascend-p2d/t56/`，只用于升级时的证明步骤。
+
+T56 版相对 T51 版：
+- 新增 C29：请求被标记完成的时刻，包络的终点。在文件中位于 C14 和 C15 之间，C15–C28 的编号和 T51 版相同。
+- 新增 F32：见第 2 节。
+- 第 6、7 节是 T51 版脚本（`02304c8f`）在现场跑出的结论，照原样保留。
+- 当时的升级说明是 `操作说明A_T56_升级p2d补丁.zh-CN.md`（T51 → T56，保留作记录）；现场 8 行差异落在哪一段，见第 8 节。
+
+下面两份 JSON 都从 `patches/vllm-ascend-p2d/replay_p2d.py` 导出，不是手抄：
 
 | 文件 | 内容 |
 |---|---|
-| `anchors.json` | 28 处改动（C01–C28）的主锚点和备选锚点：所在函数、匹配方式、锚点文本、插入位置 |
-| `criteria.json` | 重放前在现场文件上检查的 31 条结构判据（F01–F31，都是「停」），1 条只打印的说明项（N01），以及重放后的检查 |
+| `anchors.json` | 29 处改动（C01–C29）的主锚点和备选锚点：所在函数、匹配方式、锚点文本、插入位置 |
+| `criteria.json` | 重放前在现场文件上检查的 32 条结构判据（F01–F32，都是「停」），1 条只打印的说明项（N01），以及重放后的检查 |
+| `span_diff.py` | 只读：现场在 `_transfer_kv_cache_all_groups` 里加、删的行落在哪一段（第 8 节） |
 | `README.zh-CN.md` | 本说明 |
 
 导出命令：`python3 -I replay_p2d.py --export-anchors anchors.json --export-criteria criteria.json`。两份 JSON 里都有 `script_sha256`，和现场用的 `replay_p2d.py` 对得上，才说明清单和脚本一致。
@@ -28,11 +41,11 @@ python3 -I replay_p2d.py <现场的 mooncake_connector.py> --out /tmp/mooncake_c
 | `input=... sha256=... same_as_d4ad49796=True/False` | 输入文件的 sha256，以及它是不是公开的 `d4ad49796` 原文件 |
 | `STOP Fxx <fact>: expected ..., found ...` | 一条「停」判据不满足，后面跟原因 |
 | `note N01 functions whose line count differs ...` | 行数和原版不同的函数，格式为 `函数(原行数->现行数)`。只打印，不停；可以用来看现场改了哪些函数 |
-| `facts ok (31 stop facts equal the original)` | 31 条判据都满足 |
+| `facts ok (32 stop facts equal the original)` | 32 条判据都满足 |
 | `Cxx primary` 或 `Cxx alternative_N`，后跟匹配方式、锚点和名字 | 每处改动用的是主锚点还是第几条备选 |
 | `Cxx left_out ...` | 只会出现在 C22：现场代码里没有「描述符为空就返回」这一段时跳过 |
-| `check ok: 28 of 28 changes located ...` | `--check` 全部通过 |
-| `written out=... sha256=... changes=28/28 py_compile=ok same_as_replacement=...` | 写出成功；`same_as_replacement=True` 表示结果和 `d4ad49796` 的替换件逐字节相同（输入就是原文件时才会这样） |
+| `check ok: 29 of 29 changes located ...` | `--check` 全部通过 |
+| `written out=... sha256=... changes=29/29 py_compile=ok same_as_replacement=...` | 写出成功；`same_as_replacement=True` 表示结果和 `d4ad49796` 的替换件逐字节相同（输入就是原文件时才会这样） |
 
 退出码：
 
@@ -44,11 +57,11 @@ python3 -I replay_p2d.py <现场的 mooncake_connector.py> --out /tmp/mooncake_c
 | 3 | 结构判据不满足（输出里有 `STOP Fxx`） | 不写文件。重放后的埋点可能记错或出错，把输出带回来 |
 | 4 | 重放结果的检查没通过（见第 3 节） | 不写文件。把输出带回来 |
 | 5 | 写出的文件 `py_compile` 不通过 | 不用这个文件，把输出带回来 |
-| 6 | 输入已经打过补丁（已经导入 `pd_diagnostics`） | 不要重复打；先还原成现场原文件 |
+| 6 | 输入已经打过补丁（已经导入 `pd_diagnostics`）；输出说明是 T51、T56 还是 T58 版 | 不要重复打。T51、T56 版：按操作说明 A（T58）先还原，用那一版的脚本证明，再在原文件上重放。T58 版：已经打过 |
 
 ## 2. 结构判据：哪些情况要停
 
-现场改过的函数，我们看不到内容。所以重放前，脚本先在现场文件上用 Python 的 `ast` 统计插入的代码所依赖的结构：调用次数、所在循环、返回语句、变量名、属性名，再和 `d4ad49796` 原文件比。31 条判据都是「停」：任何一条不等于原版的值，就说明重放后的埋点可能记错数，或者在运行时出错，脚本什么都不写，退出码 3。
+现场改过的函数，我们看不到内容。所以重放前，脚本先在现场文件上用 Python 的 `ast` 统计插入的代码所依赖的结构：调用次数、所在循环、返回语句、变量名、属性名，再和 `d4ad49796` 原文件比。32 条判据都是「停」：任何一条不等于原版的值，就说明重放后的埋点可能记错数，或者在运行时出错，脚本什么都不写，退出码 3。
 
 函数的行数（N01）只打印、不停：现场改过的函数行数不同是正常的，行数本身说明不了埋点对不对。真正要看的是下表这些结构有没有变。
 
@@ -85,6 +98,7 @@ python3 -I replay_p2d.py <现场的 mooncake_connector.py> --out /tmp/mooncake_c
 | F29 | `request_finished.delay_free_returns` | `1` | request_finished 只有一处返回 kv_transfer_params（return delay_free_blocks, ...），producer offer 插在它之前 |
 | F30 | `request_finished.returns_at_body_level` | `true` | 这一处返回在函数体最外层，offer 不会落进某个分支 |
 | F31 | `reqmeta.is_dataclass` | `true` | ReqMeta 仍是 dataclass；pd_execution_id 作为最后一个带默认值的字段加入 |
+| F32（T56） | `handle_request.update_done_after_last_task` | `true` | `task_tracker.update_done_task_count` 是一行语句，在 `if <_mark_request_task_done 的结果>:` 的块里，即请求最后一个任务完成时才调用；C29 紧跟其后记下 `request_done_ns`，包络的终点就是这一刻 |
 
 几条说明：
 - F25 只要求两处都是 `except Exception as <名字>`，名字可以和原版不同：插入的代码从这一行读出现场用的变量名。
@@ -94,9 +108,11 @@ python3 -I replay_p2d.py <现场的 mooncake_connector.py> --out /tmp/mooncake_c
 ## 3. 重放后的检查（不通过时退出码 4）
 
 - the result parses (ast.parse) and compiles (py_compile)
-- pd_diagnostics is imported once; the five module-level helpers exist
+- pd_diagnostics is imported once; the seven module-level helpers exist (T56 adds _pd_mark_request_done, T58 _pd_diag_level)
+- (T58) KVCacheRecvingThread.__init__ sets self.pd_diag_level
 - _transfer_kv_cache_all_groups has no direct batch_transfer_sync_read and exactly one _transfer_batch
 - _handle_request_body, _pd_reformat_stage, _pd_finish_task, _transfer_batch exist in KVCacheRecvingThread
+- (T56) in _handle_request_body, `_pd_mark_request_done(req_meta)` is the statement right after update_done_task_count
 - the consumer link is created in the same loop as add_new_req
 - the producer offer is a body-level statement of request_finished before the delay_free_blocks return
 - pd_offset = 0 is right before the loops that call add_request, and pd_offset += 1 is in the block of that call
@@ -138,6 +154,7 @@ python3 -I replay_p2d.py <现场的 mooncake_connector.py> --out /tmp/mooncake_c
 | C12 | tracker_completed | `KVCacheRecvingThread._handle_request` | 是 | 1. equal `all_tasks_done = self._mark_request_task_done(request_id, all_task_done)`；2. prefix `all_tasks_done = self._mark_request_task_done(` |
 | C13 | reformat stage | `KVCacheRecvingThread._handle_request` | 是 | 1. prefix `self._reformat_pending_kv_caches(` |
 | C14 | reformat failure | `KVCacheRecvingThread._handle_request` | 是 | 1. regex `^\s*with self\._pd_reformat_stage\(req_meta, \w+\):\s*$` |
+| C29（T56） | request marked done | `KVCacheRecvingThread._handle_request` | 是 | 1. equal `self.task_tracker.update_done_task_count(request_id)`；2. prefix `self.task_tracker.update_done_task_count(` |
 | C15 | receiver methods | `KVCacheRecvingThread` | 是 | 1. prefix `def _send_done_signal_to_free_remote_port(`；2. prefix `def _transfer_kv_cache_all_groups(`；3. prefix `def _send_done_recv_signal(` |
 | C16 | full prefix hit | `KVCacheRecvingThread._transfer_kv_cache_all_groups` | 是 | 1. equal `if num_local_blocks == 0 and not has_replicate_k_blocks:`；2. prefix `if num_local_blocks == 0` |
 | C17 | meta_fetch begin | `KVCacheRecvingThread._transfer_kv_cache_all_groups` | 是 | 1. equal `# Check if we have the remote metadata cached.`；2. prefix `has_remote_metadata = (` |
@@ -155,7 +172,7 @@ python3 -I replay_p2d.py <现场的 mooncake_connector.py> --out /tmp/mooncake_c
 
 ## 5. 已经在本地测过的
 
-- 在 `d4ad49796` 原文件上，31 条判据都等于原版的值；重放结果和替换件逐字节相同。
+- 在 `d4ad49796` 原文件上，32 条判据都等于原版的值；重放结果和替换件逐字节相同。
 - 每条备选锚点都单独强制使用过一次，在原文件上都能定位，重放后的检查都通过；所有改动同时走最后一条备选锚点时也通过，生成的文件跑完整测试，232 个通过。
 - 现场可能有、但不影响埋点的改动，脚本都照常写出：
   - 异常变量改名后，插入的代码用新名字；
@@ -170,7 +187,12 @@ python3 -I replay_p2d.py <现场的 mooncake_connector.py> --out /tmp/mooncake_c
   - 裸 `except`；
   - 锁的属性改名；
   - 多一处返回 `kv_transfer_params`。
-- 其他情况：锚点没了时退出码 2，并报出编号；重复打补丁时退出码 6。
+- 其他情况：锚点没了时退出码 2，并报出编号；重复打补丁时退出码 6，并说明是 T51、T56 还是 T58 版。
+- T58 新增的：T56 版脚本在原文件上重放出的文件和 T56 替换件逐字节相同（升级时的证明步骤）；T56 版的文件，加不加 `--check` 都是退出码 6，并说明要先还原、用 `t56/replay_p2d.py` 证明。
+- T56 新增的：
+  - `update_done_task_count` 的参数写成关键字时，C29 走备选锚点，标记紧跟在调用之后；
+  - 这一调用被移出 `if <done>:`，或拆成两行时，F32 停下；
+  - T51 版脚本在原文件上重放出的文件和 T51 替换件逐字节相同，这是升级时的证明步骤。
 
 以上在 Python 3.11 和 3.9 下各跑一遍（`tools/test_replay_guards.py`）。现场文件本身还没有拿到，没在它上面跑过。
 
@@ -226,3 +248,30 @@ R1–R5 的「原版的值」是在 `d4ad49796` 原文件上用 `ast` 算出的�
 - 原版的值是 `EXPECTED`，对应的一行是 `p2d_extra X1=1 X2=1/1 X3=2 X4=4/1 X5=1 X6=ok`。
 
 各项的含义见文件开头的表。和原版不同时不停，只把这一行带回来。实验室用例在 `tools/test_extra_checks.py`，Python 3.11 和 3.9 下 13 个全部通过（`results/13_extra_checks.txt`）：原文件、替换件、模拟修改 C 都和原版相同；R1–R5 的模拟改法各自在对应的项上报出 `!`。
+
+## 8. 现场 8 行差异落在哪一段（`span_diff.py`）
+
+现场 `_transfer_kv_cache_all_groups` 比 `d4ad49796` 多 8 行（小核对 f-1：284→292），内容没有带回。
+- 这几行落在「取对端信息」（meta_fetch）或「组读表」（prepare）里，那一段的时长就包含它们；
+- 落在两段之外，就不影响这两段。
+
+`span_diff.py` 在现场把这一点核出来。
+
+- **怎么跑：** `python3 -I -S -B span_diff.py <现场的 mooncake_connector.py>`。
+  - 只读，只用标准库，不导入 vLLM、vllm-ascend，不联网，不写文件；
+  - 对原文件和打过 p2d（T51、T56 或 T58）的文件都能用。
+- **做法：**
+  - 把这个函数的非空行（去掉首尾空白）和 `d4ad49796` 原版逐行比较。原版每一行的 sha256 前 16 位嵌在脚本里。
+  - 打过补丁的文件，先认出补丁插进去的行并去掉，再把改写过的 READ 读回原来的调用。
+  - 然后把每一行加、删的行归到 5 个区间：`before`、`meta_fetch`、`between`、`prepare`、`after`。
+- **区间的边界：**
+  - 打过补丁的文件，取补丁插进去的 4 个计时语句本身（`spans=instrumented`）；
+  - 没打补丁的文件，取 C17、C19、C20、C21 的主锚点（`spans=anchors`）。
+- **输出：** 一行 `p2d_span_diff spans=... func_lines=... ref_lines=269 added=... removed=... before=+a/-r meta_fetch=+a/-r between=+a/-r prepare=+a/-r after=+a/-r added_at=<区间>:<sha16>,...`。
+  - 不打印代码；加 `--show` 才打印这几行代码。
+  - 退出码：0 成功，1 读不了输入，2 找不到函数或边界。
+- **本地测过的**（`tools/test_span_diff.py`，Python 3.11.10 和 3.9 各一遍）：
+  - 原文件、T51、T56、T58 替换件都是 0 处差异，打过补丁的文件找到的边界和锚点给出的相同；
+  - 在 meta_fetch、prepare（8 行）、两段之前、两段之间、两段之后各加行，以及在 prepare 里删一行，都报在对应的区间；同一份改动在未打补丁的文件和它的重放结果（T58 版脚本）上，报出的完全相同；
+  - 找不到函数时退出码 2。
+- **用法：** 写进 glm53-test 的升级手册（T56 定稿第三节第 4 条），操作说明 A（T56）第 3 步。

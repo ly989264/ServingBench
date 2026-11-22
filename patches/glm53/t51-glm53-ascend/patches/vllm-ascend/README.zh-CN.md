@@ -2,7 +2,7 @@
 
 | 项 | 内容 |
 |---|---|
-| 合并补丁 | `t51-vllm-ascend-d4ad49796-pd-diag.patch`：11 个源文件，加 9 个测试文件（改 3 个、新增 6 个） |
+| 合并补丁 | `t56-vllm-ascend-d4ad49796-pd-diag.patch`：11 个源文件，加 10 个测试文件（改 3 个、新增 7 个） |
 | 单文件补丁 | `per-file/01`–`11` 每个源文件一份，`per-file/90-tests.patch` 是全部测试。每一份都能在干净的 `d4ad49796` 上单独 `git apply` |
 | 基线 | vllm-ascend `d4ad49796`（`releases/v0.30.0` 分支），公开仓库 |
 | 替换件 | `files/vllm_ascend/...`：打完补丁后的 11 个源文件，其中 `diagnostics.py`、`worker/pd_device_timing.py` 是新文件 |
@@ -419,7 +419,7 @@ P1–P5 的代码和 vLLM 移植版 `_schedule()` 里对应的 5 处相同，只
 
 | 项 | Python 3.11.18 的结果 |
 |---|---|
-| 语法 | 本包 20 个文件（11 个源文件 + 9 个测试文件）和本仓库 31 个脚本，`compile()` 全部通过 |
+| 语法 | 本包 21 个文件（11 个源文件 + 10 个测试文件）和本仓库的脚本，`compile()` 全部通过 |
 | 只用标准库的测试 | `test_pd_device_timing.py` 16/16，`test_pd_diag_runner_points.py` 9/9，`test_wait_for_put_standalone.py` 4/4，`test_pool_load_link_standalone.py` 6/6 |
 | runner 测量点静态检查 | 12/12 |
 | `tests/ut/distributed/ascend_store` 全部（桩环境） | 578 通过、73 失败、1 个收集错误，失败清单和 3.12 在同一棵树上逐条相同（第 7 节，都是桩环境造成的）。依赖装的是和 3.12 相同的版本：纯 Python 的轮子沿用，`numpy`、`pydantic_core` 用 cp311 aarch64 的轮子，sha256 和 PyPI 上的一致 |
@@ -464,3 +464,120 @@ vLLM 移植版（40152b2）在启动时打三行普通日志，不是 `[PD_DIAG]
 
 - 如果 D 打出的不是 `AsyncRecomputeScheduler`，或 P 打出的不是 `BalanceScheduler`，说明现场的调度配置和第 11、12 节的前提不一样，要先查明。
 - 开关字段是 `?`，说明打这一行时 vllm-ascend 的配置还读不到。
+
+## 13. T56：每一步的另外 4 个 stage
+
+T56 在同一步里再量 4 段：`prepare_inputs`、`lm_head`（进 `worker_summary[execute]`），`draft`、`bookkeeping`（进
+`worker_summary[sample]`）。口径、字段名、开关都按 T56 的记录格式约定（`10_记录格式约定草案`）和统筹定稿
+（`31_统筹定稿`）。**只在 D 上写**，所以 P 的记录、启动行都和 T51 版逐字相同。
+
+### 13.1 测点
+
+| stage | 方法 | 范围 | 不含 |
+|---|---|---|---|
+| `prepare_inputs` | `execute_model` | 整个 `prepare input` 块：`_update_states`、`_prepare_inputs`、`_determine_batch_execution_and_padding`、`_build_attention_metadata`、`_preprocess` | KV connector 进入和 forward 之前的那几步 |
+| `lm_head` | `execute_model` | `hidden_states[logits_indices]` 和目标模型那一次 `compute_logits` | 草稿模型自己的 `compute_logits`（算在 `draft` 里）；PP / broadcast 分支（现场不走） |
+| `bookkeeping` | `sample_tokens` | `_bookkeeping_sync` 那一次调用 | — |
+| `draft` | `sample_tokens` | 闭包 `propose_draft_token_ids` 的函数体：`_skip_drafting` 或 `propose_draft_token_ids` 加 `_copy_draft_token_ids_to_cpu` | `finalize_kv_connector` |
+
+- 计时写在闭包里面，所以三处调用（PP 提前、padded batch、非 padded）不管走哪一处，每步都只量一次。
+- 6 段在同一条计算流上先后排队，设备区间互不重叠，可以相加。主机段（输入准备、记账）的设备区间只含「设备空等主机」的部分，不会和 forward、sampling 重复计数。
+
+### 13.2 开关：两道闸
+
+1. **是不是 D：** DeviceTiming 建立时调一次 `pd_diagnostics.is_pd_decode(vllm_config)`（补丁 01 提供，约定第 0 节第 8 条）。为假时 4 段、`step_device_span_ns`、`cudagraph_runtime_mode`、开销字段都不写，不管环境变量怎么设。
+   - 本补丁另外要求补丁 01 的 `_SPANS` 里已经有 `runner.prepare_inputs`、`runner.lm_head`、`runner.draft`、`runner.bookkeeping`。缺一个就按 T51 行为跑（不是半开状态），Worker 启动行里也就没有 `runner_stages=`，升级核对那一步看得出来。
+2. **`VLLM_PD_DEVICE_STAGES`：** 不设 = 4 段全开；`prepare_inputs`、`lm_head`、`draft`、`bookkeeping` 的逗号子集 = 只开列出的；`none` = 回到 T51。不认识的名字忽略；`forward`、`sampling` 不受它管，写进去也忽略。DeviceTiming 建立时读一次，改了要重启。
+
+**启动行怎么区分「关着」和「不是 D」**（Worker 启动行由补丁 01 拼，本补丁提供 `runner_stages`、`stages_source` 两个只读属性）：
+
+| 这个进程 | `runner_stages` | 启动行 |
+|---|---|---|
+| D，至少开着一段 | `forward,sampling,…` | `… runner_stages=forward,sampling,prepare_inputs,lm_head,draft,bookkeeping source=default` |
+| D，`VLLM_PD_DEVICE_STAGES=none` | `forward,sampling` | `… runner_stages=forward,sampling source=env` |
+| 不是 D（P；或者判断失败、补丁 01 的 T56 部分不在） | 空 | **和 T51 版逐字相同**，没有 `runner_stages=` |
+
+判断失败是静悄悄退回 T51 行为，不报错，所以这一行是唯一看得出来的地方：D 上没有 `runner_stages=`，就是没有被判成 D。`source` 只有 `default`（环境变量没设）和 `env`（设了）两种取值；「不是 D」那一档不打这一段，因为 P 上必须和 T51 逐字相同（约定第 0 节第 7 条），这两条要求只能这样同时满足。
+
+事件本身的主机开销不另设字段：按 T56 的精简结论，升级前后用同一组请求比 TPOT 中位数就够（判据在 glm53-test 升级手册里）。
+
+### 13.3 新字段
+
+| 字段 | 写在哪 | 什么时候有 |
+|---|---|---|
+| `stages.<名>.device_duration_ns`、`duration_ns` | 对应阶段的记录 | 这一段开着 |
+| `step_device_span_ns` | `worker_summary[sample]` | `prepare_inputs` 和 `draft` 都开着，而且这一步两个事件都读到了 |
+| `cudagraph_runtime_mode` | `worker_summary[execute]` | 至少一段开着；取 runner 已经算好的 `CUDAGraphStat.runtime_mode` |
+
+实现上这些记录级字段由 `DeviceTiming` 在读完设备值、写出记录之前，调已经打开的那条记录的 `Batch.update()` 写进去；`PdFinishClaim` 只管 stage 里的字段，所以 T56 不动补丁 01 的 `worker_base.py`。
+
+### 13.4 助手和捕图保险
+
+4 个测点都写成 `with pd_device_timing.stage(self, "<名>"):`，打开时等价于 `with diag.span("runner.<名>"), measure("<名>")`，**关掉时连主机 span 一起不开**（只关设备事件的话，P 的记录里仍会多出 stage 和主机时长）。`forward`、`sampling` 两处不动。
+
+T51 原有的两道防护照旧对新 stage 生效：`is_current_stream_capturing()` 为真时不取事件对，同一步量两次的 stage 不给设备值。按第 1.3 节，服务期间不会捕图，所以不再另加 `forward_context.capturing` 检查（T56 精简结论）。
+
+### 13.5 验证
+
+| 项 | 结果 |
+|---|---|
+| T56 单测 `tests/ut/worker/test_pd_device_timing_t56.py` | 28 项通过（开关解析、两道闸、6 段分别进哪条记录、包络、助手的开关分支、`cudagraph_runtime_mode`） |
+| T51 单测 `test_pd_device_timing.py`、`test_pd_diag_runner_points.py` | 原样通过（25 + 2 项新静态核：4 个测点的位置、dummy 路径上没有测点） |
+| 真实 vLLM 机器上的记录（`tools/t56_stage_records.py`） | 5 种配置全部符合约定：D 不设开关出 6 段加两个字段；`none`、子集、P（`is_pd_decode` 为假，含把 4 段都写进环境变量）各自如预期 |
+| 同上，vllm-ascend 自己的判定（真函数 `is_pd_decode_recompute_scheduler_enabled`） | `kv_consumer` + recompute 为真 → 是 D；**`kv_producer` + recompute 为真 → 不是 D**；`kv_consumer` + recompute 为假 → 不是 D。最后再跑一遍那个 `kv_producer` 进程：所有开关全开，写出的仍是 T51 形状的记录，启动行也没有 `runner_stages=` |
+| 记录等价 | 联合检查两种基类各 135 项通过；三份记录的字段集合和 T51 在 vLLM 40152b2 上的那次**逐字段相同**（当前 vLLM 树还没有补丁 01 的 T56 部分，所以这次跑的就是「没有 D 条件」那条路径） |
+| 调用图 | 和干净 `d4ad49796` 比，两个文件只有新增调用，没有删除 |
+| 打包 | `tools/apply_check.sh` 全绿：合并补丁、12 份单文件补丁、`SHA256SUMS`、`files/` 一致 |
+
+没有验证的：卡上的设备值和事件开销；真实 MTP 下第一步和第二步起的分支。开销按精简结论在 glm53-test 上比升级前后的 TPOT，不在本包里。
+
+## 14. T58：诊断粒度 `PD_DIAG_LEVEL`
+
+三档粒度，由 vLLM 侧的 `pd_diagnostics.diag_level()` 统一解析，本补丁每个进程读一次、缓存。vLLM 侧没有这个函数、或者调用抛异常时按 3 处理，所以装在旧的 vLLM 补丁上行为不变。
+
+**它答的是 `DiagLevel(level, source)`，不是整数**，所以读数的地方取 `.level`（`getattr(answer, "level", answer)`，直接答数字也认）。`source` 是给 vLLM 侧那条启动行用的，本补丁不用。这一点要紧：拿整条元组去和 3 比会抛 TypeError，被 `except` 接住以后就是悄悄一直按 3 走，从记录上看不出来。两个读数函数各有一个用例按真形状验证，另有一组反向对照：把读数换回只认整数的写法，29 个级别用例里有 7 个失败。
+
+| 级别 | 本补丁少写什么 |
+|---|---|
+| 3（默认） | 什么都不少，和 T56 逐字段相同 |
+| 2 | `pool_task` 的 `native_calls` 列表为空（喂给它的计数器照记，所以任务自己的时长、计数和终态不变）；设备段 `bookkeeping` 的段值不写进 `worker_summary[sample]`（两个设备事件照记） |
+| 1 | 再加上：进记录的 5 个 stage（`build_key`、`lookup`、`prepare`、`sync`、`put`）不计时也不写 |
+
+### 14.1 三处闸
+
+| 位置 | 做法 |
+|---|---|
+| `store/diagnostics.py` `stage()` | 名字在 `_RETAINED_STAGES` 里、且级别为 1 时直接 `yield`，连 `time.monotonic_ns()` 都不读 |
+| 同上 `Task.finish()` | 级别为 1 时不补齐那 5 个 stage 的占位对象，所以 `stages` 是空字典 |
+| 同上 `backend()` | 级别低于 3 时不往 `native_calls` 里追加。`add(**counts)` 在闸之前，不受影响 |
+| `worker/pd_device_timing.py` | `DeviceTiming.level` 加 `reports(name)`：`bookkeeping` 在 1、2 级返回假。`stage()` 据此不开主机 span，`_collect_locked` 据此不写设备值；两个设备事件照记 |
+
+**只有 `_RETAINED_STAGES` 那 5 个名字会进记录的 `stages`**，别的名字都进 `associated_stages`。所以 1 级的效果是「任何 `pool_task` 的 `stages` 都是空的」，不限于 `save`：加载路径上的 `sync` 也一起没有。它不是看板上的任何一段。
+
+**`native_calls` 写成空列表，不删键。** `native_calls`、`native_calls_limit`、`native_call_count`、`native_calls_dropped` 这几个键还在，省掉的是列表内容。记录形状不变，过滤器不用改。
+
+### 14.2 开关和启动行不随级别变
+
+`VLLM_PD_DEVICE_STAGES` 的意思、默认列表、`runner_stages=` 启动行，各级一模一样。`bookkeeping` 在任何级别都在默认列表里、都上启动行、两个设备事件都记——变的只是 1、2 级不写它的段值。所以：
+
+- 卡上的事件数各级相同，设备侧开销不随级别动；
+- `step_device_span_ns` 各级可比：它量的是 `prepare_inputs` 的起点到 `draft` 的终点，这两段任何级别都记；
+- T56 对已有启动行的判法和手册不用改。
+
+### 14.3 `store/diagnostics.py` 不再和同事补丁 02 逐字节相同
+
+第 0 节说过这个文件从 T51 起和补丁 02、以及另一型号的版本逐字节相同（`bdfa9b6f…`）。T58 的三处闸都必须加在这个文件里（加到调用点要动十几处），所以这条从 T58 起不成立，新值见 `SHA256SUMS.after`。记录的形状仍由这个文件决定，各级写出的字段见 `../../ut_results/t58/level-deltas.txt`。
+
+### 14.4 验证
+
+| 项 | 结果 |
+|---|---|
+| 单测 | 4 个只用标准库的文件共 70 项通过：`test_pd_device_timing.py` 16、`test_pd_device_timing_t56.py` 28、新增 `test_pd_device_timing_levels.py` 16、新增 `test_pool_diag_levels.py` 10 |
+| 3 级等价 | 联合检查在 T56 树和本包的树上、两种基类各 140 项通过，启动行相同；三份记录逐个记录种类的字段集合和条数相同。另在补丁 01 的 T56 版 vLLM 树（完全没有 `diag_level()`，走兜底那条路）上两种基类各跑一遍，结论相同 |
+| 1、2 级 | 同一套联合检查在**补丁 01 自己的 T58 vLLM 树**（`97d5de8`，25 个文件对它的 `SHA256SUMS.after`，`diag_level()` 是真的）上三个级别各 140、140、141 项通过，vLLM 侧那条 `PD_DIAG_STARTUP diag level=…` 依次读到 3、2、1 |
+| vLLM 侧的 `submit` 段 | 1 级时 D 不写 `worker_summary[execute].stages.submit`，这一段由 vLLM 侧的 `kv.load_submit` span 决定，不在本补丁里。联合检查新加一节「kv load submit」直接驱动它那个判断：decode 节点 1 级为假、2/3 级为真，prefill 节点各级为真，为假时交回的 span 是空操作 |
+| 少的正好是哪些 | `ut_results/t58/level-deltas.txt`：2 级只少 `native_calls[].*`，1 级再少 `stages.{build_key,lookup,prepare,put,sync}`，别的字段一个没动 |
+| 调用图 | T56 树对本包的树，两个文件只有新增调用，没有删除 |
+| 打包 | `tools/apply_check.sh` 全绿；12 份单文件补丁里有 9 份重新生成后与 T56 版逐字节相同 |
+
+联合检查本身这一轮学了两件事，都因为它原来断言的正是低级别要去掉的东西：一是读级别，低级别时反过来断言 Mooncake native call 和那 5 个 stage **不在**（不改会在 1、2 级下标越界崩掉）；二是把 vLLM 侧新加的 `PD_DIAG_STARTUP diag level=…` 从逐字比较的那几行里摘出来单独判，判它上面的级别就是这次跑的级别。

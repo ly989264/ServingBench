@@ -9,6 +9,10 @@ folder as this machine and can write there. The last line is RESULT: OK or RESUL
 
 Run as root with -I -S -B (refused otherwise, nothing read):
     python3 -I -S -B t51_proxy_check.py [--log-dir /data/pd-diag/logs] [--proxy-file <path>] [--show-diff]
+                                        [--expect-sha256 <64 hex digits>]
+
+--expect-sha256: the proxy file must be exactly this file (a file changed on the site, for example). Then the file is
+judged by this value alone: equal is OK whatever version it is, different is STOP file_not_the_expected_one.
 
 Reads /proc and the proxy file only. Writes no file, opens no network connection, starts no process, imports only
 the standard library. --show-diff also prints the file's difference from the nearest known version (it may contain
@@ -24,7 +28,7 @@ import re
 import stat
 import sys
 
-TOOL = "px-2"
+TOOL = "px-3"
 NAME = "load_balance_proxy_server_example.py"
 # sha256 of the proxy file -> version. main: vllm-ascend main since 6658faefc (2026-10-30, also v0.32.0rc1);
 # v0.30: 08c511a03 (2026-10-10, also v0.30.0 and d4ad49796); patched-*: the two files of this kit; upstream-*: older ones.
@@ -454,9 +458,22 @@ def container_of(pid):
     return m.group(1)[:12] if m else "none"
 
 
-def file_version(data):
+def judge_file(data, expect, show_diff, stop, older_stops):
+    """The file lines and the file's STOP reasons. With expect, the sha256 alone decides."""
     full = hashlib.sha256(data).hexdigest()
-    return full[:16], KNOWN.get(full, "other")
+    ver = KNOWN.get(full, "other")
+    print("file sha16=%s lines=%d version=%s" % (full[:16], data.count(b"\n"), ver))
+    if expect:
+        match = full == expect
+        print("file expect_sha16=%s match=%s" % (expect[:16], "yes" if match else "no"))
+        if not match:
+            stop.append("file_not_the_expected_one")
+        return
+    if ver == "other":
+        compare(data, show_diff)
+        stop.append("file_not_a_known_version")
+    elif older_stops and ver not in ("main", "v0.30", "patched-main", "patched-v0.30"):
+        stop.append("file_is_an_older_upstream_version")
 
 
 def bases():
@@ -560,9 +577,17 @@ def main():
     ap.add_argument("--log-dir", default="/data/pd-diag/logs")
     ap.add_argument("--proxy-file")
     ap.add_argument("--show-diff", action="store_true")
+    ap.add_argument("--expect-sha256")
     a = ap.parse_args()
     stop = []
     print("t51_proxy_check=%s python=%s uid=%d" % (TOOL, sys.version.split()[0], os.getuid()))
+    expect = None
+    if a.expect_sha256 is not None:
+        expect = a.expect_sha256.strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", expect):
+            print("--expect-sha256 后面要 64 位十六进制，即 sha256sum 输出的第一列")
+            print("RESULT: STOP bad_expect_sha256")
+            return 0
     if os.getuid() != 0:
         stop.append("not_root")
     procs = processes()
@@ -632,13 +657,7 @@ def main():
                 print("file 读不到")
                 stop.append("file_unreadable")
             else:
-                sha16, ver = file_version(data)
-                print("file sha16=%s lines=%d version=%s" % (sha16, data.count(b"\n"), ver))
-                if ver == "other":
-                    compare(data, a.show_diff)
-                    stop.append("file_not_a_known_version")
-                elif ver not in ("main", "v0.30", "patched-main", "patched-v0.30"):
-                    stop.append("file_is_an_older_upstream_version")
+                judge_file(data, expect, a.show_diff, stop, True)
         # the log folder as the proxy sees it
         try:
             here = os.stat(a.log_dir)
@@ -674,11 +693,7 @@ def main():
             print("file 读不到")
             stop.append("file_unreadable")
         else:
-            sha16, ver = file_version(data)
-            print("file sha16=%s lines=%d version=%s" % (sha16, data.count(b"\n"), ver))
-            if ver == "other":
-                compare(data, a.show_diff)
-                stop.append("file_not_a_known_version")
+            judge_file(data, expect, a.show_diff, stop, False)
     print("RESULT: %s" % ("OK" if not stop else "STOP " + ",".join(dict.fromkeys(stop))))
     return 0
 

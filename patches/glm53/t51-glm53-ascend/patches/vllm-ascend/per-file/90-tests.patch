@@ -309,6 +309,217 @@ index 40e3e8e6f8c68a98f636e5c85262fbe840247f9a..d22cafa203e5d6b8a864729eb9c6ebb3
      def test_pp_one_keys_are_unchanged(self):
          self.assertEqual(protocol.make_block_key("model", "hash", 1), "model@hash@1")
          self.assertEqual(
+diff --git a/tests/ut/distributed/ascend_store/test_pool_diag_levels.py b/tests/ut/distributed/ascend_store/test_pool_diag_levels.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..b1e3c87c17bd0a1cb571d276d52584771a7f4872
+--- /dev/null
++++ b/tests/ut/distributed/ascend_store/test_pool_diag_levels.py
+@@ -0,0 +1,205 @@
++"""Stdlib-only tests for the granularity of the Pool task records (ascend_store/diagnostics.py).
++
++Three levels. The full one records everything. One below it leaves out the native call list, keeping the counters
++that list feeds, so the task's own duration, its counters and its status read the same. The lowest one also leaves
++out the stages that reach the record -- build_key, lookup, prepare, sync, put -- and does not time them; the
++stages beside the record (associated_stages) and everything else are untouched at every level.
++
++The vLLM side is a fake module in sys.modules, installed before the module under test is loaded by path, because
++it imports pd_diagnostics at import time.
++"""
++
++from __future__ import annotations
++
++import importlib.util
++import sys
++import types
++import unittest
++from collections import namedtuple
++from contextlib import contextmanager
++from pathlib import Path
++
++# What the vLLM side answers with: the level, and where it came from (which is for the line it prints, not here).
++DiagLevel = namedtuple("DiagLevel", "level source")
++
++ROOT = Path(__file__).resolve().parents[4]
++MODULE = ROOT / "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/diagnostics.py"
++LEVELS = (1, 2, 3)
++RECORDS: list[tuple[str, dict]] = []
++_level = [3]
++_bare = [False]  # answer with the number itself instead of (level, source)
++
++
++def _install_fake_vllm():
++    @contextmanager
++    def scope(**fields):
++        yield fields
++
++    diag = types.ModuleType("vllm.v1.metrics.pd_diagnostics")
++    diag.scope = scope
++    diag.current = lambda: {}
++    diag.new_id = lambda prefix: prefix + "-1"
++    diag.emit = lambda event, **fields: RECORDS.append((event, fields))
++    diag.diag_level = lambda: _level[0] if _bare[0] else DiagLevel(_level[0], "env")
++    metrics = types.ModuleType("vllm.v1.metrics")
++    metrics.pd_diagnostics = diag
++    v1 = types.ModuleType("vllm.v1")
++    v1.metrics = metrics
++    vllm = types.ModuleType("vllm")
++    vllm.v1 = v1
++    sys.modules.update({"vllm": vllm, "vllm.v1": v1, "vllm.v1.metrics": metrics,
++                        "vllm.v1.metrics.pd_diagnostics": diag})
++
++
++_install_fake_vllm()
++spec = importlib.util.spec_from_file_location("pool_diagnostics_levels_ut", MODULE)
++pd = importlib.util.module_from_spec(spec)
++sys.modules[spec.name] = pd  # the dataclass in it looks itself up there while the module runs
++spec.loader.exec_module(pd)
++
++
++def one_save_task(level):
++    """One save task that exercises every kind of stage and one native call. Returns its record."""
++    _level[0] = level
++    pd._level_read.clear()
++    del RECORDS[:]
++    snapshot = pd.capture(None, "save")
++    with pd.processing(snapshot):
++        with pd.stage("build_key"):
++            pass
++        with pd.stage("sync"):
++            pass
++        with pd.stage("save_wait"):  # not one of the stages that reach the record
++            pass
++        with pd.backend("batch_put", 2, [[16], [32]], mode="ranges") as call:
++            call.batch_result(0)
++    tasks = [fields for event, fields in RECORDS if event == "pool_task"]
++    assert len(tasks) == 1, tasks
++    return tasks[0]
++
++
++class LevelReadTest(unittest.TestCase):
++    def setUp(self):
++        pd._level_read.clear()
++        self.addCleanup(pd._level_read.clear)
++        self.addCleanup(lambda: _level.__setitem__(0, 3))
++
++    def test_each_legal_level_is_taken_as_it_is(self):
++        for level in LEVELS:
++            pd._level_read.clear()
++            _level[0] = level
++            self.assertEqual(pd.level(), level)
++
++    def test_a_bare_level_is_taken_too(self):
++        """Should the vLLM side ever answer with the number itself."""
++        _bare[0] = True
++        self.addCleanup(lambda: _bare.__setitem__(0, False))
++        for level in LEVELS:
++            pd._level_read.clear()
++            _level[0] = level
++            self.assertEqual(pd.level(), level)
++
++    def test_anything_else_is_the_full_level(self):
++        for value in (0, 4, -1, "2", 2.0, None, True, False):
++            pd._level_read.clear()
++            _level[0] = value
++            self.assertEqual(pd.level(), pd.FULL_LEVEL, f"{value!r} should not be taken as a level")
++
++    def test_a_vllm_build_without_the_function_runs_at_the_full_level(self):
++        diag = sys.modules["vllm.v1.metrics.pd_diagnostics"]
++        saved = diag.diag_level
++        del diag.diag_level
++        self.addCleanup(lambda: setattr(diag, "diag_level", saved))
++        self.assertEqual(pd.level(), pd.FULL_LEVEL)
++
++    def test_a_raising_function_is_the_full_level(self):
++        diag = sys.modules["vllm.v1.metrics.pd_diagnostics"]
++        saved = diag.diag_level
++
++        def boom():
++            raise RuntimeError("sentinel")
++
++        diag.diag_level = boom
++        self.addCleanup(lambda: setattr(diag, "diag_level", saved))
++        self.assertEqual(pd.level(), pd.FULL_LEVEL)
++
++    def test_it_is_read_once_per_process(self):
++        pd._level_read.clear()
++        _level[0] = 1
++        self.assertEqual(pd.level(), 1)
++        _level[0] = 3  # a later change is not picked up: the value is settled at the first use
++        self.assertEqual(pd.level(), 1)
++
++
++class RecordTest(unittest.TestCase):
++    def setUp(self):
++        self.addCleanup(pd._level_read.clear)
++        self.addCleanup(lambda: _level.__setitem__(0, 3))
++
++    def test_the_full_level_records_the_stages_and_the_native_call(self):
++        record = one_save_task(3)
++        self.assertEqual(sorted(record["stages"]), ["build_key", "lookup", "prepare", "put", "sync"])
++        self.assertEqual(record["stages"]["build_key"]["calls"], 1)
++        self.assertEqual(record["stages"]["lookup"]["calls"], 0)  # filled in, never ran
++        self.assertEqual(len(record["native_calls"]), 1)
++        self.assertEqual(record["native_calls"][0]["operation"], "batch_put")
++        self.assertEqual(record["native_call_count"], 1)
++
++    def test_one_level_down_drops_only_the_native_call_list(self):
++        record = one_save_task(2)
++        self.assertEqual(sorted(record["stages"]), ["build_key", "lookup", "prepare", "put", "sync"])
++        self.assertEqual(record["stages"]["build_key"]["calls"], 1)
++        self.assertEqual(record["native_calls"], [])
++        self.assertEqual(record["native_call_count"], 0)
++        self.assertFalse(record["native_calls_dropped"])
++
++    def test_the_lowest_level_also_drops_the_stages_that_reach_the_record(self):
++        record = one_save_task(1)
++        self.assertEqual(record["stages"], {})
++        self.assertEqual(record["native_calls"], [])
++
++    def test_what_does_not_move_with_the_level(self):
++        full = one_save_task(3)
++        for level in (1, 2):
++            record = one_save_task(level)
++            for field in ("scope", "operation", "status", "task_id", "member_count", "members",
++                          "timing_scope", "timing_domain", "complete", "incomplete"):
++                self.assertEqual(record.get(field), full.get(field), f"{field} at level {level}")
++            # the clocks themselves differ from run to run; what matters is that they are still taken
++            self.assertIsInstance(record["queue_enter_ns"], int, f"queue_enter_ns at level {level}")
++            self.assertEqual(sorted(record), sorted(full), f"the record's fields at level {level}")
++            # the counters the native call feeds, and the stages that sit beside the record
++            self.assertEqual(sorted(record["counters"]), sorted(full["counters"]), f"counters at level {level}")
++            for name, value in full["counters"].items():
++                if not name.endswith("_ns"):  # a measured duration differs from run to run
++                    self.assertEqual(record["counters"][name], value, f"counters.{name} at level {level}")
++            self.assertEqual(sorted(record["associated_stages"]), ["backend_batch_put", "processing", "save_wait"],
++                             f"associated_stages at level {level}")
++            self.assertGreater(record["duration_ns"], 0)
++
++    def test_the_lowest_level_does_not_time_those_stages_at_all(self):
++        """Not just left out of the record: the clock is not read for them either."""
++        _level[0] = 1
++        pd._level_read.clear()
++        reads = []
++        saved = pd.time.monotonic_ns
++
++        def counted():
++            reads.append(1)
++            return saved()
++
++        pd.time.monotonic_ns = counted
++        self.addCleanup(lambda: setattr(pd.time, "monotonic_ns", saved))
++        snapshot = pd.capture(None, "save")
++        with pd.processing(snapshot):
++            before = len(reads)
++            with pd.stage("build_key"):
++                pass
++            self.assertEqual(len(reads), before, "a stage that is not recorded reads no clock")
++            with pd.stage("save_wait"):
++                pass
++            self.assertGreater(len(reads), before, "a stage beside the record is still timed")
++
++
++if __name__ == "__main__":
++    unittest.main()
 diff --git a/tests/ut/distributed/ascend_store/test_pool_load_link_standalone.py b/tests/ut/distributed/ascend_store/test_pool_load_link_standalone.py
 new file mode 100644
 index 0000000000000000000000000000000000000000..2f8832fd95ee98c2e540bb416602d1d6253bc942
@@ -1881,12 +2092,795 @@ index 0000000000000000000000000000000000000000..32e174366523b16e8e207ec264916e39
 +
 +if __name__ == "__main__":
 +    unittest.main()
+diff --git a/tests/ut/worker/test_pd_device_timing_levels.py b/tests/ut/worker/test_pd_device_timing_levels.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..0b1f81c7507e071f490723034133e747214dfe90
+--- /dev/null
++++ b/tests/ut/worker/test_pd_device_timing_levels.py
+@@ -0,0 +1,348 @@
++"""Stdlib-only tests for the granularity of the device stages in vllm_ascend/worker/pd_device_timing.py.
++
++The granularity decides which measured stages reach the record, never which ones are measured. Only bookkeeping is
++affected: below the full level its stage value is left out, while both of its device events are still recorded, so
++the step envelope and the number of events on the card read the same at every level. The startup line does not
++move with the level either. The device events are stubs on a scripted timeline and the vLLM side is a fake module
++in sys.modules, as in the other tests of this module; this file carries its own copy so that it stands alone.
++"""
++
++from __future__ import annotations
++
++import importlib.util
++import sys
++import types
++import unittest
++from collections import namedtuple
++from contextlib import contextmanager
++from pathlib import Path
++
++# What the vLLM side answers with: the level, and where it came from (which is for the line it prints, not here).
++DiagLevel = namedtuple("DiagLevel", "level source")
++
++ROOT = Path(__file__).resolve().parents[3]
++spec = importlib.util.spec_from_file_location("pd_device_timing_levels_ut",
++                                              ROOT / "vllm_ascend/worker/pd_device_timing.py")
++pdt = importlib.util.module_from_spec(spec)
++spec.loader.exec_module(pdt)
++MS = 1_000_000
++STREAM = object()
++LEVELS = (1, 2, 3)
++# The order the stages run in on a decode node: draft runs after bookkeeping there, so it closes the envelope.
++STEP_ORDER = (
++    ("execute", "prepare_inputs"),
++    ("execute", "forward"),
++    ("execute", "lm_head"),
++    ("sample", "sampling"),
++    ("sample", "bookkeeping"),
++    ("sample", "draft"),
++)
++EVERY_STAGE = {name: 2 for _, name in STEP_ORDER}
++
++
++class Device:
++    def __init__(self):
++        self.now_ms = 0.0
++        self.completed = -1
++        self.count = 0
++
++    def complete_all(self):
++        self.completed = self.count
++
++    def event(self):
++        return Event(self)
++
++
++class Event:
++    def __init__(self, device):
++        self.device = device
++        self.index = None
++        self.ts = None
++
++    def record(self, stream):
++        assert stream is STREAM
++        self.device.count += 1
++        self.index = self.device.count
++        self.ts = self.device.now_ms
++
++    def query(self):
++        return self.index is not None and self.index <= self.device.completed
++
++    def elapsed_time(self, other):
++        return other.ts - self.ts
++
++
++class Batch:
++    def __init__(self):
++        self.fields: dict = {}
++
++    def update(self, **fields):
++        self.fields.update(fields)
++
++
++class Claim:
++    def __init__(self):
++        self.stages: dict = {}
++
++    def set_stage_fields(self, stage, **fields):
++        self.stages.setdefault(stage, {}).update(fields)
++        return True
++
++    def release(self):
++        pass
++
++
++class Side:
++    """The claim and record side of one process, keyed by (execution id, phase)."""
++
++    def __init__(self):
++        self.context = {"execution_id": None, "phase": None}
++        self.claims: dict[tuple, Claim] = {}
++        self.batches: dict[tuple, Batch] = {}
++
++    def key(self):
++        return (self.context["execution_id"], self.context["phase"])
++
++    def claim_finish(self):
++        return None if self.context["execution_id"] is None else self.claims.setdefault(self.key(), Claim())
++
++    def current_batch(self):
++        return None if self.context["execution_id"] is None else self.batches.setdefault(self.key(), Batch())
++
++
++def make(level, stages=pdt.OPTIONAL_STAGES):
++    device, side = Device(), Side()
++    timing = pdt.DeviceTiming(
++        enabled=True,
++        new_event=device.event,
++        current_stream=lambda: STREAM,
++        capturing=lambda: False,
++        claim_finish=side.claim_finish,
++        current_context=lambda: dict(side.context),
++        current_batch=side.current_batch,
++        stages=stages,
++        decode_node=True,
++        level=level,
++    )
++    return timing, device, side
++
++
++def run_step(timing, device, side, execution_id="e1", durations=EVERY_STAGE):
++    """One step in the order the runner measures, through measure() as the runner's hook does."""
++    side.context.update(execution_id=execution_id, phase="execute")
++    timing.begin_execute()
++    for phase, name in STEP_ORDER:
++        if phase == "sample" and side.context["phase"] != "sample":
++            side.context["phase"] = "sample"
++            timing.begin_sample()
++        if name in pdt.OPTIONAL_STAGES and name not in timing.stages:
++            device.now_ms += durations.get(name, 0)
++            continue
++        with timing.measure(name):
++            device.now_ms += durations.get(name, 0)
++    device.complete_all()
++    timing.end_sample(read_now=True)
++
++
++def install_fake_vllm():
++    """The vLLM names the hook imports at call time. Returns (the record it writes to, span names opened, undo)."""
++    names = ("vllm", "vllm.v1", "vllm.v1.metrics", "vllm.v1.metrics.pd_diagnostics")
++    saved = {name: sys.modules.get(name) for name in names}
++    opened: list[str] = []
++    record = Batch()
++
++    @contextmanager
++    def span(name, **fields):
++        opened.append(name)
++        yield {}
++
++    diag = types.ModuleType("vllm.v1.metrics.pd_diagnostics")
++    diag.span = span
++    diag.current_batch = lambda: record
++    metrics = types.ModuleType("vllm.v1.metrics")
++    metrics.pd_diagnostics = diag
++    v1 = types.ModuleType("vllm.v1")
++    v1.metrics = metrics
++    vllm = types.ModuleType("vllm")
++    vllm.v1 = v1
++    sys.modules.update({"vllm": vllm, "vllm.v1": v1, "vllm.v1.metrics": metrics,
++                        "vllm.v1.metrics.pd_diagnostics": diag})
++
++    def undo():
++        for name, module in saved.items():
++            if module is None:
++                sys.modules.pop(name, None)
++            else:
++                sys.modules[name] = module
++
++    return record, opened, undo
++
++
++class Runner:
++    def __init__(self, timing):
++        self._pd_device_timing = timing
++
++
++class LevelReadTest(unittest.TestCase):
++    """_diag_level(): the one place the vLLM side's answer becomes a level."""
++
++    @staticmethod
++    def diag(**kwargs):
++        return types.SimpleNamespace(**kwargs)
++
++    def test_each_legal_level_is_taken_as_it_is(self):
++        for level in LEVELS:
++            answer = DiagLevel(level, "env")
++            self.assertEqual(pdt._diag_level(self.diag(diag_level=lambda a=answer: a)), level)
++
++    def test_a_bare_level_is_taken_too(self):
++        """Should the vLLM side ever answer with the number itself."""
++        for level in LEVELS:
++            self.assertEqual(pdt._diag_level(self.diag(diag_level=lambda level=level: level)), level)
++
++    def test_the_source_beside_the_level_is_ignored(self):
++        for source in ("default", "env", "invalid"):
++            self.assertEqual(pdt._diag_level(self.diag(diag_level=lambda s=source: DiagLevel(1, s))), 1)
++
++    def test_a_vllm_patch_without_the_function_runs_at_the_full_level(self):
++        self.assertEqual(pdt._diag_level(self.diag()), pdt.FULL_LEVEL)
++        self.assertEqual(pdt._diag_level(None), pdt.FULL_LEVEL)
++
++    def test_anything_that_is_not_one_of_the_three_levels_is_the_full_level(self):
++        values = (0, 4, -1, "2", 2.0, None, True, False, object(), (2, "env"),
++                  DiagLevel(0, "env"), DiagLevel("2", "env"), DiagLevel(None, "env"))
++        for value in values:
++            self.assertEqual(pdt._diag_level(self.diag(diag_level=lambda value=value: value)), pdt.FULL_LEVEL,
++                             f"{value!r} should not be taken as a level")
++
++    def test_a_raising_function_is_the_full_level(self):
++        def boom():
++            raise RuntimeError("sentinel")
++
++        self.assertEqual(pdt._diag_level(self.diag(diag_level=boom)), pdt.FULL_LEVEL)
++
++
++class StartupLineTest(unittest.TestCase):
++    def test_the_line_reads_the_same_at_every_level(self):
++        for level in LEVELS:
++            timing, _, _ = make(level)
++            self.assertEqual(timing.runner_stages,
++                             ("forward", "sampling", "prepare_inputs", "lm_head", "draft", "bookkeeping"),
++                             f"level {level}")
++            self.assertEqual(timing.stages_source, "default")
++            self.assertIn("bookkeeping", timing.stages, f"bookkeeping is measured at level {level}")
++
++
++class ReportsTest(unittest.TestCase):
++    def test_only_bookkeeping_is_held_back_and_only_below_the_full_level(self):
++        for level in LEVELS:
++            timing, _, _ = make(level)
++            for name in ("forward", "sampling", "prepare_inputs", "lm_head", "draft"):
++                self.assertTrue(timing.reports(name), f"{name} at level {level}")
++            self.assertEqual(timing.reports("bookkeeping"), level >= pdt.FULL_LEVEL, f"bookkeeping at level {level}")
++
++
++class RecordTest(unittest.TestCase):
++    def step(self, level, stages=pdt.OPTIONAL_STAGES):
++        timing, device, side = make(level, stages=stages)
++        run_step(timing, device, side)
++        return device, side
++
++    @staticmethod
++    def values(side, phase):
++        return sorted(side.claims[("e1", phase)].stages)
++
++    def test_the_execute_record_does_not_move_with_the_level(self):
++        for level in LEVELS:
++            _, side = self.step(level)
++            self.assertEqual(self.values(side, "execute"), ["forward", "lm_head", "prepare_inputs"], f"level {level}")
++
++    def test_the_bookkeeping_value_is_written_only_at_the_full_level(self):
++        for level in LEVELS:
++            _, side = self.step(level)
++            expected = ["bookkeeping", "draft", "sampling"] if level == pdt.FULL_LEVEL else ["draft", "sampling"]
++            self.assertEqual(self.values(side, "sample"), expected, f"level {level}")
++
++    def test_the_envelope_and_the_events_on_the_card_are_the_same_at_every_level(self):
++        spans, counts = set(), set()
++        for level in LEVELS:
++            device, side = self.step(level)
++            spans.add(side.batches[("e1", "sample")].fields["step_device_span_ns"])
++            counts.add(device.count)
++        # Six stages of 2 ms measured end to end, and two events per stage, whatever the level.
++        self.assertEqual(spans, {12 * MS})
++        self.assertEqual(counts, {2 * len(STEP_ORDER)})
++
++    def test_bookkeeping_switched_off_leaves_nothing_of_it_at_any_level(self):
++        for level in LEVELS:
++            device, side = self.step(level, stages=("prepare_inputs", "lm_head", "draft"))
++            self.assertNotIn("bookkeeping", self.values(side, "sample"), f"level {level}")
++            self.assertEqual(device.count, 2 * (len(STEP_ORDER) - 1), f"level {level}")
++
++
++class HelperTest(unittest.TestCase):
++    """Through the hook the runner calls, which is where the host span is opened."""
++
++    def one_stage(self, name, level):
++        """Drives one stage through the hook, in the phase that stage belongs to."""
++        phase = pdt._PHASE_OF_STAGE[name]
++        timing, device, side = make(level)
++        _, opened, undo = install_fake_vllm()
++        self.addCleanup(undo)
++        side.context.update(execution_id="e1", phase="execute")
++        timing.begin_execute()
++        if phase == "sample":
++            side.context["phase"] = "sample"
++            timing.begin_sample()
++        with pdt.stage(Runner(timing), name):
++            device.now_ms += 3
++        device.complete_all()
++        timing.end_sample(read_now=True)
++        claim = side.claims.get(("e1", phase))
++        return opened, device, {} if claim is None else claim.stages
++
++    def test_a_reported_stage_opens_its_span_at_every_level(self):
++        for level in LEVELS:
++            opened, _, stages = self.one_stage("lm_head", level)
++            self.assertEqual(opened, ["runner.lm_head"], f"level {level}")
++            self.assertEqual(stages["lm_head"]["device_duration_ns"], 3 * MS)
++
++    def test_bookkeeping_opens_its_span_only_at_the_full_level(self):
++        opened, device, stages = self.one_stage("bookkeeping", pdt.FULL_LEVEL)
++        self.assertEqual(opened, ["runner.bookkeeping"])
++        self.assertEqual(device.count, 2)
++        self.assertEqual(stages["bookkeeping"]["device_duration_ns"], 3 * MS)
++
++    def test_below_the_full_level_the_events_are_recorded_and_nothing_is_written(self):
++        for level in (1, 2):
++            opened, device, stages = self.one_stage("bookkeeping", level)
++            self.assertEqual(opened, [], f"no host span at level {level}")
++            self.assertEqual(device.count, 2, f"both device events at level {level}")
++            self.assertEqual(stages, {}, f"no stage value at level {level}")
++
++    def test_the_body_still_runs_when_the_stage_is_not_reported(self):
++        timing, _, _ = make(1)
++        ran = False
++        with pdt.stage(Runner(timing), "bookkeeping"):
++            ran = True
++        self.assertTrue(ran)
++
++    def test_the_body_error_still_reaches_the_caller(self):
++        timing, _, _ = make(1)
++        with self.assertRaises(ValueError):
++            with pdt.stage(Runner(timing), "bookkeeping"):
++                raise ValueError("sentinel")
++
++
++class CudagraphModeTest(unittest.TestCase):
++    def test_the_mode_is_written_at_every_level(self):
++        for level in LEVELS:
++            timing, _, _ = make(level)
++            record, _, undo = install_fake_vllm()
++            self.addCleanup(undo)
++            pdt.note_cudagraph_mode(Runner(timing), types.SimpleNamespace(runtime_mode="FULL"), None)
++            self.assertEqual(record.fields, {"cudagraph_runtime_mode": "FULL"}, f"level {level}")
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/ut/worker/test_pd_device_timing_t56.py b/tests/ut/worker/test_pd_device_timing_t56.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..4474115fcd2ec349c492c1866c5fbed3b5f36ff7
+--- /dev/null
++++ b/tests/ut/worker/test_pd_device_timing_t56.py
+@@ -0,0 +1,423 @@
++"""Stdlib-only tests for the T56 part of vllm_ascend/worker/pd_device_timing.py.
++
++T51 measured two stages per step; T56 adds four more and makes them switchable, so that a prefill node -- and a
++decode node with the switch off -- writes exactly what the T51 version wrote. The device events are stubs on a
++scripted timeline, as in test_pd_device_timing.py; the vLLM side (pd_diagnostics, forward context) is a fake module
++installed into sys.modules, because the helper imports it at call time.
++"""
++
++from __future__ import annotations
++
++import importlib.util
++import os
++import sys
++import types
++import unittest
++from contextlib import contextmanager
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[3]
++spec = importlib.util.spec_from_file_location("pd_device_timing_t56_ut", ROOT / "vllm_ascend/worker/pd_device_timing.py")
++pdt = importlib.util.module_from_spec(spec)
++spec.loader.exec_module(pdt)
++MS = 1_000_000
++STREAM = object()
++# The order the stages actually run in on a decode node (draft last: it runs after bookkeeping there).
++STEP_ORDER = (
++    ("execute", "prepare_inputs"),
++    ("execute", "forward"),
++    ("execute", "lm_head"),
++    ("sample", "sampling"),
++    ("sample", "bookkeeping"),
++    ("sample", "draft"),
++)
++
++
++class Device:
++    def __init__(self):
++        self.now_ms = 0.0
++        self.completed = -1
++        self.count = 0
++
++    def complete_all(self):
++        self.completed = self.count
++
++    def event(self):
++        return Event(self)
++
++
++class Event:
++    def __init__(self, device):
++        self.device = device
++        self.index = None
++        self.ts = None
++
++    def record(self, stream):
++        assert stream is STREAM
++        self.device.count += 1
++        self.index = self.device.count
++        self.ts = self.device.now_ms
++
++    def query(self):
++        return self.index is not None and self.index <= self.device.completed
++
++    def elapsed_time(self, other):
++        return other.ts - self.ts
++
++
++class Batch:
++    """vLLM's diag.Batch as far as this module uses it: record-level fields."""
++
++    def __init__(self):
++        self.fields: dict = {}
++
++    def update(self, **fields):
++        self.fields.update(fields)
++
++
++class Claim:
++    def __init__(self):
++        self.stages: dict = {}
++        self.released = 0
++
++    def set_stage_fields(self, stage, **fields):
++        self.stages.setdefault(stage, {}).update(fields)
++        return True
++
++    def release(self):
++        self.released += 1
++
++
++class Side:
++    """The claim and record side of one process, keyed by phase."""
++
++    def __init__(self):
++        self.context = {"execution_id": None, "phase": None}
++        self.claims: dict[tuple, Claim] = {}
++        self.batches: dict[tuple, Batch] = {}
++
++    def key(self):
++        return (self.context["execution_id"], self.context["phase"])
++
++    def claim_finish(self):
++        if self.context["execution_id"] is None:
++            return None
++        return self.claims.setdefault(self.key(), Claim())
++
++    def current_batch(self):
++        if self.context["execution_id"] is None:
++            return None
++        return self.batches.setdefault(self.key(), Batch())
++
++
++def make(stages=pdt.OPTIONAL_STAGES, decode_node=True, level=pdt.FULL_LEVEL):
++    device, side = Device(), Side()
++    timing = pdt.DeviceTiming(
++        enabled=True,
++        new_event=device.event,
++        current_stream=lambda: STREAM,
++        capturing=lambda: False,
++        claim_finish=side.claim_finish,
++        current_context=lambda: dict(side.context),
++        current_batch=side.current_batch,
++        stages=stages,
++        decode_node=decode_node,
++        level=level,
++    )
++    return timing, device, side
++
++
++def run_step(timing, device, side, execution_id, durations, synchronous=True):
++    """One step in the order the runner measures: the four T56 stages only when they are on."""
++    side.context.update(execution_id=execution_id, phase="execute")
++    timing.begin_execute()
++    for phase, name in STEP_ORDER:
++        if phase == "sample" and side.context["phase"] != "sample":
++            side.context["phase"] = "sample"
++            timing.begin_sample()
++        if name in pdt.OPTIONAL_STAGES and name not in timing.stages:
++            device.now_ms += durations.get(name, 0)
++            continue
++        with timing.measure(name):
++            device.now_ms += durations.get(name, 0)
++    if synchronous:
++        device.complete_all()
++    timing.end_sample(read_now=synchronous)
++
++
++def install_fake_vllm(spans=True, is_decode=True, batch=None, level=None):
++    """The three vLLM names this module imports at call time. Returns (batch, calls, undo)."""
++    saved = {name: sys.modules.get(name) for name in
++             ("vllm", "vllm.v1", "vllm.v1.metrics", "vllm.v1.metrics.pd_diagnostics")}
++    calls: list[str] = []
++    record = batch if batch is not None else Batch()
++
++    @contextmanager
++    def span(name, **fields):
++        calls.append(name)
++        yield {}
++
++    diag = types.ModuleType("vllm.v1.metrics.pd_diagnostics")
++    diag.span = span
++    diag.current_batch = lambda: record
++    diag._SPANS = {"runner." + name: name for name in pdt.OPTIONAL_STAGES} if spans else {}
++    if is_decode is not None:
++        diag.is_pd_decode = lambda vllm_config=None: is_decode
++    if level is not None:
++        diag.diag_level = lambda: level
++    metrics = types.ModuleType("vllm.v1.metrics")
++    metrics.pd_diagnostics = diag
++    v1 = types.ModuleType("vllm.v1")
++    v1.metrics = metrics
++    vllm = types.ModuleType("vllm")
++    vllm.v1 = v1
++    sys.modules.update({"vllm": vllm, "vllm.v1": v1, "vllm.v1.metrics": metrics,
++                        "vllm.v1.metrics.pd_diagnostics": diag})
++
++    def undo():
++        for name, module in saved.items():
++            if module is None:
++                sys.modules.pop(name, None)
++            else:
++                sys.modules[name] = module
++
++    return record, calls, undo
++
++
++class Runner:
++    """What the hooks read off the model runner."""
++
++    def __init__(self, timing):
++        self._pd_device_timing = timing
++
++
++class SwitchTest(unittest.TestCase):
++    def test_unset_means_all_four_stages(self):
++        self.assertEqual(pdt._parse_stages(None), (pdt.OPTIONAL_STAGES, "default"))
++
++    def test_none_goes_back_to_the_t51_behaviour(self):
++        self.assertEqual(pdt._parse_stages("none"), ((), "env"))
++        self.assertEqual(pdt._parse_stages("NONE"), ((), "env"))
++        self.assertEqual(pdt._parse_stages(" none , lm_head "), ((), "env"))
++
++    def test_a_subset_keeps_the_step_order(self):
++        self.assertEqual(pdt._parse_stages("draft,lm_head"), (("lm_head", "draft"), "env"))
++        self.assertEqual(pdt._parse_stages(" bookkeeping , prepare_inputs "),
++                         (("prepare_inputs", "bookkeeping"), "env"))
++
++    def test_unknown_names_are_ignored_and_the_base_stages_are_not_switchable(self):
++        self.assertEqual(pdt._parse_stages("forward,sampling"), ((), "env"))
++        self.assertEqual(pdt._parse_stages("lm_head,typo"), (("lm_head",), "env"))
++        self.assertEqual(pdt._parse_stages(""), ((), "env"))
++
++    def test_runner_stages_tells_switched_off_apart_from_not_a_decode_node(self):
++        timing, _, _ = make(stages=("lm_head", "draft"))
++        self.assertEqual(timing.runner_stages, ("forward", "sampling", "lm_head", "draft"))
++        self.assertEqual(timing.stages_source, "default")
++        # Switched off on a decode node: the line still says so.
++        off, _, _ = make(stages=())
++        self.assertEqual(off.runner_stages, ("forward", "sampling"))
++        # Not a decode node (a prefill node, or no way to tell): nothing on the line, as in T51.
++        not_decode, _, _ = make(stages=pdt.OPTIONAL_STAGES, decode_node=False)
++        self.assertEqual(not_decode.runner_stages, ())
++        self.assertEqual(not_decode.stages, frozenset())
++        self.assertEqual(pdt._DISABLED.runner_stages, ())
++        self.assertEqual(pdt._DISABLED.stages, frozenset())
++
++    def test_a_disabled_timing_measures_nothing(self):
++        timing = pdt.DeviceTiming(enabled=False, stages=pdt.OPTIONAL_STAGES, decode_node=True)
++        self.assertEqual(timing.stages, frozenset())
++        self.assertFalse(timing.decode_node)
++
++
++class DecodeNodeTest(unittest.TestCase):
++    def fake(self, **kwargs):
++        record, calls, undo = install_fake_vllm(**kwargs)
++        self.addCleanup(undo)
++        return sys.modules["vllm.v1.metrics.pd_diagnostics"], record, calls
++
++    def test_decode_node_with_the_spans_registered(self):
++        diag, _, _ = self.fake()
++        self.assertTrue(pdt._is_decode_node(diag, object()))
++
++    def test_prefill_node(self):
++        diag, _, _ = self.fake(is_decode=False)
++        self.assertFalse(pdt._is_decode_node(diag, object()))
++
++    def test_an_older_vllm_patch_without_the_function_or_the_spans(self):
++        diag, _, _ = self.fake(is_decode=None)
++        self.assertFalse(pdt._is_decode_node(diag, object()))
++        diag, _, _ = self.fake(spans=False)
++        self.assertFalse(pdt._is_decode_node(diag, object()))
++
++    def test_a_raising_function_is_a_no(self):
++        diag, _, _ = self.fake()
++
++        def boom(vllm_config=None):
++            raise RuntimeError("sentinel")
++
++        diag.is_pd_decode = boom
++        self.assertFalse(pdt._is_decode_node(diag, object()))
++
++
++class SwitchGateTest(unittest.TestCase):
++    """DeviceTiming.switches(): the gate and the environment together, the way for_runner uses them."""
++
++    def setUp(self):
++        os.environ.pop(pdt._ENV_STAGES, None)
++        self.addCleanup(lambda: os.environ.pop(pdt._ENV_STAGES, None))
++
++    def fake(self, **kwargs):
++        _, _, undo = install_fake_vllm(**kwargs)
++        self.addCleanup(undo)
++        return sys.modules["vllm.v1.metrics.pd_diagnostics"]
++
++    def test_decode_node_defaults_to_all_four(self):
++        self.assertEqual(pdt.DeviceTiming.switches(self.fake(), None),
++                         (pdt.OPTIONAL_STAGES, "default", True, pdt.FULL_LEVEL))
++
++    def test_decode_node_with_the_switch_set(self):
++        os.environ[pdt._ENV_STAGES] = "draft"
++        self.assertEqual(pdt.DeviceTiming.switches(self.fake(), None), (("draft",), "env", True, pdt.FULL_LEVEL))
++
++    def test_prefill_node_measures_nothing_whatever_the_switch_says(self):
++        os.environ[pdt._ENV_STAGES] = "prepare_inputs,lm_head,draft,bookkeeping"
++        stages, _, decode, _ = pdt.DeviceTiming.switches(self.fake(is_decode=False), None)
++        self.assertEqual((stages, decode), ((), False))
++
++    def test_an_older_vllm_patch_measures_nothing(self):
++        stages, _, decode, _ = pdt.DeviceTiming.switches(self.fake(spans=False), None)
++        self.assertEqual((stages, decode), ((), False))
++
++
++class SixStageTest(unittest.TestCase):
++    def values(self, side, execution_id, phase):
++        return side.claims[(execution_id, phase)].stages
++
++    def test_each_stage_goes_to_its_own_record(self):
++        timing, device, side = make()
++        run_step(timing, device, side, "e1", {name: 1 for _, name in STEP_ORDER})
++        execute = self.values(side, "e1", "execute")
++        sample = self.values(side, "e1", "sample")
++        self.assertEqual(sorted(execute), ["forward", "lm_head", "prepare_inputs"])
++        self.assertEqual(sorted(sample), ["bookkeeping", "draft", "sampling"])
++        for stages in (execute, sample):
++            for fields in stages.values():
++                self.assertEqual(fields["device_duration_ns"], 1 * MS)
++
++    def test_the_step_envelope_spans_the_first_stage_to_the_last(self):
++        timing, device, side = make()
++        run_step(timing, device, side, "e1", {name: 2 for _, name in STEP_ORDER})
++        # Six stages of 2 ms each, measured end to end.
++        self.assertEqual(side.batches[("e1", "sample")].fields["step_device_span_ns"], 12 * MS)
++        self.assertNotIn("step_device_span_ns", side.batches[("e1", "execute")].fields)
++
++    def test_no_envelope_when_either_end_of_it_is_switched_off(self):
++        for stages in (("lm_head", "draft"), ("prepare_inputs", "lm_head")):
++            timing, device, side = make(stages=stages)
++            run_step(timing, device, side, "e1", {name: 2 for _, name in STEP_ORDER})
++            self.assertNotIn("step_device_span_ns", side.batches[("e1", "sample")].fields)
++
++    def test_a_switched_off_stage_is_not_in_the_record_at_all(self):
++        timing, device, side = make(stages=("lm_head",))
++        run_step(timing, device, side, "e1", {name: 1 for _, name in STEP_ORDER})
++        self.assertEqual(sorted(self.values(side, "e1", "execute")), ["forward", "lm_head"])
++        self.assertEqual(sorted(self.values(side, "e1", "sample")), ["sampling"])
++
++    def test_with_every_stage_off_the_records_are_what_t51_wrote(self):
++        timing, device, side = make(stages=())
++        self.assertEqual(timing.runner_stages, ("forward", "sampling"))  # the line still marks it a decode node
++        run_step(timing, device, side, "e1", {name: 1 for _, name in STEP_ORDER})
++        self.assertEqual(sorted(self.values(side, "e1", "execute")), ["forward"])
++        self.assertEqual(sorted(self.values(side, "e1", "sample")), ["sampling"])
++        for batch in side.batches.values():
++            self.assertEqual(batch.fields, {})
++
++    def test_events_that_never_complete_leave_the_stages_without_device_values(self):
++        timing, device, side = make()
++        run_step(timing, device, side, "e1", {name: 1 for _, name in STEP_ORDER}, synchronous=False)
++        for _ in range(pdt.SLOTS):
++            side.context.update(execution_id=None, phase=None)
++            timing.begin_execute()
++        self.assertEqual(self.values(side, "e1", "execute"), {})
++        self.assertEqual(side.batches[("e1", "sample")].fields, {})
++
++
++class HelperTest(unittest.TestCase):
++    def test_the_helper_opens_the_span_and_the_events_together(self):
++        timing, device, side = make()
++        _, calls, undo = install_fake_vllm()
++        self.addCleanup(undo)
++        side.context.update(execution_id="e1", phase="execute")
++        timing.begin_execute()
++        with pdt.stage(Runner(timing), "lm_head"):
++            device.now_ms += 3
++        device.complete_all()
++        timing.end_sample(read_now=True)
++        self.assertEqual(calls, ["runner.lm_head"])
++        self.assertEqual(side.claims[("e1", "execute")].stages["lm_head"]["device_duration_ns"], 3 * MS)
++
++    def test_a_stage_that_is_off_opens_nothing(self):
++        timing, device, side = make(stages=("draft",))
++        _, calls, undo = install_fake_vllm()
++        self.addCleanup(undo)
++        side.context.update(execution_id="e1", phase="execute")
++        timing.begin_execute()
++        ran = False
++        with pdt.stage(Runner(timing), "lm_head"):
++            ran = True
++        self.assertTrue(ran)
++        self.assertEqual(calls, [])
++        device.complete_all()
++        timing.end_sample(read_now=True)
++        self.assertEqual(side.claims[("e1", "execute")].stages, {})
++
++    def test_the_helper_never_raises_without_the_vllm_module(self):
++        timing, _, _ = make()
++        ran = False
++        with pdt.stage(Runner(timing), "draft"):
++            ran = True
++        self.assertTrue(ran)
++
++    def test_the_body_error_reaches_the_caller(self):
++        timing, _, _ = make()
++        _, _, undo = install_fake_vllm()
++        self.addCleanup(undo)
++        with self.assertRaises(ValueError):
++            with pdt.stage(Runner(timing), "draft"):
++                raise ValueError("sentinel")
++
++
++class CudagraphModeTest(unittest.TestCase):
++    def test_the_mode_is_written_on_the_execute_record(self):
++        timing, _, _ = make()
++        record, _, undo = install_fake_vllm()
++        self.addCleanup(undo)
++        pdt.note_cudagraph_mode(Runner(timing), types.SimpleNamespace(runtime_mode="FULL"), None)
++        self.assertEqual(record.fields, {"cudagraph_runtime_mode": "FULL"})
++
++    def test_the_enum_name_is_used_when_there_are_no_stats(self):
++        timing, _, _ = make()
++        record, _, undo = install_fake_vllm()
++        self.addCleanup(undo)
++        pdt.note_cudagraph_mode(Runner(timing), None, types.SimpleNamespace(name="PIECEWISE"))
++        self.assertEqual(record.fields, {"cudagraph_runtime_mode": "PIECEWISE"})
++
++    def test_nothing_is_written_when_every_stage_is_off(self):
++        timing, _, _ = make(stages=())
++        record, _, undo = install_fake_vllm()
++        self.addCleanup(undo)
++        pdt.note_cudagraph_mode(Runner(timing), types.SimpleNamespace(runtime_mode="FULL"), None)
++        self.assertEqual(record.fields, {})
++
++    def test_nothing_is_written_and_nothing_raises_without_a_mode(self):
++        timing, _, _ = make()
++        record, _, undo = install_fake_vllm()
++        self.addCleanup(undo)
++        pdt.note_cudagraph_mode(Runner(timing), None, None)
++        pdt.note_cudagraph_mode(Runner(timing))
++        self.assertEqual(record.fields, {})
++
++
++if __name__ == "__main__":
++    unittest.main()
 diff --git a/tests/ut/worker/test_pd_diag_runner_points.py b/tests/ut/worker/test_pd_diag_runner_points.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..636784fd699f8a22501f1aa38f24345365be4156
+index 0000000000000000000000000000000000000000..5e76ffce9ebf266388b8b2dff90415ccbf328ccb
 --- /dev/null
 +++ b/tests/ut/worker/test_pd_diag_runner_points.py
-@@ -0,0 +1,392 @@
+@@ -0,0 +1,458 @@
 +"""Stdlib-only tests for the runner's forward and sampling measurement points (d4ad49796 layout).
 +
 +Set VLLM_COMPACT_ROOT to the vLLM checkout that carries vllm/v1/metrics/pd_diagnostics.py.
@@ -2098,6 +3092,28 @@ index 0000000000000000000000000000000000000000..636784fd699f8a22501f1aa38f243453
 +    return found
 +
 +
++def stage_blocks(function, name=None):
++    """The `with pd_device_timing.stage(self, "<name>")` blocks inside this function, by stage name."""
++    found = {}
++
++    def visit(node):
++        if isinstance(node, ast.With):
++            for item in node.items:
++                call = item.context_expr
++                if (isinstance(call, ast.Call) and ast.unparse(call.func) == "pd_device_timing.stage"
++                        and len(call.args) == 2):
++                    found.setdefault(ast.literal_eval(call.args[1]), []).append(node)
++        for child in ast.iter_child_nodes(node):
++            visit(child)
++
++    visit(function)
++    return found if name is None else found.get(name, [])
++
++
++def calls_in(node):
++    return {ast.unparse(child.func) for child in ast.walk(node) if isinstance(child, ast.Call)}
++
++
 +class RunnerPlacementTest(unittest.TestCase):
 +    def test_v1_decorators_and_call_sites(self):
 +        v1 = runner_methods(V1)
@@ -2141,6 +3157,50 @@ index 0000000000000000000000000000000000000000..636784fd699f8a22501f1aa38f243453
 +        )
 +        # V2 keeps host timing only.
 +        self.assertNotIn("pd_device_timing", V2.read_text(encoding="utf-8"))
++
++    def test_v1_t56_stage_points(self):
++        """The four T56 stages: one block each, around the calls the segment is defined as."""
++        v1 = runner_methods(V1)
++        blocks = {name: stage_blocks(v1[name]) for name in ("execute_model", "sample_tokens")}
++        self.assertEqual(sorted(blocks["execute_model"]), ["lm_head", "prepare_inputs"])
++        self.assertEqual(sorted(blocks["sample_tokens"]), ["bookkeeping", "draft"])
++        for name, found in blocks.items():
++            for stage, nodes in found.items():
++                self.assertEqual(len(nodes), 1, f"{stage} must be measured in one place in {name}")
++
++        prepare = calls_in(blocks["execute_model"]["prepare_inputs"][0])
++        for call in ("self._update_states", "self._prepare_inputs", "self._determine_batch_execution_and_padding",
++                     "self._build_attention_metadata", "self._preprocess", "self.synchronize_input_prep"):
++            self.assertIn(call, prepare)
++        self.assertNotIn("self._model_forward", prepare)  # the forward stage keeps its own events
++
++        lm_head = calls_in(blocks["execute_model"]["lm_head"][0])
++        self.assertIn("self.model.compute_logits", lm_head)
++        self.assertNotIn("self._model_forward", lm_head)
++
++        bookkeeping = calls_in(blocks["sample_tokens"]["bookkeeping"][0])
++        self.assertIn("self._bookkeeping_sync", bookkeeping)
++        self.assertNotIn("self.propose_draft_token_ids", bookkeeping)
++
++        # The draft block sits inside the closure, so it covers each of its call sites exactly once.
++        draft_block = blocks["sample_tokens"]["draft"][0]
++        draft = calls_in(draft_block)
++        for call in ("self.propose_draft_token_ids", "self._skip_drafting", "self._copy_draft_token_ids_to_cpu"):
++            self.assertIn(call, draft)
++        closures = [node for node in ast.walk(v1["sample_tokens"])
++                    if isinstance(node, ast.FunctionDef) and node.name == "propose_draft_token_ids"]
++        self.assertEqual(len(closures), 1)
++        self.assertIn(draft_block, list(ast.iter_child_nodes(closures[0])))
++        self.assertGreaterEqual(len(call_spans(v1["sample_tokens"], "propose_draft_token_ids")), 2)
++
++        # The graph mode of the step, once, next to where the runner works it out.
++        self.assertEqual(len(call_spans(v1["execute_model"], "pd_device_timing.note_cudagraph_mode")), 1)
++
++    def test_v1_t56_stages_are_not_on_the_dummy_paths(self):
++        v1 = runner_methods(V1)
++        for name in ("_dummy_run", "_dummy_sampler_run", "profile_run", "capture_model"):
++            self.assertEqual(stage_blocks(v1[name]), {}, f"{name} must not measure a T56 stage")
++            self.assertEqual(call_spans(v1[name], "pd_device_timing.note_cudagraph_mode"), [])
 +
 +    def test_imports_name_the_vllm_patch_symbols(self):
 +        for path in (V1, V2):

@@ -1,0 +1,12 @@
+=== 12:44:59 library (resume)
+cmake version 3.31.12
+-rwxr-xr-x 1 root root 413150352 Nov 20 12:55 /out/repl58/build/mooncake-store/src/libmooncake_store.so
+=== 12:55:12 relink
+v1: needed=libzstd-2a4af8ca.so.1.5.5,libtransfer_engine.so,libxxhash-0bb4316f.so.0.8.2,libnuma.so.1,libascendcl.so,libmooncake_common.so,libyaml-cpp-f6e0e2ab.so.0.7.0,libasio.so,libibverbs.so.1,libgflags-0650a09e.so.2.2.2,libjsoncpp-598fe3ba.so.1.9.5,ascend_transport.so,libglog-afa88425.so.0.6.0,libstdc++.so.6,libm.so.6,libgcc_s.so.1,libc.so.6 rpath=$ORIGIN soname=libmooncake_store.so
+needed: libzstd-2a4af8ca.so.1.5.5,libtransfer_engine.so,libxxhash-0bb4316f.so.0.8.2,libnuma.so.1,libascendcl.so,libmooncake_common.so,libyaml-cpp-f6e0e2ab.so.0.7.0,libasio.so,libibverbs.so.1,libgflags-0650a09e.so.2.2.2,libjsoncpp-598fe3ba.so.1.9.5,ascend_transport.so,libglog-afa88425.so.0.6.0,libstdc++.so.6,libm.so.6,libgcc_s.so.1,libc.so.6
+rpath: $ORIGIN
+soname: libmooncake_store.so
+NEEDED set equals the site's
+-rw-r--r-- 1 root root 15402392 Nov 20 12:55 /out/libmooncake_store.so
+37a3aaf8acb53c6a3cdb9251b9e6d3e1edc0c13789c8d4138d111b1d71cc4a6f  /out/libmooncake_store.so
+=== 12:55:19 done

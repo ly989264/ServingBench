@@ -1,5 +1,5 @@
 diff --git a/vllm_ascend/worker/model_runner_v1.py b/vllm_ascend/worker/model_runner_v1.py
-index 30c76975b5ec629e97a95f274e1765f5483efd21..5bd5ccf541aa0be1614f94965cb99a3a8e68eede 100644
+index 30c76975b5ec629e97a95f274e1765f5483efd21..fa91dc053afbb830a3ae32be7bc5e73ba32b08c5 100644
 --- a/vllm_ascend/worker/model_runner_v1.py
 +++ b/vllm_ascend/worker/model_runner_v1.py
 @@ -85,6 +85,7 @@ from vllm.v1.kv_cache_interface import (
@@ -42,7 +42,39 @@ index 30c76975b5ec629e97a95f274e1765f5483efd21..5bd5ccf541aa0be1614f94965cb99a3a
  
          # If ngram_gpu is used, we need to copy the scheduler_output to avoid
          # the modification has influence on the scheduler_output in engine core process.
-@@ -2760,6 +2765,7 @@ class NPUModelRunner(GPUModelRunner):
+@@ -2282,7 +2287,10 @@ class NPUModelRunner(GPUModelRunner):
+             get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
+ 
+         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+-        with record_function_or_nullcontext("prepare input"):
++        with (
++            record_function_or_nullcontext("prepare input"),
++            pd_device_timing.stage(self, "prepare_inputs"),
++        ):
+             with self.synchronize_input_prep():
+                 # Fix up prev_req_id_to_index for requests that were discarded
+                 # in the previous sample_tokens step. If a request has
+@@ -2387,6 +2395,7 @@ class NPUModelRunner(GPUModelRunner):
+                     force_eager=self.model_config.enforce_eager,
+                     num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
+                 )
++                pd_device_timing.note_cudagraph_mode(self, cudagraph_stats, cudagraph_mode)
+ 
+                 if logger.isEnabledFor(logging.DEBUG):
+                     logger.debug(
+@@ -2630,8 +2639,9 @@ class NPUModelRunner(GPUModelRunner):
+                     self._finalize_dump_data()
+                     return output
+ 
+-                sample_hidden_states = hidden_states[logits_indices]
+-                logits = self.model.compute_logits(sample_hidden_states)
++                with pd_device_timing.stage(self, "lm_head"):
++                    sample_hidden_states = hidden_states[logits_indices]
++                    logits = self.model.compute_logits(sample_hidden_states)
+             else:
+                 # Rare case.
+                 assert not self.is_pooling_model
+@@ -2760,6 +2770,7 @@ class NPUModelRunner(GPUModelRunner):
          self._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only=True)
  
      @torch.inference_mode()
@@ -50,7 +82,7 @@ index 30c76975b5ec629e97a95f274e1765f5483efd21..5bd5ccf541aa0be1614f94965cb99a3a
      def sample_tokens(
          self, grammar_output: "GrammarOutput | None"
      ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
-@@ -2781,6 +2787,7 @@ class NPUModelRunner(GPUModelRunner):
+@@ -2781,6 +2792,7 @@ class NPUModelRunner(GPUModelRunner):
              output.kv_connector_output = kv_connector_output
              return output
  
@@ -58,7 +90,98 @@ index 30c76975b5ec629e97a95f274e1765f5483efd21..5bd5ccf541aa0be1614f94965cb99a3a
          # Unpack ephemeral state.
          (
              scheduler_output,
-@@ -2950,10 +2957,11 @@ class NPUModelRunner(GPUModelRunner):
+@@ -2825,27 +2837,29 @@ class NPUModelRunner(GPUModelRunner):
+         )
+ 
+         def propose_draft_token_ids(sampled_token_ids):
+-            if not input_fits_in_drafter:
+-                self._skip_drafting(
++            # One stage per step whichever of the three call sites below runs.
++            with pd_device_timing.stage(self, "draft"):
++                if not input_fits_in_drafter:
++                    self._skip_drafting(
++                        scheduler_output,
++                        sampled_token_ids if use_padded_batch else None,
++                    )
++                    return
++                assert spec_decode_common_attn_metadata is not None
++                self._draft_token_ids = self.propose_draft_token_ids(
++                    sampled_token_ids,
++                    self.input_batch.sampling_metadata,
+                     scheduler_output,
+-                    sampled_token_ids if use_padded_batch else None,
++                    spec_decode_metadata,
++                    spec_decode_common_attn_metadata,
++                    positions,
++                    scheduler_output.total_num_scheduled_tokens,
++                    hidden_states,
++                    aux_hidden_states,
++                    sample_hidden_states,
++                    batch_desc,
+                 )
+-                return
+-            assert spec_decode_common_attn_metadata is not None
+-            self._draft_token_ids = self.propose_draft_token_ids(
+-                sampled_token_ids,
+-                self.input_batch.sampling_metadata,
+-                scheduler_output,
+-                spec_decode_metadata,
+-                spec_decode_common_attn_metadata,
+-                positions,
+-                scheduler_output.total_num_scheduled_tokens,
+-                hidden_states,
+-                aux_hidden_states,
+-                sample_hidden_states,
+-                batch_desc,
+-            )
+-            self._copy_draft_token_ids_to_cpu(scheduler_output)
++                self._copy_draft_token_ids_to_cpu(scheduler_output)
+ 
+         output_spec_token_ids = None
+         use_padded_batch = False
+@@ -2868,23 +2882,24 @@ class NPUModelRunner(GPUModelRunner):
+                 with record_function_or_nullcontext("draft_token"):
+                     propose_draft_token_ids(sampler_output.sampled_token_ids)
+ 
+-        (
+-            num_nans_in_logits,
+-            num_nans_device,
+-            logprobs_lists,
+-            valid_sampled_token_ids,
+-            prompt_logprobs_dict,
+-            req_ids_output_copy,
+-            req_id_to_index_output_copy,
+-            invalid_req_indices,
+-        ) = self._bookkeeping_sync(
+-            scheduler_output,
+-            sampler_output,
+-            logits,
+-            hidden_states,
+-            scheduler_output.total_num_scheduled_tokens,
+-            spec_decode_metadata,
+-        )
++        with pd_device_timing.stage(self, "bookkeeping"):
++            (
++                num_nans_in_logits,
++                num_nans_device,
++                logprobs_lists,
++                valid_sampled_token_ids,
++                prompt_logprobs_dict,
++                req_ids_output_copy,
++                req_id_to_index_output_copy,
++                invalid_req_indices,
++            ) = self._bookkeeping_sync(
++                scheduler_output,
++                sampler_output,
++                logits,
++                hidden_states,
++                scheduler_output.total_num_scheduled_tokens,
++                spec_decode_metadata,
++            )
+ 
+         with record_function_or_nullcontext("draft_token"):
+             if self.speculative_config:
+@@ -2950,10 +2965,11 @@ class NPUModelRunner(GPUModelRunner):
                  self._update_states_after_model_execute(sampler_output.sampled_token_ids, scheduler_output)
  
          if not self.use_async_scheduling:
@@ -71,7 +194,7 @@ index 30c76975b5ec629e97a95f274e1765f5483efd21..5bd5ccf541aa0be1614f94965cb99a3a
              model_runner_output=model_runner_output,
              sampled_token_ids=sampler_output.sampled_token_ids,
              logprobs_tensors=sampler_output.logprobs_tensors,
-@@ -2966,6 +2974,7 @@ class NPUModelRunner(GPUModelRunner):
+@@ -2966,6 +2982,7 @@ class NPUModelRunner(GPUModelRunner):
              async_output.sampled_token_ids_cpu,
              async_output.async_copy_ready_event,
          )
@@ -79,7 +202,7 @@ index 30c76975b5ec629e97a95f274e1765f5483efd21..5bd5ccf541aa0be1614f94965cb99a3a
          return async_output
  
      # overwrite _sample for lmhead_tp_enable and need_accepted_tokens
-@@ -2976,20 +2985,28 @@ class NPUModelRunner(GPUModelRunner):
+@@ -2976,20 +2993,28 @@ class NPUModelRunner(GPUModelRunner):
          if spec_decode_metadata is None:
              if lmhead_tp_enable() and logits is not None:
                  logits = logits[: self.input_batch.num_reqs]
@@ -118,7 +241,7 @@ index 30c76975b5ec629e97a95f274e1765f5483efd21..5bd5ccf541aa0be1614f94965cb99a3a
          return sampler_output
  
      def _get_nans_in_logits(self, logits: torch.Tensor | None) -> dict[str, int]:
-@@ -3244,9 +3261,17 @@ class NPUModelRunner(GPUModelRunner):
+@@ -3244,9 +3269,17 @@ class NPUModelRunner(GPUModelRunner):
              if self.enable_enpu:
                  # The soft segmentation scenario requires event.record first, then event.wait
                  self._update_full_graph_params_if_needed(forward_context, num_tokens_padded)

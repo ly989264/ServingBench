@@ -4,7 +4,8 @@ Usage: python3 check_field_subset.py hybrid.jsonl v1.jsonl [more v1 .jsonl ...] 
 Records are grouped by (event, scope, transfer_role). Field paths are flattened with list positions
 collapsed to [], so native_calls[0].status and native_calls[3].status are the same path. For the
 enumerated fields below, the set of values V1 wrote must be contained in the set hybrid wrote.
-Exits 1 when V1 has a path or a value that hybrid does not.
+Exits 1 when V1 has a path or a value that hybrid does not, other than the V1-only fields of contract 1.4.0
+(V1_ONLY), which are listed in their own column.
 """
 
 import json
@@ -12,8 +13,18 @@ import re
 import sys
 from collections import defaultdict
 
+# Fields only MooncakeConnectorV1 writes (contract glm5.3 1.4.0, the T56 exception to "V1 writes only fields hybrid
+# writes"): the KV-load envelope and the per-task maxima on request_generation, request_done_ns on task.
+V1_ONLY = {
+    ("pd_transfer_summary", "request_generation", None): {
+        "kv_load_envelope_ns", "kv_load_timing_scope", "task_max_queue_wait_ns", "task_max_meta_fetch_ns",
+        "task_max_prepare_ns",
+    },
+    ("pd_transfer_summary", "task", None): {"request_done_ns"},
+}
+
 ENUMERATED = re.compile(
-    r"^(event|scope|transfer_role|status|transfer_status|direction|timing_scope|transfer_timing_scope|kv_role"
+    r"^(event|scope|transfer_role|status|transfer_status|direction|timing_scope|transfer_timing_scope|kv_role|kv_load_timing_scope"
     r"|stages\.[^.]+\.(status|completion)|associated_stages\.[^.]+\.status"
     r"|native_calls\[\]\.(status|operation|transfer_scope|result_scope|per_segment_status|byte_semantics)"
     r"|links\[\]\.kind|complete|incomplete|final_task|tracker_completed|final_task_queued|delayed_free)$"
@@ -54,13 +65,16 @@ def main(argv):
     hybrid_fields, hybrid_values, hybrid_count = collect([argv[0]])
     v1_fields, v1_values, v1_count = collect(argv[1:])
     problems = 0
-    print("| 记录 | hybrid 条数 | V1 条数 | V1 字段路径 | V1 多出的路径 | V1 多出的枚举取值 | 只在 hybrid 出现的路径 |")
-    print("|---|---|---|---|---|---|---|")
+    print("| 记录 | hybrid 条数 | V1 条数 | V1 字段路径 | V1 多出的路径 | V1 多出的枚举取值 | 约定 1.4.0 允许的 V1 独有字段 | 只在 hybrid 出现的路径 |")
+    print("|---|---|---|---|---|---|---|---|")
     for key in sorted(set(hybrid_fields) | set(v1_fields), key=str):
-        extra_paths = sorted(v1_fields[key] - hybrid_fields[key])
+        allowed = V1_ONLY.get(key, set())
+        extra_paths = sorted(v1_fields[key] - hybrid_fields[key] - allowed)
+        v1_only = sorted((v1_fields[key] - hybrid_fields[key]) & allowed)
         extra_values = [
             f"`{name}`={value}"
             for name in sorted(v1_values[key])
+            if name not in allowed
             for value in sorted(v1_values[key][name] - hybrid_values[key][name])
         ]
         hybrid_only = sorted(hybrid_fields[key] - v1_fields[key])
@@ -69,7 +83,7 @@ def main(argv):
         print(
             f"| {label} | {hybrid_count[key]} | {v1_count[key]} | {len(v1_fields[key])} | "
             f"{', '.join(f'`{p}`' for p in extra_paths) or '无'} | {', '.join(extra_values) or '无'} | "
-            f"{', '.join(f'`{p}`' for p in hybrid_only) or '无'} |"
+            f"{', '.join(f'`{p}`' for p in v1_only) or '无'} | {', '.join(f'`{p}`' for p in hybrid_only) or '无'} |"
         )
     print()
     print("V1 的枚举取值（每种记录）：")

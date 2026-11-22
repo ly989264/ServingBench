@@ -40,7 +40,7 @@ import struct
 import sysconfig
 import time
 
-TOOL_VERSION = "glm53-6"
+TOOL_VERSION = "glm53-8"
 EXPECTED_B64 = None  # filled in by build.py; otherwise t51_expected.json next to this file is used
 MAX_SUMMARY_LINES = 20
 MAX_LOG_BYTES = 64 * 1024 * 1024  # vLLM log: only the first 64 MiB are read
@@ -1506,10 +1506,15 @@ def check_mooncake(expected, worker_maps, redact, search):
     out["timing_tags"] = sorted(tags)
     # which libmooncake_store.so this is: the delivered replacement, the site's original (field check f-1), or other
     store_rel = os.path.basename(pkg) + "/libmooncake_store.so"
-    repl, orig = expected.get("mooncake_replacement") or {}, expected.get("mooncake_site_original") or {}
+    orig = expected.get("mooncake_site_original") or {}
+    repls = list(expected.get("mooncake_replacements") or [])
+    if not repls and expected.get("mooncake_replacement"):
+        repls = [dict(expected["mooncake_replacement"], label="")]
     got = files.get(store_rel)
-    out["store_is"] = ("replacement" if repl and got == repl.get("sha16") else "site_original" if orig and got == orig.get("sha16")
+    hit = [r for r in repls if got is not None and got == r.get("sha16")]
+    out["store_is"] = ("replacement" if hit else "site_original" if orig and got == orig.get("sha16")
                        else "absent" if got is None else "other")
+    out["replacement"] = hit[0].get("label") if hit else None
     sib = {}
     for name, want in sorted((expected.get("mooncake_lab_siblings") or {}).items()):
         exp = dynsym_exports(os.path.join(pkg, name))
@@ -1934,7 +1939,22 @@ def elf_info(path, search=None):
 MAX_DYNSYM_BYTES = 64 * 1024 * 1024
 SITE_PATCH_FILES = ("patch/__init__.py", "patch/platform/__init__.py", "patch/platform/patch_kv_load_failure_reason.py",
                     "patch/platform/patch_prefill_length_validation.py")
-BASE_FIELDS = ("kind", "conn", "spec", "eager", "async_sched", "load_async", "tp", "dp", "sched_short")
+BASE_FIELDS = ("kind", "conn", "spec", "eager", "async_sched", "load_async", "tp", "dp", "sched_short", "diag_level")
+# a field a baseline token of an older check does not carry: compared as this value
+BASE_FIELD_DEFAULTS = {"diag_level": "3"}
+
+
+def diag_level_of(env):
+    """PD_DIAG_LEVEL as the T58 patches read it (the same table as vLLM's pd_diagnostics.diag_level() and Mooncake's
+    pd_timing_level.h): unset or empty -> 3 default; exactly 1, 2 or 3 -> env; anything else -> 3 invalid."""
+    if env is None:
+        return None, "?"
+    v = env.get("PD_DIAG_LEVEL")
+    if v is None or v == "":
+        return 3, "default"
+    if v in ("1", "2", "3"):
+        return int(v), "env"
+    return 3, "invalid"
 
 
 def dynsym_exports(path):
@@ -2051,6 +2071,9 @@ def base_compare(token, groups):
     except Exception:
         return ["BASELINE_UNREADABLE"]
     old = {r[0]: dict(zip(BASE_FIELDS, r[1:])) for r in rows}
+    for o in old.values():
+        for k, dv in BASE_FIELD_DEFAULTS.items():
+            o.setdefault(k, dv)
     new = {g["ports"]: {k: str(g.get(k)) for k in BASE_FIELDS} for g in groups}
     diffs = []
     for ports in sorted(set(old) | set(new)):
@@ -2123,12 +2146,41 @@ def redact_path_only(path):
 
 
 def port_field(ref, actual):
-    """port=a/b: how many of the b files the T51 port changes or adds are exactly the ported version."""
-    out = ""
+    """port=<version>:a/b,...: per embedded patched state (T51, T56), how many of the b files that port changes or
+    adds are exactly the ported version."""
+    parts = []
     for label, data in sorted((ref.get("alts") or {}).items()):
         files = data.get("files", {})
-        out += " port=%d/%d" % (sum(1 for rel, h in files.items() if actual.get(rel) == h), len(files))
-    return out
+        parts.append("%s:%d/%d" % (label.split("+")[-1], sum(1 for rel, h in files.items() if actual.get(rel) == h), len(files)))
+    return (" port=" + ",".join(parts)) if parts else ""
+
+
+def alt_facts(ref, actual, res):
+    """Per embedded patched state: exact files of how many, and the changed files outside that port (site edits)."""
+    facts = []
+    for label, data in sorted((ref.get("alts") or {}).items()):
+        files = data.get("files", {})
+        exact = sum(1 for rel, h in files.items() if actual.get(rel) == h)
+        others = sorted((set(res["changed"]) | set(res["added"])) - set(files))
+        facts.append({"label": label.split("+")[-1], "exact": exact, "of": len(files), "others": others})
+    return facts
+
+
+def verdict_of(facts, ignore=(), show_zero=False):
+    """ok(<version>) when every file of one embedded port is exact (the newest such version), unpatched when no
+    file of any port is, BAD(...) otherwise (against the port with the most exact files)."""
+    if not facts:
+        return "absent"
+    full = [f for f in facts if f["of"] and f["exact"] == f["of"]]
+    if full:
+        f = full[-1]
+        local = [r for r in f["others"] if r not in ignore]
+        return "ok(%s%s)" % (f["label"], (",site_local=%d" % len(local)) if local or show_zero else "")
+    if all(f["exact"] == 0 for f in facts):
+        local = [r for r in facts[-1]["others"] if r not in ignore]
+        return "unpatched" + ("(site_local=%d)" % len(local) if local or show_zero else "")
+    f = max(facts, key=lambda x: (x["exact"] / max(x["of"], 1), x["label"]))
+    return "BAD(%s:port=%d/%d,other=%d)" % (f["label"], f["exact"], f["of"], len([r for r in f["others"] if r not in ignore]))
 
 
 def origin_fields(o):
@@ -2199,6 +2251,7 @@ def strict_compare(top, pkg_dir, originals, port_text=None):
     for rel in sorted(set(originals) | set(port_text)):
         check_deadline()
         pub, port = originals.get(rel), port_text.get(rel)
+        ports = port if isinstance(port, dict) else ({"port": port} if port is not None else {})
         data = read_bytes(os.path.join(root, rel))
         if data is None:
             out[rel] = {"state": "missing" if pub is not None else "port_file_absent"}
@@ -2206,12 +2259,13 @@ def strict_compare(top, pkg_dir, originals, port_text=None):
         if pub is not None and data == pub.encode("utf-8"):
             out[rel] = {"state": "equal"}
             continue
-        if port is not None and data == port.encode("utf-8"):
-            out[rel] = {"state": "port"}
+        hit = [label for label, text in sorted(ports.items()) if data == text.encode("utf-8")]
+        if hit:
+            out[rel] = {"state": "port", "label": hit[-1]}
             continue
         b = data.decode("utf-8", "replace").splitlines(True)
         best = None
-        for ref, text in (("public", pub), ("port", port)):
+        for ref, text in [("public", pub)] + [("port", x) for _, x in sorted(ports.items())]:
             if text is None:
                 continue
             ops = difflib.SequenceMatcher(None, text.splitlines(True), b, autojunk=False).get_opcodes()
@@ -2510,12 +2564,7 @@ def build_report(args):
             if labels:
                 lines.append("vllm_changes=" + short_list(labels, 200))
             code_digest["vllm"] = sha16(json.dumps(actual, sort_keys=True).encode())
-            alt_files = {}
-            for _label, _alt in sorted((expected["vllm"].get("alts") or {}).items()):
-                alt_files = _alt.get("files", {})
-            exact = sum(1 for rel, h in alt_files.items() if actual.get(rel) == h)
-            others = sorted((set(res["changed"]) | set(res["added"])) - set(alt_files))
-            verdict_facts["vllm"] = {"state": res["state"], "exact": exact, "of": len(alt_files), "others": others}
+            verdict_facts["vllm"] = alt_facts(expected["vllm"], actual, res)
         else:
             lines.append("vllm=absent")
 
@@ -2555,12 +2604,7 @@ def build_report(args):
             detail["vllm_ascend"]["site_patch_files"] = site_p
             lines.append("site_patches " + " ".join(site_p))
             code_digest["ascend"] = sha16(json.dumps(actual, sort_keys=True).encode())
-            alt_files = {}
-            for _label, _alt in sorted((expected["vllm_ascend"].get("alts") or {}).items()):
-                alt_files = _alt.get("files", {})
-            exact = sum(1 for rel, h in alt_files.items() if actual.get(rel) == h)
-            others = sorted((set(res["changed"]) | set(res["added"])) - set(alt_files))
-            verdict_facts["ascend"] = {"state": res["state"], "exact": exact, "of": len(alt_files), "others": others}
+            verdict_facts["ascend"] = alt_facts(expected["vllm_ascend"], actual, res)
         else:
             lines.append("ascend=absent")
 
@@ -2586,16 +2630,30 @@ def build_report(args):
     p2d_res = None
     with Section('p2d', errors):
         adir_ = _RUNTIME.get("vllm_ascend")
-        if adir_ and expected.get("p2d"):
+        versions = expected.get("p2d_versions") or ({"t51": expected["p2d"]} if expected.get("p2d") else {})
+        if adir_ and versions:
             data = read_bytes(os.path.join(adir_, "distributed", "kv_transfer", "kv_p2p", "mooncake_connector.py"))
             if data is None:
                 p2d_res = {"state": "absent"}
             else:
-                p2d_res = p2d_post(expected["p2d"], data.decode("utf-8", "replace"))
+                # every embedded replay version (T51, T56); the newest one the file fully matches wins
+                runs = [dict(p2d_post(spec, data.decode("utf-8", "replace")), label=label) for label, spec in sorted(versions.items())]
+                okv = [r for r in runs if r.get("state") == "ok"]
+                if okv:
+                    p2d_res = okv[-1]
+                elif all(r.get("state") == "not_replayed" for r in runs):
+                    p2d_res = runs[-1]
+                else:
+                    # judged against the version it is closest to: most of its changes found, then the newer one
+                    def closeness(r):
+                        ch = r.get("changes") or (0, 1)
+                        return (ch[0] / max(ch[1], 1), -len(r.get("missing") or []), r["label"])
+                    p2d_res = max((r for r in runs if r.get("state") != "not_replayed"), key=closeness)
+                p2d_res["versions"] = {r["label"]: r.get("state") for r in runs}
             detail["p2d"] = p2d_res
             if p2d_res.get("changes"):
-                txt = "p2d=%s(changes=%d/%d,missing=%s,struct=%s,extra=%s,replacement_file=%s)" % (
-                    p2d_res["state"], p2d_res["changes"][0], p2d_res["changes"][1], "+".join(p2d_res["missing"]) or "none",
+                txt = "p2d=%s(%s,changes=%d/%d,missing=%s,struct=%s,extra=%s,replacement_file=%s)" % (
+                    p2d_res["state"], p2d_res.get("label", "-"), p2d_res["changes"][0], p2d_res["changes"][1], "+".join(p2d_res["missing"]) or "none",
                     "ok" if not p2d_res["problems"] else "problems:%d" % len(p2d_res["problems"]),
                     "same" if p2d_res["extra_same"] else "DIFFERS", boolstr(p2d_res["equals_replacement"]))
             else:
@@ -2622,7 +2680,7 @@ def build_report(args):
                     len(mc.get("so_diff", [])),
                     len(mc.get("changed_since_install", [])),
                     len(mc.get("timing_tags", [])),
-                    mc.get("store_is", "?"),
+                    mc.get("store_is", "?") + ("(%s)" % mc["replacement"] if mc.get("replacement") else ""),
                     mc.get("glog") or "?",
                     len(mc.get("loaded", [])) if worker_maps else "noperm" if apis else "-",
                     "+".join(sorted(set(os.path.dirname(x).rsplit("/", 1)[-1] + "/" + os.path.basename(x) for x in mc.get("loaded", []) if "libmooncake_store" in x))) or "-",
@@ -2819,6 +2877,7 @@ def build_report(args):
                 g["eager"] = str(g.get("eager"))
                 g["async_sched"] = boolstr(g.get("async_sched"))
                 g["load_async"] = boolstr(g.get("load_async"))
+                g["diag_level"] = str(diag_level_of(run_env)[0] if run_env is not None else "?")
                 bgroups.append(g)
             token = base_token(bgroups)
             detail["baseline_token"] = token
@@ -2880,7 +2939,7 @@ def build_report(args):
             parts.append("log_dir=set")
         glog_env = ",".join(parts) or "unset"
         lines.append(
-            "run pid1=%s launcher=%s stdout=%s stderr=%s worker_stderr=%s logcfg=%s glog_env=%s free_gib=%s runner=%s env_read=%s req_id_norand=%s"
+            "run pid1=%s launcher=%s stdout=%s stderr=%s worker_stderr=%s logcfg=%s glog_env=%s free_gib=%s runner=%s env_read=%s req_id_norand=%s diag_level=%s"
             % (
                 pid1_kind,
                 "+".join(sorted(launchers)) or "-",
@@ -2893,6 +2952,7 @@ def build_report(args):
                 runner,
                 boolstr(run_env is not None) if apis else "-",
                 ("unset" if run_env.get("VLLM_DISABLE_REQUEST_ID_RANDOMIZATION") is None else safe_ver(run_env["VLLM_DISABLE_REQUEST_ID_RANDOMIZATION"])[:8]) if run_env is not None else "?",
+                "%s(%s)" % diag_level_of(run_env) if run_env is not None else "?",
             )
         )
         gdirs = ["/tmp"]
@@ -2978,39 +3038,23 @@ def build_report(args):
 
     # ---- verdict per component, for the check after patching (guide A step 8)
     with Section('verdict', errors):
-        v = verdict_facts.get("vllm")
-        if v is None:
-            vv = "absent"
-        elif v["of"] and v["exact"] == v["of"]:
-            vv = "ok" + ("(site_local=%d)" % len(v["others"]) if v["others"] else "")
-        elif v["exact"] == 0:
-            vv = "unpatched" + ("(site_local=%d)" % len(v["others"]) if v["others"] else "")
-        else:
-            vv = "BAD(port=%d/%d,other=%d)" % (v["exact"], v["of"], len(v["others"]))
-        a = verdict_facts.get("ascend")
+        vv = verdict_of(verdict_facts.get("vllm"))
         conn_rel = "vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py"
-        if a is None:
-            av = "absent"
-        elif a["of"] and a["exact"] == a["of"]:
-            local = [r for r in a["others"] if r != conn_rel]
-            av = "ok(site_local=%d)" % len(local)
-        elif a["exact"] == 0:
-            av = "unpatched(site_local=%d)" % len([r for r in a["others"] if r != conn_rel])
-        else:
-            av = "BAD(port=%d/%d)" % (a["exact"], a["of"])
+        av = verdict_of(verdict_facts.get("ascend"), ignore=(conn_rel,), show_zero=True)
         if p2d_res is None:
             pv = "-"
         elif p2d_res.get("state") == "ok":
-            pv = "ok"
+            pv = "ok(%s)" % p2d_res.get("label", "-")
         elif p2d_res.get("state") == "not_replayed":
             pv = "unpatched"
         else:
-            pv = "BAD(%s)" % ",".join(x for x in (
+            pv = "BAD(%s:%s)" % (p2d_res.get("label", "-"), ",".join(x for x in (
                 ("missing:" + "+".join(p2d_res.get("missing") or [])) if p2d_res.get("missing") else "",
                 "struct" if p2d_res.get("problems") else "", "" if p2d_res.get("extra_same", True) else "extra",
-                p2d_res.get("state") if p2d_res.get("state") not in ("BAD",) else "") if x)
+                p2d_res.get("state") if p2d_res.get("state") not in ("BAD",) else "") if x))
         mc_is = (detail.get("mooncake") or {}).get("store_is")
-        mv = {"replacement": "ok", "site_original": "not_replaced", None: "-"}.get(mc_is, "BAD(%s)" % mc_is)
+        mlabel = (detail.get("mooncake") or {}).get("replacement")
+        mv = {"replacement": "ok(%s)" % mlabel if mlabel else "ok", "site_original": "not_replaced", None: "-"}.get(mc_is, "BAD(%s)" % mc_is)
         detail["verdict"] = {"vllm": vv, "ascend": av, "p2d": pv, "mooncake": mv}
         lines.append("verdict vllm=%s ascend=%s p2d=%s mooncake=%s" % (vv, av, pv, mv))
 

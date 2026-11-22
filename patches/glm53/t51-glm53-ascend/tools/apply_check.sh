@@ -4,7 +4,7 @@ set -e
 git config --global --add safe.directory '*'
 cp -r /base /w && cd /w
 echo "base $(git rev-parse --short=9 HEAD), dirty files: $(git status --porcelain | wc -l)"
-COMBINED=/pkg/t51-vllm-ascend-d4ad49796-pd-diag.patch
+COMBINED=/pkg/t58-vllm-ascend-d4ad49796-pd-diag.patch
 git apply --check "$COMBINED" && echo "combined patch ($(grep -c '^diff --git' "$COMBINED") files): git apply --check OK"
 n=0
 for p in /pkg/per-file/*.patch; do git apply --check "$p"; n=$((n + 1)); done

@@ -8,11 +8,11 @@
 | vllm-ascend：缓存池 | 补丁 02 的缓存池部分移植到 `d4ad49796`，另加「等 put 完成」的计时（第 1 节）和缓存池异步加载的映射记录（3.3 节） |
 | vllm-ascend：V1 runner | 补丁 02 在 runner 里的 forward、sampling 阶段，移到 `d4ad49796` 默认使用的 V1 runner（第 1 节） |
 | vllm-ascend：P/D 传输 | `MooncakeConnectorV1`（`kv_p2p/mooncake_connector.py`）新加打点，记录格式和补丁 02 里 `MooncakeHybridConnector` 的完全相同（第 4 节） |
-| Mooncake | 补丁 04，原样 |
+| Mooncake | 补丁 04；1.5.0 起是 04b：计时记录改写进文件（8.4 节） |
 
 读者：面板二（过滤器、`segments.json`、采集）和上面三处移植。本约定只规定节点进程写出什么、哪些字段可用，不规定过滤器和看板怎么取。要改约定，先告诉统筹。
 
-版本：glm5.3 版 1.3.3（2026-11-19），由 dsv4.1 版 2.2 改写。修订见文末。
+版本：glm5.3 版 1.5.1（2026-11-20），由 dsv4.1 版 2.2 改写；1.4.0 加 T56 的 D 侧内容（第 7 节），1.5.0 加 T58 的粒度开关和 Mooncake 的记录文件（第 8 节）。修订见文末。
 
 ## 0. 总则
 
@@ -20,7 +20,9 @@
 - **时钟。** 所有 `*_ns`（`*_wall_ns` 除外）都取本进程的 `time.monotonic_ns()`。同一台机器上的进程之间可以直接比较，跨机器不能比较。`*_wall_ns` 取 `time.time_ns()`，只出现在 `native_calls[]` 里（`pool_task` 和 `pd_transfer_summary[task]` 两种记录都有），用来和 Mooncake 的原生日志行对时间。
 - **阶段字典的形状。** 记录里 `stages.<名字>` 的值都由 `Batch.add_stage` 生成，键固定为 `calls`、`duration_ns`、`start_ns`、`end_ns`、`status`、`exceptions`、`measured_calls`、`skipped_calls`、`unmeasured_calls`，另加各阶段自己的属性。同一条记录里同名阶段被调用多次时，`duration_ns` 是各次之和，`start_ns` 取最早，`end_ns` 取最晚。
 - **`execution_id`。** 格式为 `execution-<run_id>-<EngineCore 的 pid>-<序号>`，由 EngineCore 每次 `schedule()` 生成（补丁 01，`vllm/v1/core/sched/scheduler.py`），经 `scheduler_output.pd_execution_id` 传给各 connector 的 `build_connector_meta` 和 Worker。这个字符串在整个集群里唯一，按它关联不需要另带机器、实例或 dp_rank。
-- **新增只做加法。** 不新增 `event` 种类，不改已有字段的名字、类型和含义。和补丁 02 相比新增的只有：`worker_summary` 里的一个阶段（第 1 节）；沿用 `pd_transfer_summary[scope=link]` 的一种新 `transfer_role` 取值 `"pool_load"`（3.3 节）；`MooncakeConnectorV1` 写出和 hybrid 相同的几种记录（第 4 节）。v3 的段只引用 `pd_transfer_summary` 的 `scope="request_generation"`，读这些日志时行为不变。
+- **新增只做加法。** 不新增 `event` 种类，不改已有字段的名字、类型和含义。和补丁 02 相比新增的只有：`worker_summary` 里的一个阶段（第 1 节）；沿用 `pd_transfer_summary[scope=link]` 的一种新 `transfer_role` 取值 `"pool_load"`（3.3 节）；`MooncakeConnectorV1` 写出和 hybrid 相同的几种记录（第 4 节）。v3 的段只引用 `pd_transfer_summary` 的 `scope="request_generation"`，读这些日志时行为不变。 1.4.0（T56）在已有的 `core_summary[request]`、`pd_transfer_summary[task]`、`pd_transfer_summary[request_generation]`、`worker_summary` 里加阶段和字段，同样只做加法，见第 7 节。
+- **已有阶段的边界不动（1.4.0）。** `stages.forward`、`stages.sampling` 的主机计时和设备计时只包住目标模型调用、sampler 调用；以后加的段各是新阶段，不移动现有计时的起止点。
+- **T56 的内容只在 D 写（1.4.0）。** 新代码装到 P 上时，写出的记录和本约定 1.3.3 逐字段相同。「是不是 D」只用 `pd_diagnostics.is_pd_decode(vllm_config)` 这一个函数判断（vllm-ascend 的 utils 条件），规则见 7.1。
 - **不再新增字段。** 从本版起，不再新增任何字段，除非写明它的核对用途；新增之前先报统筹。本套补丁已经加的字段，都在所在的表里写了核对用途。
 - **两种 connector，同一种格式。** dsv4.1 的 D 用 `MooncakeHybridConnector` 从 P 读 KV，glm5.3 的 D 用 `MooncakeConnectorV1`。两者写出的 `pd_transfer_summary` 记录字段逐一相同，记录里没有区分 connector 种类的字段，过滤器不需要区分。
 
@@ -73,6 +75,8 @@ glm5.3 的配置里和记录有关的几项：`MultiConnector` = `MooncakeConnec
 - **哪些记录有。** 只在 V1 runner、`tp_rank` 为 0 的 `worker_summary` 里写；事件不加同步、延后读取，读取前先 `query()`，读不到时不写这个字段（不写 0）。以后如果改了 `keep_tp_rank`，其他 rank 的记录没有设备值，只能回退到 host 值，两种口径会混在一起，用时要注意。
 - **推迟写出。** `tp_rank` 为 0 上带设备值的 `worker_summary[phase=execute]`、`[phase=sample]` 推迟到读到设备值以后再写，最多推迟 4 步，写出顺序严格按步骤先后；到期还读不到设备值，这条记录照常写出，只是不带 `device_duration_ns`，也不写 0。下一步开始时和进程退出时都有兜底写出。这两条记录的 `timestamp_ns`、`native_tid` 是写出时的时刻和线程，不是这一步执行时的；各阶段的 `start_ns`、`end_ns` 不变。推迟写出用的是 vLLM `worker_base` 里一个默认关闭的开关，具体接口由 vLLM 和 vllm-ascend 两处移植对齐。不另写补充记录，同一条记录里既有 host 值也有设备值。
 - **段的取法。** 段定义优先取 `device_duration_ns`，没有时回退到 `duration_ns`；面板按段回退，并在过滤器的自检行里数出回退了多少步。forward 的定义因此从「目标模型调用开始 → host 返回」改为「设备上执行这一步的时长」，sampling 同理。
+
+**1.4.0：** 同一套设备计时另加 4 个 stage（prepare_inputs、lm_head、draft、bookkeeping），以及只记录的几个字段，都只在 D，见 7.4、7.5。
 
 **参考取法（给 `segments.json`，由另一个 worker 定）。** 和 v3 的 `forward` 一样走累加：`event` 为 `worker_summary`，`where` 为 `{"phase": "execute"}`，`key` 为 `request_ids`，`value` 为 `stages.wait_for_put.duration_ns`，P 侧 `part` 取 `total`。
 
@@ -291,6 +295,8 @@ pd_transfer_summary[scope=link].execution_id
 
 原有的日志行（第 1053 行的 `KV cache transfer for request ... took ... ms`）和返回值、异常行为都不改。
 
+**1.4.0：** 使请求完成的那条 task 另有 `request_done_ns`（7.3）。
+
 ### 4.3 请求汇总记录 `pd_transfer_summary[request_generation]`
 
 **什么时候写。** 同一请求同一个 `request_generation` 的读任务全部结束（未完成数为 0），并且带 `all_task_done` 的最后一个任务已经入队时，由结束最后一个任务的读取线程用 `diag.emit` 写一条。
@@ -311,6 +317,8 @@ pd_transfer_summary[scope=link].execution_id
 | `complete`、`incomplete` | `native_calls_dropped` 为 0 时 `true`、`false`，否则反过来 |
 
 v3 用这条记录的 `transfer_envelope_ns` 做 D 的 wait_for_transfer，和 dsv4.1 相同。这条记录的 `execution_id` 固定为 `null`，不能用来关联步骤；按步骤关联用 3.2 节的映射记录或 4.2 节的读任务记录。
+
+**1.4.0：** 另有 `kv_load_envelope_ns`、`kv_load_timing_scope`、`task_max_queue_wait_ns`、`task_max_meta_fetch_ns`、`task_max_prepare_ns`（7.3）。
 
 ### 4.4 P：producer 记录
 
@@ -391,10 +399,190 @@ glog 在消息前加前缀 `Lmmdd hh:mm:ss.uuuuuu <线程号> <文件>:<行号>]
 | 5 | 整个 key 保存失败时记 `backend_failure` 或 `unknown_result`，不出现 `failed` | `status` 的取值少一种；按状态筛选时不要依赖 `failed` |
 | 6 | 线程正常停止时不写 `not_processed`，只在线程异常退出时写 | `not_processed` 只表示线程异常退出 |
 | 7 | `stages.forward`、`stages.sampling` 新增 `device_duration_ns`（只在 V1 runner、`tp_rank` 为 0）；这些记录推迟写出，最多 4 步，`timestamp_ns`、`native_tid` 是写出时的（第 1 节，C14） | 只加字段；v3 读到的 `duration_ns` 不变。按 `timestamp_ns` 排序时，这些记录会晚于它们所属的那一步 |
+| 8 | 1.4.0（T56）：`core_summary[request]` 加 `stages.kv_ready_wait`；`worker_summary` 加 `prepare_inputs`、`lm_head`、`draft`、`bookkeeping` 4 个 stage 和只记录的 `step_device_span_ns`、`cudagraph_runtime_mode`；都只在 D（第 7 节） | 只加阶段和字段；已有阶段的边界不动 |
+| 9 | 1.4.0（T56）：`MooncakeConnectorV1` 的 `request_generation` 加 `kv_load_envelope_ns`、`kv_load_timing_scope`、`task_max_queue_wait_ns`、`task_max_meta_fetch_ns`、`task_max_prepare_ns`，task 加 `request_done_ns`；hybrid 没有这 6 个字段（7.3） | 是「两种 connector 同一种格式」的例外；对 hybrid 的记录不要依赖它们 |
 
 另外两处不是格式差异，只是写的位置不同：forward、sampling 两个阶段写在 `d4ad49796` 的 V1 runner `worker/model_runner_v1.py` 里（第 1 节）；P 的缓存池加载是同步的，`pool_task[load]` 由 Worker 主线程写，没有 `load_submit`（2.1 节），这是补丁 02 本来就有的同步分支。
 
 `d4ad49796` 的保存路径和 `f9c8e0bdb` 相同：`add_save_batch`（`kv_transfer.py` 第 934 行）一次把一批请求放进保存队列，后面跟一个批次结束标记；等待保存完成用 `wait_for_requests_saved`（只等被释放的请求）。`pool_task[save]` 的记录除上表第 4–6 项外和补丁 02 相同：每个请求在入队时取快照，出队时开始计时；批次结束标记不产生记录。以后再发现差异，补进上表，并先告诉统筹。
+
+## 7. T56：D 侧新增（1.4.0）
+
+设计依据：`docs/tasks/T56/10_记录格式约定草案.zh-CN.md`（1.4.0 设计定稿，实施开始时改定，又按顾问的精简把关和统筹的 `32_精简落地决定` 和之后的回复改一次，`d805b26f`）。本节只写节点进程写出什么；段怎么取由 `segments.json` 定（t41）。本节新增的每一项都只在 D 上写，规则见 7.1。
+
+### 7.1 只在 D 写；「是不是 D」只用一条规则
+
+- **P 上和 1.3.3 逐字段相同。** 新代码装到 P 上时，写出的记录和 T51 版逐字段相同：本节的阶段、字段都不写，也不写成 `skipped`、`null` 或 0；启动行也和 T51 版逐字相同（7.4，不是 D 的那一档）。用记录等价测试核。
+- **判断函数：** `vllm.v1.metrics.pd_diagnostics.is_pd_decode(vllm_config)`，在 vLLM 补丁的 `pd_diagnostics.py` 里，三份补丁只调这一个函数，不各自判断。
+  - **规则：** 调用时从 `sys.modules` 取 `vllm_ascend.utils`，返回它的 `is_pd_decode_recompute_scheduler_enabled(vllm_config)`（`d4ad49796` 的 `utils.py` 第 1217–1245 行：顶层 `kv_role == "kv_consumer"`，并且 `recompute_scheduler_enable` 为真）。模块没加载、没有这个函数或出异常时返回 `False`。只用这一个条件，不看调度器类。
+  - 这和「D 跑 Recompute 一族」是同一个条件：`d4ad49796` 的 `platform.py` 第 1115–1145 行只在这个条件成立时把调度器换成 Recompute 一族（D 是 `AsyncRecomputeScheduler`）。
+  - 不在模块导入时 import vllm_ascend。
+  - 不只看 `recompute_scheduler_enable`：它是配置开关，不是角色；在 `kv_producer` 上配了它时，EngineCore 里的配置单例仍是真。共用条件另外要求顶层是 `kv_consumer`。
+  - 只在初始化时调一次并保存：调度器初始化（vLLM 补丁），DeviceTiming 建立（vllm-ascend 补丁）。p2d 的新字段只在 D 的接收线程写，不需要判断。
+  - vllm-ascend 补丁另要求 `_SPANS` 里已有 7.4 的 4 个 `runner.*`，缺一个就按假处理，整体回到 T51 的行为（补丁 01、03 版本不配套时不会半开）。
+- **启动行是硬核对：** 取不到配置时函数返回 `False`，D 会悄悄退回 T51 的行为，不报错。所以第一批 D 重启以后，下面两条必须同时满足，不满足就停下：
+  - EngineCore 启动行 `PD_DIAG_STARTUP scheduler=…` 是 Recompute 一族（D 为 `vllm_ascend.core.recompute_scheduler.AsyncRecomputeScheduler`）；
+  - `tp_rank` 0 的 Worker 启动行 `runner_stages=` 列出 6 个 stage（7.4）。
+  - EngineCore 一侧的结果启动行上看不出，由首批数据里 `kv_ready_wait` 有值来核（7.2）。
+- **已有阶段的边界不动。** `stages.forward`、`stages.sampling` 的主机计时和设备计时仍只包住目标模型调用、sampler 调用；新加的段各是新阶段。
+
+### 7.2 kv_ready_wait：`core_summary[scope=request].stages.kv_ready_wait`
+
+由 EngineCore 写，在请求结束时那条 `core_summary[request]` 里（`Request.pd_queue_transition("finished")`），不新增日志行。两个条件都满足才写，否则没有这个阶段：这个实例是 D（7.1）；这个请求开过至少一轮（调度器得知 KV 到齐、读取失败、在 `WAITING_FOR_REMOTE_KVS` 里被中止，三者有其一）。
+
+| 字段 | 单位、时钟 | 含义 | 核对用途 |
+|---|---|---|---|
+| `calls` | 次 | 发生过几轮「KV 到齐 → 开始运行」，通常为 1 | 区分重试 |
+| `duration_ns` | ns | 第一轮的 `end_ns − start_ns`；没有终点时为 `null` | 段的取值 |
+| `start_ns` | ns，EngineCore 的 `monotonic_ns` | 第一轮的起点：`_update_from_kv_xfer_finished` 收到 `finished_recving`、请求还在 `WAITING_FOR_REMOTE_KVS` 时（vLLM `scheduler.py` 第 3171–3176 行） | 「调度器得知 KV 到齐」，比字节到齐晚一步 |
+| `end_ns` | 同上 | 第一轮的终点：运行它的那一次 `schedule()` 的开始，即补丁 01 包装里的 `start_ns`（第 589 行） | 等式：等于同一步 `core_summary[execution].stages.schedule.start_ns`；数值由单测核。现场按步的标识核：`ranges[0].scheduled_execution_id` 等于这个请求 EngineCore 一侧部分和的 `first_exec`（ClickHouse 里没有每步的 `schedule.start_ns`） |
+| `status` | — | `ok`、`missing`、`error`、`cancelled`、`invalid` | 区分没有值的原因 |
+| `ranges` | 列表，最多 64 项 | 每轮一项：`episode`、`start_ns`、`promoted_ns`、`end_ns`、`duration_ns`、`ready_execution_id`、`scheduled_execution_id`、`status`、`load_failed` | `promoted_ns` 区分「等下一次 `schedule()`」和「提升后又多等几步」；两个 `execution_id` 和步骤记录对上 |
+| `dropped_ranges` | 项 | 超过 64 项丢掉的轮数 | 同 `queue` |
+| `complete`、`end_observed` | 布尔 | 第一轮起点终点都有；第一轮有终点 | 同 `queue` |
+| `timing_scope` | — | `"kv_ready_seen_to_scheduled"` | 标明口径 |
+
+- 字段名、`status` 取值、按 `episode` 分项照已有的 `queue` 阶段；以第一轮为准，和 `queued_time` 不算抢占一致。
+- D 的 `AsyncRecomputeScheduler` 沿 MRO 调到补丁 01 的 `schedule()` 包装，起点所在的方法都是继承的，vllm-ascend 不用改。
+- 段的说明：kv_ready_wait从调度器得知 KV 到齐算起，比字节到齐晚一步；字节到齐在接收线程（墙钟）里（7.3）。
+
+### 7.3 等 KV 的墙钟包络和 3 个 L2 的最大值：`pd_transfer_summary`
+
+由 D Worker 的接收线程写，在已有的两种记录里。
+
+| 记录 | 字段 | 单位、时钟 | 含义 | 为空 | 核对用途 |
+|---|---|---|---|---|---|
+| `request_generation` | `kv_load_envelope_ns` | ns，差值，D Worker 的 `monotonic_ns` | 请求被标记完成的时刻减去本请求所有任务中最早的 `queued_ns` | 没有标记完成时为 `null` | 段的取值：接收线程（墙钟） |
+| `request_generation` | `kv_load_timing_scope` | 字符串常量 | `"first_task_queued_to_request_marked_done"` | 不为空 | 标明口径；现有 `timing_scope` 说明的是 `transfer_envelope_ns` |
+| `request_generation` | `task_max_queue_wait_ns` | ns，差值 | 本请求（本 rank）各任务 `queue_wait_ns` 的最大值 | 没有一个任务开始处理时为 `null` | 段「receive_queue」的取值 |
+| `request_generation` | `task_max_meta_fetch_ns` | 同上 | 各任务 `associated_stages.meta_fetch.duration_ns` 的最大值（已含 `metadata_request`） | 没有一个任务走到取对端信息时为 `null` | 段「取对端信息」的取值 |
+| `request_generation` | `task_max_prepare_ns` | 同上 | 各任务 `associated_stages.prepare.duration_ns` 的最大值 | 没有一个任务走到组读表时为 `null` | 段「组读表」的取值 |
+| `task` | `request_done_ns` | ns，原始时刻 | 请求被标记完成的时刻：p2d 第 924 行 `task_tracker.update_done_task_count` 之后。只在使请求完成的那条 task（`tracker_completed=true`）上有值 | 其余 task 为 `null`（`pd_transfer_summary` 的惯例：形状固定，不适用的字段写 `null`） | 让包络能从 task 记录复算 |
+
+- 终点取标记完成，不取各任务 `end_ns` 的最大值：标记完成以后还要给 P 发结束信号、等 ACK，那段不属于等 KV。
+- 三个最大值在请求汇总（`pd_request_tasks[request_id]`）里和任务计数、字节数、包络同一处并，在同一把锁里更新。
+- 关系（同一请求、同一 D rank）：`kv_load_envelope_ns` ≥ `transfer_envelope_ns`；≥ 三个最大值各自；≤ 最晚的 `end_ns` − 最早的 `queued_ns`。
+- 取对端信息只取 `meta_fetch`：`meta_fetch` 第 1172–1190 行已包含第 1179 行的 `metadata_request`。
+- **这是「两种 connector 同一种格式」（第 0 节）的例外：** 这 6 个字段 hybrid 没有，是 V1 独有的。dsv4.1（hybrid）挂起，不受影响；过滤器、面板对 hybrid 的记录不要依赖它们。
+- 重放：`replay_p2d.py` 出新版，新增一处修改，锚点是 `self.task_tracker.update_done_task_count(request_id)`；其余改的是补丁自己的代码。
+
+### 7.4 prepare_inputs、lm_head、draft、bookkeeping：`worker_summary` 的 4 个 stage
+
+| 面板上 | stage 名 | 记录 | 起止（`model_runner_v1.py`，T51 版） | span 事件名 |
+|---|---|---|---|---|
+| prepare_inputs | `prepare_inputs` | `worker_summary[phase=execute]` | 第 2290 行 `prepare input` 块开始 → 第 2533 行 `update_cos_sin` 之后 | `runner.prepare_inputs` |
+| lm_head | `lm_head` | 同上 | 只包第 2639 行目标模型那一次 `compute_logits` | `runner.lm_head` |
+| draft | `draft` | `worker_summary[phase=sample]` | 闭包 `propose_draft_token_ids`（第 2834 行）的函数体 | `runner.draft` |
+| bookkeeping | `bookkeeping` | 同上 | 第 2878–2894 行，包住 `_bookkeeping_sync` | `runner.bookkeeping` |
+
+- **字段：** 和 forward、sampling 相同，由 `Batch.add_stage` 生成；读到设备值时加 `device_duration_ns`，规则照第 1 节 C14（只在 V1 runner、`tp_rank` 0；读不到不写，不写 0；推迟写出最多 4 步）。6 段在同一条计算流上，设备区间互不重叠，可以相加。核对用途：段的取值；主机时长留作分析。
+- **span：** vLLM 补丁在 `_SPANS` 里加 `"runner.prepare_inputs": "prepare_inputs"`、`"runner.lm_head": "lm_head"`、`"runner.draft": "draft"`、`"runner.bookkeeping": "bookkeeping"`。
+- **助手：** 4 处都用 `with pd_device_timing.stage(self, "<名>"):`，打开时等价于 `with diag.span("runner.<名>"), self.measure("<名>")`；关掉时直接 `yield`，记录里没有这个 stage，主机时长也不写。不另加 `forward_context.capturing` 检查（服务期间不捕图）；T51 已有的捕图规则照旧（`npu.is_current_stream_capturing` 为真时不记设备事件）。forward、sampling 两处不动。
+- **`pd_device_timing.py`：** `_PHASE_OF_STAGE` 加 4 项；每个 slot 从 2 对事件变成 6 对，SLOTS 仍为 4；已有规则照样适用于新 stage。
+- **开关 `VLLM_PD_DEVICE_STAGES`**（DeviceTiming 建立时读一次，改了要重启；只在 `is_pd_decode(vllm_config)` 为真时起作用）：
+  - 不设：4 段全开；
+  - 4 个 stage 名中的若干个，用逗号分隔：只开列出的，没列的整段不写；
+  - `none`：4 段全关，回到 T51（每步 2 对设备事件）；
+  - forward、sampling 写进来也忽略；不认识的名字忽略、不报错。
+- **启动行：** `PD_DIAG_STARTUP worker device_timing=<on|off> tp_rank=<n>` 按三档写：
+  - D 上至少一段开着：末尾加 ` runner_stages=<开着的 stage，含 forward、sampling> source=<default|env>`，默认是 `runner_stages=forward,sampling,prepare_inputs,lm_head,draft,bookkeeping source=default`；
+  - D 上设成 `none`：末尾加 ` runner_stages=forward,sampling source=env`；
+  - 不是 D：不加，这一行和 T51 版逐字相同。
+
+### 7.5 只记录、不上看板的字段
+
+| 记录 | 字段 | 单位 | 含义 | 什么时候有 | 核对用途 |
+|---|---|---|---|---|---|
+| `worker_summary[sample]` | `step_device_span_ns` | ns，设备时长 | 本步 `prepare_inputs` 的 start 事件到 `draft` 的 end 事件 | 设备计时开着，并且 `prepare_inputs`、`draft` 都开着；读不到不写 | 核「6 段之和 ≤ 本步设备包络」；判断第一步多出的约 48 ms 是否落在段之间的缝里 |
+| `worker_summary[execute]` | `cudagraph_runtime_mode` | 字符串 `"FULL"`、`"PIECEWISE"`、`"NONE"` | 本步目标模型实际用的图模式，取 runner 已经算好的 `CUDAGraphStat.runtime_mode` | D 的 `tp_rank` 0，4 个新 stage 至少开着一个时每步写；`none` 时不写 | 看第一步、第二步起各走什么模式（第一步每请求 1 个 token，不满足 uniform decode） |
+
+- 只记录的字段，用不上看板的累加规则写进按请求的部分和，供核对查询用。记录格式不变。规则由 `segments.json` 定（t41），共 5 条：`step_device_span_ns` 1 条，分第一步、第二步起；`cudagraph_runtime_mode` 3 条，用 `where` 分 `FULL`、`PIECEWISE`、`NONE` 计步数；bookkeeping `stages.bookkeeping` 1 条，分第一步、第二步起。看板和 coverage 都不显示这些规则。
+- bookkeeping `stages.bookkeeping` 照记（7.4），看板不显示；上面那第 5 条规则让它的现场数据进 ClickHouse，要上看板时只改段定义（10_ 第 8 节冲突 20）。
+- 节点上不留每步的原值：过滤器是节点上唯一写 `[PD_DIAG]` 的地方，没有规则的每步记录不写出。按请求的部分和是这几个字段唯一的取数来源。
+- `cudagraph_runtime_mode` 只代表目标模型：草稿 `_propose` 自己 dispatch（`llm_base_proposer.py` 第 1090–1111 行），只沿用目标模型的 `uniform_decode`。草稿的图模式不另记。
+- P 上不管开关怎么设都不写（7.1）。
+
+### 7.6 开销判据（glm53-test 升级手册里的两步）
+
+- 没有开销自测字段，也没有 `VLLM_PD_DIAG_TIMING_COST`。
+- 同一组请求、同样并发，升级前（T51 版）、升级后（4 段全开）各跑 3 遍，取 TPOT 中位数。升级后中位数 − 升级前中位数 > max(2% × 升级前中位数, 波动) 时，把 `VLLM_PD_DEVICE_STAGES` 改成 `lm_head,draft`。波动是同一版本 3 遍 TPOT 的最大减最小，两个版本各算一次，取大的。
+- 2% 是阈值，不是预测：按 D 每步约 60 ms、新增设备事件记录每次几十微秒估的，没有量过。
+- 改成 `lm_head,draft` 以后，关掉的段整段不写（含主机时长）：prepare_inputs、bookkeeping没有数据，看板上prepare_inputs为空，`step_device_span_ns` 也不写。只改环境变量，重启那批 D，不重出补丁包。
+
+### 7.7 兼容
+
+- 记录的 `version` 仍为 2；只加阶段和字段，不新增 `event` 种类。
+- 旧过滤器（v3.1-extra）读新记录：新阶段、新字段不读，已有段的口径不变；原样写出的 `core_summary[request]`、`request_generation` 在 D 上每请求多约 0.8–0.9 KB（按文本长度估）。
+- 新过滤器读旧记录或 P 上的记录：新段为空，不报错。P 节点也会收到新的 `segments.json`，新段的列为空，P 侧原来的 27 段不变。
+- 过滤器代码不变；升级顺序先补丁、后面板。
+- 服务期间不捕图：vllm-ascend `acl_graph.py` 第 184 行在捕图前调 `validate_cudagraph_capturing_enabled()`，开关只在启动时的捕图函数里打开。T51 打补丁手册（操作说明 A 第 7.3 节）里「服务中第一次遇到某个桶的那一步在捕获」这句解释不对；留空比例这个判据本身不受影响。
+
+## 8. T58：粒度开关和 Mooncake 计时文件（1.5.0）
+
+设计定稿：`docs/tasks/T58/T58_设计.zh-CN.md`（`f08bfac5`），用户定「T58，按照推荐」。记录的 `version` 仍是 2；只在低级别少写字段，没有字段改含义，也没有新的必需字段。
+
+### 8.1 `PD_DIAG_LEVEL`
+
+| 环境变量的值 | 生效的级别 | `source` |
+|---|---|---|
+| 不设 | 3 | `default` |
+| 空串 | 3 | `default` |
+| `3` | 3 | `env` |
+| `2` | 2 | `env` |
+| `1` | 1 | `env` |
+| 其余，如 `0`、`4`、`abc`、` 2 `（带空格）、`2x` | 3 | `invalid` |
+
+- vLLM、vllm-ascend 主体、p2d 都调 vLLM 补丁的 `pd_diagnostics.diag_level()`：进程里第一次用时读、缓存，改了要重启。Mooncake 在 C++ 里按同一张表解析（`pd_timing_level.h`）。两边用这张表的输入测，结果逐行相同。
+- proxy 不读它，仍只由 `PD_PROXY_DIAG` 开关。
+- **粒度是上限，组件自己的开关只能往下收：**
+  - `VLLM_PD_DEVICE_STAGES` 的意思和默认列表不变；
+  - `MC_PD_TIMING=0` 时 Mooncake 不写；
+  - 粒度不是 3 时 Mooncake 也不写。
+
+### 8.2 每一级不写的字段
+
+| 级别 | 不写（也不为它计时） | 组件 |
+|---|---|---|
+| 2 级及以下 | Mooncake 计时记录（8.4） | Mooncake |
+| 2 级及以下 | `pool_task` 的 `native_calls`：写成空列表（键保留，喂它的计数器照记），任何 `pool_task` 都一样。用到的是 `save` 上的；第 2 节读 `pool_task[load]` 不读它 | vllm-ascend 缓存池 |
+| 2 级及以下 | `worker_summary` 的 `stages.bookkeeping` 段值。那一对设备事件照记，`step_device_span_ns` 的含义不变（用户定的做法乙） | vllm-ascend runner |
+| 1 级 | `pool_task` 的 `stages`：只有 `build_key`、`lookup`、`prepare`、`sync`、`put` 这 5 个名字会进 `stages`，1 级不计时也不写，所以任何 `pool_task` 的 `stages` 都是空的。用到的是 `save` 上的；`load` 上没有任何一段读 `stages`（第 2 节用的是时长、计数、状态和 `members`） | vllm-ascend 缓存池 |
+| 1 级 | D `worker_summary[execute]` 的 `stages.submit`（`kv.load_submit` 这个 span 在 D、1 级时不开，`start_load_kv` 照常调用） | vLLM（`kv_connector_model_runner_mixin.py`、V2 `gpu/kv_connector.py`） |
+| 1 级 | D `pd_transfer_summary[request_generation]` 的 `task_max_queue_wait_ns`、`task_max_meta_fetch_ns`、`task_max_prepare_ns`、`transfer_envelope_ns` | p2d |
+
+**任何一级都照写：**
+- schedule 的子段：queue、hash、lookup、alloc、other，这是唯一的例外；
+- `kv_load_envelope_ns`、`kv_ready_wait`；
+- forward、sampling、prepare_inputs、lm_head、draft 的设备时长，`step_device_span_ns`、`cudagraph_runtime_mode`；
+- 候选映射用的记录，即 `pd_transfer_summary` 的 link、task，和 `pool_task[load_submit]`；
+- 其余 L1 段的来源。
+
+各段从第几级起记，见设计乙第 2 节的两张表（P 27 段、D 29 段），t41 的 `segments.json` `from_level` 以它为准。
+
+### 8.3 记录里的粒度、启动行
+
+- **`diag_level`**（整数 1、2）：写进 `api_summary[scope=request]` 和 `core_summary[scope=request]`，**只在 1、2 级写**。3 级不写，缺省就是 3，所以 3 级的记录和 T56 逐字段相同，P 和 T51 逐字段相同。
+- **过滤器自检行**（t41）每次都带 `diag_level`；`pd_file_open` 不带。
+- **新启动行：** `PD_DIAG_STARTUP diag level=<n> source=<default|env|invalid>`，每个 EngineCore 进程、每个 Worker 进程各一行，API 不写。已有的启动行一个字不动。
+
+### 8.4 Mooncake 计时记录（补丁 04b，替代第 5 节的 glog 行）
+
+- **文件：** `/data/pd-diag/logs/mooncake/mc.<启动时刻>.<pid>.<seq>.log`，每个进程一个文件（`MC_PD_TIMING_DIR` 可改目录，供测试用）。
+  - 写满 256 MiB 换 `seq`，从不改名，只追加。
+  - 这个名字格式的文件超过 12 小时就删，换文件时、每 10 分钟各清一次，也删别的进程留下的；`ENOENT` 忽略。
+- **行的格式：** `<本地 ISO 时间> (mooncake pid=<pid>) INFO [client_service.cpp:0] [PD_DIAG] {json}`。
+  - 第一行 `pd_file_open`：`source`、`pid`、`file`、`seq`、`build`、`wall_ns`、`timestamp_ns`。
+  - 每分钟一行 `mc_timing_stats`：`written`、`dropped`、`queue_max`。
+- **计时记录：** 事件名 `mc_batch_put`、`mc_batch_upsert`，`version` 1。
+  - 和 `pool_task[save].native_calls` 关联的字段，名字和格式和那边一致：`submitted_keys`、`submitted_bytes`、`native_tid`（`gettid()`）、`wall_ns`（调用里、finalize 以后读的 UTC 纳秒，落在调用的 `start_wall_ns`、`end_wall_ns` 之间）、`pid`（`getpid()`，就是调用 Mooncake 的 vLLM 进程）。
+  - 其余字段：`phase1_start_batch_put_us` 到 `phase4_finalize_batch_put_us`、`total_us`、`timing_scope`（`normal_full`、`prefer_same_node_full`、`prefer_same_node_not_started`）、`status`、`complete`、`failed_keys`、`phase_status`（只有 not_started 有）。含义和第 5 节相同。
+  - 原签名包装的记录照旧不带 `phase1…`、`total_us`，`complete=false`。
+- **写入：**
+  - 调用线程只拼行、放进 16384 行的有界队列，满了就丢、计数；
+  - 每个进程一个写线程，`pthread_create` 以后 `pthread_detach`，每 200 ms 写一次，不 `fsync`；
+  - 没有带析构的静态对象；退出时最后不到 200 ms 的行丢；
+  - fork 以后子进程开自己的写线程和文件。
+- glog 和标准错误里不再有 `[BatchPutTiming]`、`[BatchUpsertTiming]`；`MC_PD_TIMING=0` 时不退回标准错误。
 
 ## 修订记录
 
@@ -407,3 +595,6 @@ glog 在消息前加前缀 `Lmmdd hh:mm:ss.uuuuuu <线程号> <文件>:<行号>]
 | glm5.3 版 1.3.1 | 11-19 | 第 1 节 C14 一段补两句（统筹确认）：到期读不到设备值时照常写出、不带该字段也不写 0；面板按段回退到 host 值，并在过滤器自检行里数出回退步数。记录格式没有变 |
 | glm5.3 版 1.3.2 | 11-19 | 按 P/D 传输移植的核对和顾问审查改第 4 节五处：4.1 步骤号和序号改为 `add_request` 的可选参数（没有时退回 `diag.current()`，值相同）；步骤号属性缺失时记 `null`；4.2 没有原生读取时记录里是 `status="missing"`、`unmeasured_calls=1`；V1 下 `native_calls` 至多 1 条、`native_calls_dropped` 恒为 0；`do_virtual` 只在 `kv_transfer_params` 带 `do_virtual=true` 时出现。记录格式没有变 |
 | glm5.3 版 1.3.3 | 11-19 | 3.4 节加一条：D 的 RecomputeScheduler 在 `schedule()` 里把请求退回 P 时，该请求的 `core_summary[request]` 多 `role: "unknown"`、少 `no_forward`，过滤器和采集器都不读这两个键。记录格式没有变 |
+| glm5.3 版 1.4.0 | 11-20 | T56，D 侧（设计定稿 `docs/tasks/T56/10_记录格式约定草案.zh-CN.md` `d805b26f`，实施开始时改定，后按精简把关、`32_精简落地决定` 和统筹之后的回复又改一次）：第 0 节加「已有阶段的边界不动」「T56 的内容只在 D 写」；新增第 7 节：「是不是 D」的判断函数（只用 vllm-ascend 的 utils 条件，取不到返回 `False`；启动行硬核对）、kv_ready_wait `kv_ready_wait`、包络和 F3 的三个最大值、`request_done_ns`、4 个 runner stage 和开关 `VLLM_PD_DEVICE_STAGES`、只记录的字段（用不上看板的累加规则写进按请求的部分和，span 1 条、图模式 3 条、bookkeeping 1 条）、开销判据（升级前后各 3 遍比 TPOT 中位数）、兼容；按顾问的精简把关不设开销自测字段、`VLLM_PD_DIAG_TIMING_COST` 和助手里的 capturing 检查；第 6 节加第 8、9 条。记录的 `version` 仍为 2 |
+| glm5.3 版 1.5.0 | 11-20 | T58（设计 `docs/tasks/T58/T58_设计.zh-CN.md` `f08bfac5`，用户定「T58，按照推荐」）：新加第 8 节，粒度开关 `PD_DIAG_LEVEL`、各级不写的字段、记录里的 `diag_level`、新启动行，以及 Mooncake 计时记录改写进文件（补丁 04b，替代第 5 节的 glog 行）。记录 `version` 仍是 2 |
+| glm5.3 版 1.5.1 | 11-20 | 8.2 节两处更正，按实施时的核对：D 的 `stages.submit` 由 vLLM 补丁写（`kv.load_submit`），组件一栏原写成 vllm-ascend；1 级不写的 `pool_task` 的 5 个 stage、2 级及以下不写的 `native_calls` 都不只限于 `save`，任何 `pool_task` 都一样（`load` 上没有段读它们；`native_calls` 写成空列表，键保留）。各级写不写的规则不变，记录格式没有变 |

@@ -8,12 +8,20 @@
 #             (d4ad49796 + ef5bd17's 11 files + the connector replayed from the public original), asc-fin-d (the same
 #             with site edits outside the port and the connector replayed from a site-edited one), asc-fin-bad
 #             (asc-fin-d with one line added to a ported file and one replay change undone)
+#             glm53-7 (T56): vllm-t56 (v0.30.0 + t51-glm53-vllm 796927a's T56 patch), asc-t56-p (asc-fin-p with the
+#             2 files t51-glm53-ascend cf72b07 changes and the connector replayed by t51-glm53-p2d d7d26f3's T56
+#             replay_p2d.py from the public original), asc-t56-d (asc-fin-d the same way, connector replayed from the
+#             site-edited one)
 #   env MC_REPLACEMENT: the delivered libmooncake_store.so (g13 puts it in place of the wheel's)
+#   glm53-8 (T58): vllm-t58 (v0.30.0 + t51-glm53-vllm's T58 files), asc-t58-p / asc-t58-d (asc-t56-p/-d with the 2 files
+#             t51-glm53-ascend's T58 changes and the connector replayed by t51-glm53-p2d's T58 replay_p2d.py from the
+#             public / the site-edited original); env MC_REPLACEMENT_V2: Mooncake replacement v2 (patch 04b);
+#             env BASELINE_G7: a glm53-7 baseline_token of the g22 situation (T56 lab), BASELINE_G24: g24's glm53-8 token
 #   NPU_WHEEL a real mooncake-transfer-engine-npu wheel (cp312, aarch64), installed into the fake site
 set -u
 LAB=$1; WORK=$2; NPU_WHEEL=$3; shift 3
 HERE=$(cd "$(dirname "$0")" && pwd)
-CASES=${*:-"g1 g2 g3 g4 g4b g5 g6 g7 g8 g9 g9b g10 g11 g12 g13 g14 g15 g16 g17 g18"}
+CASES=${*:-"g1 g2 g3 g4 g4b g5 g6 g7 g8 g9 g9b g10 g11 g12 g13 g14 g15 g16 g17 g18 g19 g20 g21 g22 g23 g24 g25 g26 g27 g28 g29 g30 g31 g32"}
 PYFLAGS="-I -S -B"   # how the check must be run (it refuses otherwise); g11 runs it without
 WRAP=""              # g12 runs it under strace
 mkdir -p "$LAB/out" "$LAB/sites"
@@ -187,5 +195,87 @@ for case in $CASES; do
     run_case "$case" python:3.12-slim 3.12 t51-glm-dnode14 \
       "-v $WORK/vllm-fin:/vllm-workspace/vllm:ro -v $WORK/asc-fin-d:/vllm-workspace/vllm-ascend:ro -v $HERE/launch_d:/launch:ro -v $LAB/cann_nodev:/usr/local/Ascend:ro" \
       "bash /launch/start_d.sh" "$D_ARGS --startup-log /logs/vllm_9003.log --baseline ${TOKEN:-none}" ;;
+  g19)  # glm53-7: a D after the T56 upgrade (both ports and the connector at T56)
+    site g19 --mooncake-wheel "$NPU_WHEEL"
+    run_case g19 python:3.12-slim 3.12 t51-glm-dnode19 \
+      "-v $WORK/vllm-t56:/vllm-workspace/vllm:ro -v $WORK/asc-t56-p:/vllm-workspace/vllm-ascend:ro -v $HERE/launch_d:/launch:ro -v $LAB/cann_nodev:/usr/local/Ascend:ro" \
+      "bash /launch/start_d.sh" "$D_ARGS --startup-log /logs/vllm_9003.log" ;;
+  g20)  # glm53-7: an upgrade half done (vLLM at T56, vllm-ascend still at T51)
+    site g20 --mooncake-wheel "$NPU_WHEEL"
+    run_case g20 python:3.12-slim 3.12 t51-glm-dnode20 \
+      "-v $WORK/vllm-t56:/vllm-workspace/vllm:ro -v $WORK/asc-fin-p:/vllm-workspace/vllm-ascend:ro -v $HERE/launch_d:/launch:ro -v $LAB/cann_nodev:/usr/local/Ascend:ro" \
+      "bash /launch/start_d.sh" "$D_ARGS --startup-log /logs/vllm_9003.log" ;;
+  g21)  # glm53-7: the site-like D after the T56 upgrade (site edits outside the port, connector replayed by the T56
+        # replay from the site-edited original), with --export-diff
+    site g21 --mooncake-wheel "$NPU_WHEEL"
+    run_case g21 python:3.12-slim 3.12 t51-glm-dnode21 \
+      "-v $WORK/vllm-t56:/vllm-workspace/vllm:ro -v $WORK/asc-t56-d:/vllm-workspace/vllm-ascend:ro -v $HERE/launch_d:/launch:ro -v $LAB/cann_nodev:/usr/local/Ascend:ro" \
+      "bash /launch/start_d.sh" "$D_ARGS --startup-log /logs/vllm_9003.log --export-diff" ;;
+  g22)  # glm53-7: g19 on a container whose Mooncake store was already replaced (the 11-20 test-cluster exception)
+    site g22 --mooncake-wheel "$NPU_WHEEL"
+    [ -n "${MC_REPLACEMENT:-}" ] && cp "$MC_REPLACEMENT" "$LAB/sites/g22/mooncake/libmooncake_store.so"
+    run_case g22 python:3.12-slim 3.12 t51-glm-dnode22 \
+      "-v $WORK/vllm-t56:/vllm-workspace/vllm:ro -v $WORK/asc-t56-p:/vllm-workspace/vllm-ascend:ro -v $HERE/launch_d:/launch:ro -v $LAB/cann_nodev:/usr/local/Ascend:ro" \
+      "bash /launch/start_d.sh" "$D_ARGS --startup-log /logs/vllm_9003.log" ;;
+  g23)  # glm53-7: the glm53-1 path, a P that goes from the site's original files straight to T56 (no T51 in between):
+        # P launch (1 instance, TP16) on the site-edited tree whose connector the T56 replay wrote from the site original;
+        # the before state of this path is g1 (P) and g2 (D), the D after state is g21
+    site g23 --mooncake-wheel "$NPU_WHEEL"
+    MAP=$(cd "$LAB/sites/g23" && ls mooncake/*.so 2>/dev/null | head -2 | sed "s#^#/usr/local/lib/python3.12/site-packages/#" | paste -sd: -)
+    run_case g23 python:3.12-slim 3.12 t51-glm-pnode23 \
+      "-v $WORK/vllm-t56:/vllm-workspace/vllm:ro -v $WORK/asc-t56-d:/vllm-workspace/vllm-ascend:ro -v $HERE/launch_p:/launch:ro -v $LAB/cann_nodev:/usr/local/Ascend:ro -e T51_FAKE_MAP=$MAP" \
+      "bash /launch/start_p.sh" "$P_ARGS --startup-log /logs/vllm_9000.log" ;;
+  g24)  # glm53-8: glm53-test after T58, a D with all three at T58 and Mooncake v2 in place
+    site g24 --mooncake-wheel "$NPU_WHEEL"
+    [ -n "${MC_REPLACEMENT_V2:-}" ] && cp "$MC_REPLACEMENT_V2" "$LAB/sites/g24/mooncake/libmooncake_store.so"
+    run_case g24 python:3.12-slim 3.12 t51-glm-dnode24 \
+      "-v $WORK/vllm-t58:/vllm-workspace/vllm:ro -v $WORK/asc-t58-p:/vllm-workspace/vllm-ascend:ro -v $HERE/launch_d:/launch:ro -v $LAB/cann_nodev:/usr/local/Ascend:ro" \
+      "bash /launch/start_d.sh" "$D_ARGS --startup-log /logs/vllm_9003.log" ;;
+  g25)  # glm53-8: glm53-test before T58 (the g22 situation: T56 and Mooncake v1) seen by glm53-8
+    site g25 --mooncake-wheel "$NPU_WHEEL"
+    [ -n "${MC_REPLACEMENT:-}" ] && cp "$MC_REPLACEMENT" "$LAB/sites/g25/mooncake/libmooncake_store.so"
+    run_case g25 python:3.12-slim 3.12 t51-glm-dnode25 \
+      "-v $WORK/vllm-t56:/vllm-workspace/vllm:ro -v $WORK/asc-t56-p:/vllm-workspace/vllm-ascend:ro -v $HERE/launch_d:/launch:ro -v $LAB/cann_nodev:/usr/local/Ascend:ro" \
+      "bash /launch/start_d.sh" "$D_ARGS --startup-log /logs/vllm_9003.log" ;;
+  g26)  # glm53-8: an upgrade half done (vLLM at T58, vllm-ascend still at T56)
+    site g26 --mooncake-wheel "$NPU_WHEEL"
+    run_case g26 python:3.12-slim 3.12 t51-glm-dnode26 \
+      "-v $WORK/vllm-t58:/vllm-workspace/vllm:ro -v $WORK/asc-t56-p:/vllm-workspace/vllm-ascend:ro -v $HERE/launch_d:/launch:ro -v $LAB/cann_nodev:/usr/local/Ascend:ro" \
+      "bash /launch/start_d.sh" "$D_ARGS --startup-log /logs/vllm_9003.log" ;;
+  g27)  # glm53-8: the site-like D after T58 (site edits outside the port, connector replayed by the T58 replay from the
+        # site-edited original), with --export-diff
+    site g27 --mooncake-wheel "$NPU_WHEEL"
+    run_case g27 python:3.12-slim 3.12 t51-glm-dnode27 \
+      "-v $WORK/vllm-t58:/vllm-workspace/vllm:ro -v $WORK/asc-t58-d:/vllm-workspace/vllm-ascend:ro -v $HERE/launch_d:/launch:ro -v $LAB/cann_nodev:/usr/local/Ascend:ro" \
+      "bash /launch/start_d.sh" "$D_ARGS --startup-log /logs/vllm_9003.log --export-diff" ;;
+  g28)  # glm53-8: the glm53-1 path, a P that goes from the site's original files straight to T58, Mooncake v2 in place
+    site g28 --mooncake-wheel "$NPU_WHEEL"
+    [ -n "${MC_REPLACEMENT_V2:-}" ] && cp "$MC_REPLACEMENT_V2" "$LAB/sites/g28/mooncake/libmooncake_store.so"
+    MAP=$(cd "$LAB/sites/g28" && ls mooncake/*.so 2>/dev/null | head -2 | sed "s#^#/usr/local/lib/python3.12/site-packages/#" | paste -sd: -)
+    run_case g28 python:3.12-slim 3.12 t51-glm-pnode28 \
+      "-v $WORK/vllm-t58:/vllm-workspace/vllm:ro -v $WORK/asc-t58-d:/vllm-workspace/vllm-ascend:ro -v $HERE/launch_p:/launch:ro -v $LAB/cann_nodev:/usr/local/Ascend:ro -e T51_FAKE_MAP=$MAP" \
+      "bash /launch/start_p.sh" "$P_ARGS --startup-log /logs/vllm_9000.log" ;;
+  g29)  # glm53-8: g24 with PD_DIAG_LEVEL=2 in the launch environment: diag_level=2(env), and it enters the baseline
+    site g29 --mooncake-wheel "$NPU_WHEEL"
+    run_case g29 python:3.12-slim 3.12 t51-glm-dnode29 \
+      "-v $WORK/vllm-t58:/vllm-workspace/vllm:ro -v $WORK/asc-t58-p:/vllm-workspace/vllm-ascend:ro -v $HERE/launch_d:/launch:ro -v $LAB/cann_nodev:/usr/local/Ascend:ro -e PD_DIAG_LEVEL=2" \
+      "bash /launch/start_d.sh" "$D_ARGS --startup-log /logs/vllm_9003.log" ;;
+  g30)  # glm53-8: g24 with PD_DIAG_LEVEL=abc: diag_level=3(invalid)
+    site g30 --mooncake-wheel "$NPU_WHEEL"
+    run_case g30 python:3.12-slim 3.12 t51-glm-dnode30 \
+      "-v $WORK/vllm-t58:/vllm-workspace/vllm:ro -v $WORK/asc-t58-p:/vllm-workspace/vllm-ascend:ro -v $HERE/launch_d:/launch:ro -v $LAB/cann_nodev:/usr/local/Ascend:ro -e PD_DIAG_LEVEL=abc" \
+      "bash /launch/start_d.sh" "$D_ARGS --startup-log /logs/vllm_9003.log" ;;
+  g31)  # glm53-8: the g24 situation checked against a glm53-7 token taken before the upgrade (no diag_level in it, read
+        # as 3): baseline=same
+    site g31 --mooncake-wheel "$NPU_WHEEL"
+    [ -n "${MC_REPLACEMENT_V2:-}" ] && cp "$MC_REPLACEMENT_V2" "$LAB/sites/g31/mooncake/libmooncake_store.so"
+    run_case g31 python:3.12-slim 3.12 t51-glm-dnode24 \
+      "-v $WORK/vllm-t58:/vllm-workspace/vllm:ro -v $WORK/asc-t58-p:/vllm-workspace/vllm-ascend:ro -v $HERE/launch_d:/launch:ro -v $LAB/cann_nodev:/usr/local/Ascend:ro" \
+      "bash /launch/start_d.sh" "$D_ARGS --startup-log /logs/vllm_9003.log --baseline ${BASELINE_G7:-none}" ;;
+  g32)  # glm53-8: the g29 situation (PD_DIAG_LEVEL=2) checked against g24's token (level 3): BASELINE_DIFF on diag_level
+    site g32 --mooncake-wheel "$NPU_WHEEL"
+    run_case g32 python:3.12-slim 3.12 t51-glm-dnode29 \
+      "-v $WORK/vllm-t58:/vllm-workspace/vllm:ro -v $WORK/asc-t58-p:/vllm-workspace/vllm-ascend:ro -v $HERE/launch_d:/launch:ro -v $LAB/cann_nodev:/usr/local/Ascend:ro -e PD_DIAG_LEVEL=2" \
+      "bash /launch/start_d.sh" "$D_ARGS --startup-log /logs/vllm_9003.log --baseline ${BASELINE_G24:-none}" ;;
   esac
 done

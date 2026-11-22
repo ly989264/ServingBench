@@ -1,0 +1,768 @@
+diff --git a/README.md b/README.md
+index b1ec01381d5842bc93bc2621f63231ba6ebe3b12..2fdfc0fa4eb97e272ca62616a8c9b8fa69b4e492 100644
+--- a/README.md
++++ b/README.md
+@@ -132,22 +132,26 @@ Mooncake Store is a high-performance distributed key-value cache storage engine
+ 
+ #### Store timing diagnostics
+ 
+-This instrumentation branch adds INFO-level `[BatchPutTiming]` observations
+-without changing the original calls, results, or native metric expressions.
+-The shared prefer-same-node write path uses `[BatchUpsertTiming]` for Upsert.
++This instrumentation branch records the native timing of `Client::BatchPut` and
++`Client::BatchUpsert` without changing the original calls, results, or native metric
++expressions. The records (`mc_batch_put`, `mc_batch_upsert`) are written to files under
++`/data/pd-diag/logs/mooncake/`, not through glog or stderr; see
++[Native Batch Write Timing](docs/source/getting_started/observability.md#native-batch-write-timing)
++for the file layout, rotation, retention, and the `MC_PD_TIMING` and `PD_DIAG_LEVEL`
++switches.
+ 
+ | `timing_scope` | Measured range |
+ | --- | --- |
+ | `normal_full` | `StartBatchPut` through `FinalizeBatchPut`, in four phases. Phase 1 includes buffer staging; phase 3 includes `SubmitDfsWrites`. |
+-| `phase1_only` | Prefer-same-node `StartBatchPut` and buffer staging. No `total_us` is emitted for this record. |
+-| `prefer_same_node_remaining` | Grouping/submission, transfer wait, and result propagation/DFS writes/finalization. `total_us` covers only these phases 2–4, not phase 1. |
++| `prefer_same_node_full` | The prefer-same-node path: phase 1 on the caller side, then grouping/submission, transfer wait, and result propagation/DFS writes/finalization. `total_us` spans phase 1 through finalization. The original-signature `BatchWriteWhenPreferSameNode(ops, is_upsert)` also records this scope, without `phase1_start_batch_put_us` and `total_us`, and with `complete=false`. |
++| `prefer_same_node_not_started` | The configuration check rejected the write before phase 1: `status=error`, `complete=false`, `phase_status=not_started`, keys and bytes, no phase or total durations. |
+ 
+-These host intervals end before result collection and their timing-log emission;
+-they are not full API latency or additive TTFT components. `keys` and `bytes`
+-describe operation counts and slice lengths, not successful transfers or measured
+-wire traffic.
++These host intervals end before result collection and record emission;
++they are not full API latency or additive TTFT components. `submitted_keys` and
++`submitted_bytes` describe operation counts and slice lengths, not successful transfers
++or measured wire traffic.
+ Interrupted calls may lack completion records. Clock reads, slice counting, and
+-logging add overhead; they do not introduce transfers, retries, or device waits.
++record formatting add overhead; they do not introduce transfers, retries, or device waits.
+ 
+ </details>
+ 
+diff --git a/docs/source/getting_started/observability.md b/docs/source/getting_started/observability.md
+index e6c75bb316ebfa23d2a0e6e3f1ffef553fc861c7..dbe18a3c3584c0d6e100c9b76add3fdf144b00bd 100644
+--- a/docs/source/getting_started/observability.md
++++ b/docs/source/getting_started/observability.md
+@@ -226,9 +226,34 @@ client HTTP server remains enabled while metrics are disabled, `/metrics` and
+ ## Native Batch Write Timing
+ 
+ Each completed `Client::BatchPut` or `Client::BatchUpsert` invocation emits one
+-`[BatchPutTiming]` or `[BatchUpsertTiming]` line. The forwarding overload does not
+-emit a second line. Records carry `keys`, `bytes`, four microsecond phase fields,
+-`total_us`, `timing_scope`, `status`, `complete`, and `failed_keys`.
++`mc_batch_put` or `mc_batch_upsert` record. The forwarding overload does not emit a
++second record. Records are not written through glog or stderr; they go to files of
++their own:
++
++- Directory: `/data/pd-diag/logs/mooncake/` (`MC_PD_TIMING_DIR` overrides it).
++- Files: `mc.<start time>.<pid>.<seq>.log`, one per process. A file that reaches
++  256 MiB is closed and the next `seq` is opened; files are never renamed. Files of
++  this name pattern older than 12 hours are deleted whenever a file is opened and
++  every 10 minutes, including files left by other processes.
++- Lines: `<local ISO time> (mooncake pid=<pid>) INFO [client_service.cpp:0] [PD_DIAG] {json}`.
++  The first line of a file is a `pd_file_open` record; every minute an
++  `mc_timing_stats` record carries `written`, `dropped`, and `queue_max`.
++- Record fields: `wall_ns` (UTC nanoseconds, read inside the call after
++  finalization), `pid`, `native_tid` (the calling thread's `gettid()`),
++  `submitted_keys`, `submitted_bytes`, four microsecond phase fields, `total_us`,
++  `timing_scope`, `status`, `complete`, and `failed_keys`.
++- Switches: nothing is written when `MC_PD_TIMING=0`, or when `PD_DIAG_LEVEL` is
++  `1` or `2`. `PD_DIAG_LEVEL` unset, empty, `3`, or any other value means level 3.
++  There is no fallback to stderr.
++- The calling thread only formats the record and puts it into a bounded ring of
++  16384 records; a full ring drops the record and counts it. One detached writer
++  thread per process writes every 200 ms without `fsync`; the last records (under
++  200 ms) are lost when the process exits. After `fork()`, the child's first record
++  starts its own writer and file.
++- If the directory cannot be created or a file cannot be opened, the records are
++  dropped and counted, and a single glog `WARNING` says so; the write call itself is
++  never blocked or failed.
++
+ Clocks use `steady_clock`; durations are converted directly to integer
+ microseconds without rounding intermediate time points.
+ 
+@@ -250,8 +275,8 @@ The original native latency metric keeps its existing boundaries and placement.
+ object is successful for Put, matching CollectResults. `complete=true` means all
+ four clock ranges were measured, not that all keys succeeded. Configuration
+ rejection before phase 1 emits one `status=error complete=false` record with
+-`timing_scope=prefer_same_node_not_started`, `phase_status=not_started`, keys and
+-bytes, and no fabricated phase/total durations. An exception escaping the call
++`timing_scope=prefer_same_node_not_started`, `phase_status=not_started`,
++`submitted_keys` and `submitted_bytes`, and no fabricated phase/total durations. An exception escaping the call
+ does not produce a completed timing record. The original-signature
+ `BatchWriteWhenPreferSameNode(ops, is_upsert)` stays exported so that no name is
+ removed from the library; nothing in this build calls it. It does not know the two
+diff --git a/mooncake-store/include/pd_timing_level.h b/mooncake-store/include/pd_timing_level.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..af41baa896795ae1511c413c20b1da9ae1c8d1c8
+--- /dev/null
++++ b/mooncake-store/include/pd_timing_level.h
+@@ -0,0 +1,34 @@
++#pragma once
++
++// Parsing of PD_DIAG_LEVEL for the batch-write timing records (inline, so that the
++// store library exports nothing new and a standalone test can include the same code).
++// The rules match the Python parser in vLLM's pd_diagnostics.diag_level():
++//   unset or empty      -> level 3, source "default"
++//   exactly "1" "2" "3" -> that level, source "env"
++//   anything else       -> level 3, source "invalid" (no trimming: " 2 " is invalid)
++
++#include <cstring>
++
++namespace mooncake {
++namespace pd_timing {
++
++struct Level {
++    int level;
++    const char* source;
++};
++
++inline Level ParseDiagLevel(const char* value) {
++    if (value == nullptr || value[0] == '\0') return {3, "default"};
++    if (std::strcmp(value, "1") == 0) return {1, "env"};
++    if (std::strcmp(value, "2") == 0) return {2, "env"};
++    if (std::strcmp(value, "3") == 0) return {3, "env"};
++    return {3, "invalid"};
++}
++
++// MC_PD_TIMING: unset or anything but "0" means on; "0" means off.
++inline bool ParseTimingSwitch(const char* value) {
++    return !(value != nullptr && std::strcmp(value, "0") == 0);
++}
++
++}  // namespace pd_timing
++}  // namespace mooncake
+diff --git a/mooncake-store/src/client_service.cpp b/mooncake-store/src/client_service.cpp
+index adbb14aa60e3e00a0f05d8b740420ab42a82d5a7..2501ee1f855167eeeea18e7bffa1a0d1b6180253 100644
+--- a/mooncake-store/src/client_service.cpp
++++ b/mooncake-store/src/client_service.cpp
+@@ -5,6 +5,18 @@
+ 
+ #include <sstream>
+ 
++#include <dirent.h>
++#include <fcntl.h>
++#include <pthread.h>
++#include <sys/stat.h>
++#include <sys/syscall.h>
++#include <sys/types.h>
++#include <unistd.h>
++
++#include <cstdio>
++#include <ctime>
++
++#include "pd_timing_level.h"
+ #include "ascii_string.h"
+ #include "allocator.h"
+ #include "segment.h"
+@@ -412,6 +424,345 @@ FinalizeDecision DetermineFinalizeDecision(
+             .count());
+ }
+ 
++// Batch-write timing records, written to files of their own (not glog, not stderr).
++//
++// /data/pd-diag/logs/mooncake/mc.<start>.<pid>.<seq>.log (MC_PD_TIMING_DIR overrides the directory, for tests).
++// One file per process; a full file (256 MiB) is closed and the next seq is opened; files are never renamed; files
++// older than 12 hours are deleted when a file is opened and every 10 minutes (other processes' too, ENOENT ignored).
++// Each line: "<local ISO time> (mooncake pid=<pid>) INFO [client_service.cpp:0] [PD_DIAG] {json}". The first line
++// of a file is a pd_file_open record; every minute a mc_timing_stats record carries written/dropped/queue_max.
++//
++// Written only when MC_PD_TIMING is not "0" and PD_DIAG_LEVEL is level 3 (pd_timing_level.h).
++// The calling thread only formats the line and puts it into a bounded ring (16384 slots); a full ring drops the
++// line and counts it. One detached writer thread per process (pthread_create, started by the first record) writes
++// every 200 ms. All state is plain data with static initialisers: there is no static object with a destructor, the
++// writer is never joined, and the last lines (under 200 ms) are lost at exit. pthread_atfork: prepare locks the
++// ring, the parent unlocks it, the child re-initialises the lock and empties the ring, so that its first record
++// starts a writer and a file of its own.
++namespace {
++
++// Compile-time overrides for tests only (smaller files, ring and intervals); the values below are the defaults.
++#ifndef MC_PD_TIMING_ROTATE_BYTES
++#define MC_PD_TIMING_ROTATE_BYTES (256ull << 20)
++#endif
++#ifndef MC_PD_TIMING_KEEP_SECONDS
++#define MC_PD_TIMING_KEEP_SECONDS 43200
++#endif
++#ifndef MC_PD_TIMING_CLEAN_SECONDS
++#define MC_PD_TIMING_CLEAN_SECONDS 600
++#endif
++#ifndef MC_PD_TIMING_STATS_SECONDS
++#define MC_PD_TIMING_STATS_SECONDS 60
++#endif
++#ifndef MC_PD_TIMING_SLOTS
++#define MC_PD_TIMING_SLOTS 16384
++#endif
++
++constexpr size_t kPdSlots = MC_PD_TIMING_SLOTS;
++constexpr size_t kPdSlotBytes = 640;
++constexpr size_t kPdBatch = 256;
++constexpr const char* kPdDefaultDir = "/data/pd-diag/logs/mooncake";
++constexpr const char* kPdBuild = "timing-files-1";
++
++struct PdSlot {
++    uint32_t len;
++    char data[kPdSlotBytes];
++};
++
++struct PdState {
++    pthread_mutex_t mu;
++    pthread_cond_t cv;
++    PdSlot* ring;       // calloc'ed on first use, never freed
++    size_t head;        // oldest slot
++    size_t count;
++    uint64_t written;
++    uint64_t dropped;
++    uint64_t queue_max;
++    int started;        // 0 not started, 1 writer running, -1 writer could not start
++    int enabled;        // -1 not decided, 0 off, 1 on
++    int warned;
++};
++
++PdState g_pd = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, nullptr, 0, 0, 0, 0, 0, 0, -1, 0};
++pthread_once_t g_pd_once = PTHREAD_ONCE_INIT;
++
++void PdAtforkPrepare() { pthread_mutex_lock(&g_pd.mu); }
++void PdAtforkParent() { pthread_mutex_unlock(&g_pd.mu); }
++void PdAtforkChild() {
++    pthread_mutex_init(&g_pd.mu, nullptr);
++    pthread_cond_init(&g_pd.cv, nullptr);
++    g_pd.head = 0;
++    g_pd.count = 0;
++    g_pd.written = 0;
++    g_pd.dropped = 0;
++    g_pd.queue_max = 0;
++    g_pd.started = 0;
++}
++
++void PdInitOnce() {
++    const auto level = pd_timing::ParseDiagLevel(std::getenv("PD_DIAG_LEVEL"));
++    const bool on = pd_timing::ParseTimingSwitch(std::getenv("MC_PD_TIMING"));
++    g_pd.enabled = (on && level.level == 3) ? 1 : 0;
++    if (g_pd.enabled) {
++        g_pd.ring = static_cast<PdSlot*>(std::calloc(kPdSlots, sizeof(PdSlot)));
++        if (g_pd.ring == nullptr) g_pd.enabled = 0;
++    }
++    if (g_pd.enabled) pthread_atfork(PdAtforkPrepare, PdAtforkParent, PdAtforkChild);
++}
++
++int64_t PdWallNs() {
++    struct timespec ts;
++    clock_gettime(CLOCK_REALTIME, &ts);
++    return static_cast<int64_t>(ts.tv_sec) * 1000000000 + ts.tv_nsec;
++}
++
++int64_t PdMonoNs() {
++    struct timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return static_cast<int64_t>(ts.tv_sec) * 1000000000 + ts.tv_nsec;
++}
++
++// "<local ISO time with ms and offset> (mooncake pid=<pid>) INFO [client_service.cpp:0] [PD_DIAG] "
++int PdPrefix(char* out, size_t cap, int64_t wall_ns, pid_t pid) {
++    time_t secs = static_cast<time_t>(wall_ns / 1000000000);
++    struct tm tmv;
++    localtime_r(&secs, &tmv);
++    char date[32], zone[8];
++    strftime(date, sizeof(date), "%Y-%m-%dT%H:%M:%S", &tmv);
++    strftime(zone, sizeof(zone), "%z", &tmv);  // +0800
++    return std::snprintf(out, cap, "%s.%03d%c%c%c:%c%c (mooncake pid=%d) INFO [client_service.cpp:0] [PD_DIAG] ",
++                         date, static_cast<int>((wall_ns / 1000000) % 1000), zone[0], zone[1], zone[2], zone[3],
++                         zone[4], static_cast<int>(pid));
++}
++
++void PdWarnOnce(const char* what, const char* path) {
++    if (g_pd.warned) return;
++    g_pd.warned = 1;
++    LOG(WARNING) << "[PD_DIAG] mooncake timing records dropped: " << what << " " << path << " ("
++                 << std::strerror(errno) << ")";
++}
++
++const char* PdDir() {
++    const char* d = std::getenv("MC_PD_TIMING_DIR");
++    return (d != nullptr && d[0] != '\0') ? d : kPdDefaultDir;
++}
++
++bool PdMkdirs(const char* dir) {
++    char buf[512];
++    const size_t n = std::strlen(dir);
++    if (n == 0 || n >= sizeof(buf)) return false;
++    std::memcpy(buf, dir, n + 1);
++    for (size_t i = 1; i <= n; ++i) {
++        if (buf[i] == '/' || buf[i] == '\0') {
++            const char c = buf[i];
++            buf[i] = '\0';
++            if (mkdir(buf, 0755) != 0 && errno != EEXIST) return false;
++            buf[i] = c;
++        }
++    }
++    return true;
++}
++
++// mc.YYYYmmddTHHMMSS.<pid>.<seq 4 digits>.log
++bool PdIsOurFile(const char* name) {
++    unsigned y, pid, seq;
++    char t[16], tail[8];
++    return std::sscanf(name, "mc.%8uT%6s.%u.%4u.%4s", &y, t, &pid, &seq, tail) == 5 && std::strcmp(tail, "log") == 0 &&
++           std::strlen(name) > 20;
++}
++
++struct PdFile {
++    int fd;
++    uint64_t bytes;
++    unsigned seq;
++    char start[16];
++    char path[640];
++};
++
++void PdClean(const char* dir, const char* current) {
++    DIR* d = opendir(dir);
++    if (d == nullptr) return;
++    const time_t cutoff = time(nullptr) - MC_PD_TIMING_KEEP_SECONDS;
++    char path[640];
++    while (struct dirent* e = readdir(d)) {
++        if (!PdIsOurFile(e->d_name)) continue;
++        std::snprintf(path, sizeof(path), "%s/%s", dir, e->d_name);
++        if (current != nullptr && std::strcmp(path, current) == 0) continue;
++        struct stat st;
++        if (stat(path, &st) == 0 && st.st_mtime < cutoff) unlink(path);  // ENOENT from a concurrent unlink: ignored
++    }
++    closedir(d);
++}
++
++bool PdOpen(PdFile& f, pid_t pid) {
++    const char* dir = PdDir();
++    if (!PdMkdirs(dir)) {
++        PdWarnOnce("cannot create", dir);
++        return false;
++    }
++    std::snprintf(f.path, sizeof(f.path), "%s/mc.%s.%d.%04u.log", dir, f.start, static_cast<int>(pid), f.seq);
++    f.fd = open(f.path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
++    if (f.fd < 0) {
++        PdWarnOnce("cannot open", f.path);
++        return false;
++    }
++    struct stat st;
++    f.bytes = (fstat(f.fd, &st) == 0) ? static_cast<uint64_t>(st.st_size) : 0;
++    const int64_t wall = PdWallNs();
++    char line[kPdSlotBytes + 160];
++    int n = PdPrefix(line, sizeof(line), wall, pid);
++    const char* base = std::strrchr(f.path, '/');
++    n += std::snprintf(line + n, sizeof(line) - n,
++                       "{\"event\":\"pd_file_open\",\"version\":1,\"source\":\"mooncake\",\"pid\":%d,\"file\":\"%s\","
++                       "\"seq\":%u,\"build\":\"%s\",\"wall_ns\":%lld,\"timestamp_ns\":%lld}\n",
++                       static_cast<int>(pid), base ? base + 1 : f.path, f.seq, kPdBuild,
++                       static_cast<long long>(wall), static_cast<long long>(PdMonoNs()));
++    if (write(f.fd, line, n) == n) f.bytes += n;
++    PdClean(dir, f.path);
++    return true;
++}
++
++void* PdWriterMain(void*) {
++    PdFile f;
++    f.fd = -1;
++    f.bytes = 0;
++    f.seq = 0;
++    const pid_t pid = getpid();
++    {
++        time_t now = time(nullptr);
++        struct tm tmv;
++        localtime_r(&now, &tmv);
++        strftime(f.start, sizeof(f.start), "%Y%m%dT%H%M%S", &tmv);
++    }
++    int64_t last_stats = PdMonoNs(), last_clean = last_stats;
++    char* const batch = static_cast<char*>(std::malloc(kPdBatch * (kPdSlotBytes + 1)));  // lives as long as the thread
++    for (;;) {
++        size_t lens[kPdBatch];
++        size_t got = 0;
++        uint64_t written = 0, dropped = 0, qmax = 0;
++        pthread_mutex_lock(&g_pd.mu);
++        if (g_pd.count == 0) {
++            struct timespec until;
++            clock_gettime(CLOCK_REALTIME, &until);
++            until.tv_nsec += 200 * 1000000;
++            if (until.tv_nsec >= 1000000000) {
++                until.tv_sec += 1;
++                until.tv_nsec -= 1000000000;
++            }
++            pthread_cond_timedwait(&g_pd.cv, &g_pd.mu, &until);
++        }
++        while (g_pd.count > 0 && got < kPdBatch && batch != nullptr) {
++            const PdSlot& s = g_pd.ring[g_pd.head];
++            std::memcpy(batch + got * (kPdSlotBytes + 1), s.data, s.len);
++            lens[got++] = s.len;
++            g_pd.head = (g_pd.head + 1) % kPdSlots;
++            --g_pd.count;
++        }
++        g_pd.written += got;
++        written = g_pd.written;
++        dropped = g_pd.dropped;
++        qmax = g_pd.queue_max;
++        pthread_mutex_unlock(&g_pd.mu);
++
++        const int64_t mono = PdMonoNs();
++        const bool stats_due = mono - last_stats >= static_cast<int64_t>(MC_PD_TIMING_STATS_SECONDS) * 1000000000;
++        if (got == 0 && !stats_due) continue;
++        if (f.fd >= 0 && f.bytes >= MC_PD_TIMING_ROTATE_BYTES) {
++            close(f.fd);
++            f.fd = -1;
++            ++f.seq;
++        }
++        if (f.fd < 0 && !PdOpen(f, pid)) {
++            pthread_mutex_lock(&g_pd.mu);
++            g_pd.dropped += got;
++            g_pd.written -= got;
++            pthread_mutex_unlock(&g_pd.mu);
++            continue;
++        }
++        for (size_t i = 0; i < got; ++i) {
++            const char* p = batch + i * (kPdSlotBytes + 1);
++            if (write(f.fd, p, lens[i]) == static_cast<ssize_t>(lens[i])) f.bytes += lens[i];
++        }
++        if (stats_due) {
++            last_stats = mono;
++            char line[kPdSlotBytes + 160];
++            const int64_t wall = PdWallNs();
++            int n = PdPrefix(line, sizeof(line), wall, pid);
++            n += std::snprintf(line + n, sizeof(line) - n,
++                               "{\"event\":\"mc_timing_stats\",\"version\":1,\"wall_ns\":%lld,\"pid\":%d,"
++                               "\"written\":%llu,\"dropped\":%llu,\"queue_max\":%llu}\n",
++                               static_cast<long long>(wall), static_cast<int>(pid),
++                               static_cast<unsigned long long>(written), static_cast<unsigned long long>(dropped),
++                               static_cast<unsigned long long>(qmax));
++            if (write(f.fd, line, n) == n) f.bytes += n;
++        }
++        if (mono - last_clean >= static_cast<int64_t>(MC_PD_TIMING_CLEAN_SECONDS) * 1000000000) {
++            last_clean = mono;
++            PdClean(PdDir(), f.path);
++        }
++    }
++    return nullptr;
++}
++
++// Put one record (the JSON object, no newline) into the ring; start the writer on the first record of a process.
++void PdEnqueue(const char* json, int json_len, int64_t wall_ns) {
++    char line[kPdSlotBytes];
++    const pid_t pid = getpid();
++    int n = PdPrefix(line, sizeof(line), wall_ns, pid);
++    if (n <= 0 || json_len <= 0 || static_cast<size_t>(n + json_len + 1) >= sizeof(line)) {
++        pthread_mutex_lock(&g_pd.mu);
++        ++g_pd.dropped;
++        pthread_mutex_unlock(&g_pd.mu);
++        return;
++    }
++    std::memcpy(line + n, json, json_len);
++    n += json_len;
++    line[n++] = '\n';
++    pthread_mutex_lock(&g_pd.mu);
++    if (g_pd.started == 0) {
++        pthread_t t;
++        if (pthread_create(&t, nullptr, PdWriterMain, nullptr) == 0) {
++            pthread_detach(t);
++            g_pd.started = 1;
++        } else {
++            g_pd.started = -1;
++        }
++    }
++    if (g_pd.started != 1 || g_pd.count >= kPdSlots) {
++        ++g_pd.dropped;
++    } else {
++        PdSlot& s = g_pd.ring[(g_pd.head + g_pd.count) % kPdSlots];
++        std::memcpy(s.data, line, n);
++        s.len = static_cast<uint32_t>(n);
++        ++g_pd.count;
++        if (g_pd.count > g_pd.queue_max) g_pd.queue_max = g_pd.count;
++        if (g_pd.count == 1) pthread_cond_signal(&g_pd.cv);
++    }
++    pthread_mutex_unlock(&g_pd.mu);
++}
++
++bool PdTimingOn() {
++    pthread_once(&g_pd_once, PdInitOnce);
++    return g_pd.enabled == 1;
++}
++
++// The record of a write rejected by the configuration check before phase 1: keys, bytes, no phases.
++void PdNotStarted(bool is_upsert, size_t keys, uint64_t bytes) {
++    if (!PdTimingOn()) return;
++    const int64_t wall = PdWallNs();
++    char json[kPdSlotBytes];
++    const int n = std::snprintf(
++        json, sizeof(json),
++        "{\"event\":\"%s\",\"version\":1,\"wall_ns\":%lld,\"pid\":%d,\"native_tid\":%ld,\"submitted_keys\":%zu,"
++        "\"submitted_bytes\":%llu,\"timing_scope\":\"prefer_same_node_not_started\",\"phase_status\":\"not_started\","
++        "\"status\":\"error\",\"complete\":false}",
++        is_upsert ? "mc_batch_upsert" : "mc_batch_put", static_cast<long long>(wall), static_cast<int>(getpid()),
++        static_cast<long>(syscall(SYS_gettid)), keys, static_cast<unsigned long long>(bytes));
++    if (n > 0 && static_cast<size_t>(n) < sizeof(json)) PdEnqueue(json, n, wall);
++}
++
++}  // namespace
++
+ Client::Client(const std::string& local_hostname,
+                const std::string& metadata_connstring,
+                const std::string& protocol,
+@@ -2231,11 +2582,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
+                     total_bytes += slice.size;
+                 }
+             }
+-            LOG(INFO) << "[BatchUpsertTiming] keys=" << keys.size()
+-                      << " bytes=" << total_bytes
+-                      << " status=error complete=false"
+-                      << " timing_scope=prefer_same_node_not_started"
+-                      << " phase_status=not_started";
++            PdNotStarted(true, keys.size(), total_bytes);
+             return std::vector<tl::expected<void, ErrorCode>>(
+                 keys.size(), tl::unexpected(*err));
+         }
+@@ -3334,32 +3681,34 @@ void Client::LogBatchWriteTiming(
+     std::chrono::steady_clock::time_point after_wait_transfers,
+     std::chrono::steady_clock::time_point batch_end,
+     const char* timing_scope) const {
++    if (!PdTimingOn()) return;
+     // Unknown start (the original-signature BatchWriteWhenPreferSameNode): no phase1 and no total, complete=false.
+     // The fields are left out rather than written as 0, so that a reader finds them missing.
+     const bool start_known =
+         batch_begin != std::chrono::steady_clock::time_point::min() &&
+         after_start_batch_put != std::chrono::steady_clock::time_point::min();
+-    std::ostringstream phase1, total;
++    const int64_t wall = PdWallNs();  // inside the call, after batch_end: within the caller's [start, end]
++    char phase1[64] = "", total[48] = "";
+     if (start_known) {
+-        phase1 << " phase1_start_batch_put_us="
+-               << DurationUsBetween(batch_begin, after_start_batch_put);
+-        total << " total_us=" << DurationUsBetween(batch_begin, batch_end);
+-    }
+-    LOG(INFO) << (is_upsert ? "[BatchUpsertTiming]" : "[BatchPutTiming]")
+-              << " keys=" << keys << " bytes=" << total_bytes
+-              << phase1.str()
+-              << " phase2_submit_transfers_us="
+-              << DurationUsBetween(submit_begin, after_submit_transfers)
+-              << " phase3_wait_transfers_us="
+-              << DurationUsBetween(after_submit_transfers,
+-                                   after_wait_transfers)
+-              << " phase4_finalize_batch_put_us="
+-              << DurationUsBetween(after_wait_transfers, batch_end)
+-              << total.str()
+-              << " timing_scope=" << timing_scope
+-              << " status=" << (failed_keys == 0 ? "ok" : "error")
+-              << " complete=" << (start_known ? "true" : "false")
+-              << " failed_keys=" << failed_keys;
++        std::snprintf(phase1, sizeof(phase1), ",\"phase1_start_batch_put_us\":%llu",
++                      static_cast<unsigned long long>(DurationUsBetween(batch_begin, after_start_batch_put)));
++        std::snprintf(total, sizeof(total), ",\"total_us\":%llu",
++                      static_cast<unsigned long long>(DurationUsBetween(batch_begin, batch_end)));
++    }
++    char json[kPdSlotBytes];
++    const int n = std::snprintf(
++        json, sizeof(json),
++        "{\"event\":\"%s\",\"version\":1,\"wall_ns\":%lld,\"pid\":%d,\"native_tid\":%ld,\"submitted_keys\":%zu,"
++        "\"submitted_bytes\":%llu%s,\"phase2_submit_transfers_us\":%llu,\"phase3_wait_transfers_us\":%llu,"
++        "\"phase4_finalize_batch_put_us\":%llu%s,\"timing_scope\":\"%s\",\"status\":\"%s\",\"complete\":%s,"
++        "\"failed_keys\":%zu}",
++        is_upsert ? "mc_batch_upsert" : "mc_batch_put", static_cast<long long>(wall), static_cast<int>(getpid()),
++        static_cast<long>(syscall(SYS_gettid)), keys, static_cast<unsigned long long>(total_bytes), phase1,
++        static_cast<unsigned long long>(DurationUsBetween(submit_begin, after_submit_transfers)),
++        static_cast<unsigned long long>(DurationUsBetween(after_submit_transfers, after_wait_transfers)),
++        static_cast<unsigned long long>(DurationUsBetween(after_wait_transfers, batch_end)), total, timing_scope,
++        failed_keys == 0 ? "ok" : "error", start_known ? "true" : "false", failed_keys);
++    if (n > 0 && static_cast<size_t>(n) < sizeof(json)) PdEnqueue(json, n, wall);
+ }
+ 
+ void Client::StageWriteBuffersForRemoteReplicas(
+@@ -3542,11 +3891,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
+                     total_bytes += slice.size;
+                 }
+             }
+-            LOG(INFO) << "[BatchPutTiming] keys=" << keys.size()
+-                      << " bytes=" << total_bytes
+-                      << " status=error complete=false"
+-                      << " timing_scope=prefer_same_node_not_started"
+-                      << " phase_status=not_started";
++            PdNotStarted(false, keys.size(), total_bytes);
+             return std::vector<tl::expected<void, ErrorCode>>(
+                 keys.size(), tl::unexpected(*err));
+         }
+diff --git a/mooncake-store/tests/client_integration_test.cpp b/mooncake-store/tests/client_integration_test.cpp
+index 2c6942a1a2efb3a4e6aac8fb59866da77e5e4a9f..8b2b808cac4df7c70535d812dde008ccce0a3509 100644
+--- a/mooncake-store/tests/client_integration_test.cpp
++++ b/mooncake-store/tests/client_integration_test.cpp
+@@ -14,6 +14,10 @@
+ #include <sstream>
+ #include <vector>
+ #include <regex>
++#include <algorithm>
++#include <fstream>
++#include <sys/syscall.h>
++#include <unistd.h>
+ #include <unordered_set>
+ #include <unordered_map>
+ #include <thread>
+@@ -137,27 +141,65 @@ class ClientIdCaptureSink : public google::LogSink {
+     }
+ };
+ 
+-class BatchWriteTimingCaptureSink : public google::LogSink {
++// The batch-write timing records go to files of their own (not glog): point them at a private directory for this
++// test binary before the first record, and read back this thread's records by native_tid.
++const std::string& BatchWriteTimingDir() {
++    static const std::string dir = [] {
++        std::string d = (std::filesystem::temp_directory_path() /
++                         ("mooncake-batch-timing-" + std::to_string(getpid())))
++                            .string();
++        setenv("MC_PD_TIMING_DIR", d.c_str(), 1);
++        return d;
++    }();
++    return dir;
++}
++[[maybe_unused]] const bool kBatchWriteTimingDirSet = !BatchWriteTimingDir().empty();
++
++class BatchWriteTimingCapture {
+    public:
+-    BatchWriteTimingCaptureSink() { google::AddLogSink(this); }
+-    ~BatchWriteTimingCaptureSink() override { google::RemoveLogSink(this); }
+-
+-    void send(google::LogSeverity, const char*, const char*, int,
+-              const struct ::tm*, const char* message,
+-              size_t message_len) override {
+-        // Other client/background threads must not mutate this call's capture.
+-        if (std::this_thread::get_id() != owner_) return;
+-        std::string_view text(message, message_len);
+-        if (text.find("[BatchPutTiming]") != std::string_view::npos ||
+-            text.find("[BatchUpsertTiming]") != std::string_view::npos) {
+-            records.emplace_back(text);
++    BatchWriteTimingCapture() : baseline_(Matching().size()) {}
++
++    // Waits (up to 5 s; the writer flushes every 200 ms) until `expected` new records of this thread are on disk.
++    void Collect(size_t expected) {
++        for (int i = 0; i < 100; ++i) {
++            auto all = Matching();
++            if (all.size() >= baseline_ + expected) {
++                records.assign(all.begin() + baseline_, all.end());
++                return;
++            }
++            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+         }
++        auto all = Matching();
++        records.assign(all.begin() + std::min(baseline_, all.size()), all.end());
+     }
+ 
+     std::vector<std::string> records;
+ 
+    private:
+-    const std::thread::id owner_ = std::this_thread::get_id();
++    std::vector<std::string> Matching() const {
++        std::vector<std::string> out;
++        const std::string tid = "\"native_tid\":" + std::to_string(static_cast<long>(syscall(SYS_gettid))) + ",";
++        std::error_code ec;
++        std::vector<std::filesystem::path> files;
++        for (const auto& e : std::filesystem::directory_iterator(BatchWriteTimingDir(), ec)) {
++            if (e.path().filename().string().rfind("mc.", 0) == 0) files.push_back(e.path());
++        }
++        std::sort(files.begin(), files.end());
++        for (const auto& f : files) {
++            std::ifstream in(f);
++            std::string line;
++            while (std::getline(in, line)) {
++                if (line.find(tid) != std::string::npos &&
++                    (line.find("\"event\":\"mc_batch_put\"") != std::string::npos ||
++                     line.find("\"event\":\"mc_batch_upsert\"") != std::string::npos)) {
++                    out.push_back(line.substr(line.find('{')));
++                }
++            }
++        }
++        return out;
++    }
++
++    size_t baseline_;
+ };
+ 
+ class ClientIntegrationTest : public ::testing::Test {
+@@ -673,16 +715,18 @@ TEST_F(ClientIntegrationTest, BatchWriteTimingHasOneCompletedRecordPerCall) {
+     const std::array<const char*, 4> stages{
+         "phase1_start_batch_put_us", "phase2_submit_transfers_us",
+         "phase3_wait_transfers_us", "phase4_finalize_batch_put_us"};
++    // One flat JSON object of numbers, strings and booleans: "key":value pairs, values without commas.
+     auto parse = [](const std::string& record) {
+         std::unordered_map<std::string, std::string> fields;
+-        std::istringstream stream(record);
++        std::string body = record.substr(1, record.size() - 2);
++        std::istringstream stream(body);
+         std::string token;
+-        while (stream >> token) {
+-            auto separator = token.find('=');
+-            if (separator != std::string::npos) {
+-                fields.emplace(token.substr(0, separator),
+-                               token.substr(separator + 1));
+-            }
++        while (std::getline(stream, token, ',')) {
++            auto separator = token.find("\":");
++            if (separator == std::string::npos || token.empty() || token[0] != '"') continue;
++            std::string value = token.substr(separator + 2);
++            if (!value.empty() && value.front() == '"') value = value.substr(1, value.size() - 2);
++            fields.emplace(token.substr(1, separator - 1), value);
+         }
+         return fields;
+     };
+@@ -696,19 +740,18 @@ TEST_F(ClientIntegrationTest, BatchWriteTimingHasOneCompletedRecordPerCall) {
+         // The repeated put is successful even when its native result is
+         // OBJECT_ALREADY_EXISTS. Each invocation still owns exactly one record.
+         for (bool upsert : {false, false, true}) {
+-            BatchWriteTimingCaptureSink sink;
++            BatchWriteTimingCapture sink;
+             auto results = upsert ? test_client_->BatchUpsert(keys, slices, config)
+                                   : test_client_->BatchPut(keys, slices, config);
+             ASSERT_EQ(results.size(), 1);
+             ASSERT_TRUE(results[0]);
++            sink.Collect(1);
+             ASSERT_EQ(sink.records.size(), 1);
+             const auto& record = sink.records[0];
+-            EXPECT_EQ(record.find(upsert ? "[BatchUpsertTiming]"
+-                                         : "[BatchPutTiming]"),
+-                      0);
+             auto fields = parse(record);
+-            EXPECT_EQ(fields.at("keys"), "1");
+-            EXPECT_EQ(fields.at("bytes"), std::to_string(value.size()));
++            EXPECT_EQ(fields.at("event"), upsert ? "mc_batch_upsert" : "mc_batch_put");
++            EXPECT_EQ(fields.at("submitted_keys"), "1");
++            EXPECT_EQ(fields.at("submitted_bytes"), std::to_string(value.size()));
+             EXPECT_EQ(fields.at("status"), "ok");
+             EXPECT_EQ(fields.at("complete"), "true");
+             EXPECT_EQ(fields.at("failed_keys"), "0");
+@@ -732,7 +775,7 @@ TEST_F(ClientIntegrationTest, BatchWriteTimingHasOneCompletedRecordPerCall) {
+             return tl::unexpected(ErrorCode::INVALID_PARAMS);
+         };
+         for (bool upsert : {false, true}) {
+-            BatchWriteTimingCaptureSink sink;
++            BatchWriteTimingCapture sink;
+             auto results =
+                 upsert ? test_client_->BatchUpsert(failed_keys, slices, config,
+                                                    fail_staging)
+@@ -741,6 +784,7 @@ TEST_F(ClientIntegrationTest, BatchWriteTimingHasOneCompletedRecordPerCall) {
+             ASSERT_EQ(results.size(), 1);
+             ASSERT_FALSE(results[0]);
+             EXPECT_EQ(results[0].error(), ErrorCode::INVALID_PARAMS);
++            sink.Collect(1);
+             ASSERT_EQ(sink.records.size(), 1);
+             auto fields = parse(sink.records[0]);
+             EXPECT_EQ(fields.at("status"), "error");
+@@ -752,16 +796,17 @@ TEST_F(ClientIntegrationTest, BatchWriteTimingHasOneCompletedRecordPerCall) {
+         config.prefer_alloc_in_same_node = true;
+         config.replica_num = 2;
+         for (bool upsert : {false, true}) {
+-            BatchWriteTimingCaptureSink sink;
++            BatchWriteTimingCapture sink;
+             auto results = upsert ? test_client_->BatchUpsert(keys, slices, config)
+                                   : test_client_->BatchPut(keys, slices, config);
+             ASSERT_EQ(results.size(), 1);
+             ASSERT_FALSE(results[0]);
+             EXPECT_EQ(results[0].error(), ErrorCode::INVALID_PARAMS);
++            sink.Collect(1);
+             ASSERT_EQ(sink.records.size(), 1);
+             auto fields = parse(sink.records[0]);
+-            EXPECT_EQ(fields.at("keys"), "1");
+-            EXPECT_EQ(fields.at("bytes"), std::to_string(value.size()));
++            EXPECT_EQ(fields.at("submitted_keys"), "1");
++            EXPECT_EQ(fields.at("submitted_bytes"), std::to_string(value.size()));
+             EXPECT_EQ(fields.at("status"), "error");
+             EXPECT_EQ(fields.at("complete"), "false");
+             EXPECT_EQ(fields.at("timing_scope"), "prefer_same_node_not_started");

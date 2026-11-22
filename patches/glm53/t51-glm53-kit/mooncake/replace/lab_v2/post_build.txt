@@ -1,0 +1,76 @@
+=== 13:20:09 compile commands
+610971 /out/repl58/build/compile_commands.json
+ninja: no work to do.
+=== 13:20:10 parsing table
+PD_DIAG_LEVEL=(unset) -> level 3 source default ok
+PD_DIAG_LEVEL=''      -> level 3 source default ok
+PD_DIAG_LEVEL='3'     -> level 3 source env     ok
+PD_DIAG_LEVEL='2'     -> level 2 source env     ok
+PD_DIAG_LEVEL='1'     -> level 1 source env     ok
+PD_DIAG_LEVEL='0'     -> level 3 source invalid ok
+PD_DIAG_LEVEL='4'     -> level 3 source invalid ok
+PD_DIAG_LEVEL='abc'   -> level 3 source invalid ok
+PD_DIAG_LEVEL=' 2 '   -> level 3 source invalid ok
+PD_DIAG_LEVEL='2x'    -> level 3 source invalid ok
+MC_PD_TIMING=(unset) -> on ok
+MC_PD_TIMING=''    -> on ok
+MC_PD_TIMING='1'   -> on ok
+MC_PD_TIMING='0'   -> off ok
+MC_PD_TIMING='no'  -> on ok
+RESULT: OK
+=== 13:20:10 class layout of mooncake::Client: original 78566d45 header vs 04b header
+orig: Class mooncake::Client    size=1728 align=8    base size=1721 base align=8 
+v2: Class mooncake::Client    size=1728 align=8    base size=1721 base align=8 
+class layout of mooncake::Client: identical (7 lines, compiler addresses masked)
+=== 13:20:52 small test library (ROTATE_BYTES=20000, KEEP 20 s, CLEAN 3 s, STATS 2 s, SLOTS 4)
+413150352 /out/post/libmooncake_store_small.so
+small relinked: 15402392
+=== 13:21:30 sym_check against the layout (current = unpatched check build)
+exports current=10974 replacement=10977 removed=0 added=3
+  added   _ZN8mooncake6Client14CollectResultsERKSt6vectorINS_12PutOperationESaIS2_EERm
+  added   _ZN8mooncake6Client28BatchWriteWhenPreferSameNodeERSt6vectorINS_12PutOperationESaIS2_EEbNSt6chrono10time_pointINS6_3_V212steady_clockENS6_8durationIlSt5ratioILl1ELl1000000000EEEEEESE_
+  added   _ZNK8mooncake6Client19LogBatchWriteTimingEmbmmNSt6chrono10time_pointINS1_3_V212steady_clockENS1_8durationIlSt5ratioILl1ELl1000000000EEEEEES9_S9_S9_S9_S9_PKc
+importer store.cpython-311-aarch64-linux-gnu.so: takes 46 names the current library exports, missing in replacement: 0
+imports current=713 replacement=725 new=12 gone=0
+  new import __isoc23_sscanf weak=0 by_layout=-(system lib)
+  new import __register_atfork weak=0 by_layout=-(system lib)
+  new import calloc weak=0 by_layout=-(system lib)
+  new import mkdir weak=0 by_layout=-(system lib)
+  new import pthread_cond_init weak=0 by_layout=-(system lib)
+  new import pthread_cond_signal weak=0 by_layout=-(system lib)
+  new import pthread_cond_timedwait weak=0 by_layout=-(system lib)
+  new import pthread_create weak=0 by_layout=-(system lib)
+  new import pthread_detach weak=0 by_layout=-(system lib)
+  new import pthread_mutex_init weak=0 by_layout=-(system lib)
+  new import strftime weak=0 by_layout=-(system lib)
+  new import strrchr weak=0 by_layout=-(system lib)
+needed same
+soname same
+runpath same
+result ok
+=== 13:21:30 exports v1 vs v2
+v1 exports 11414 v2 exports 11414 only v1 0 only v2 0
+=== 13:21:30 NEEDED / RUNPATH / SONAME of v2
+libzstd-2a4af8ca.so.1.5.5,libtransfer_engine.so,libxxhash-0bb4316f.so.0.8.2,libnuma.so.1,libascendcl.so,libmooncake_common.so,libyaml-cpp-f6e0e2ab.so.0.7.0,libasio.so,libibverbs.so.1,libgflags-0650a09e.so.2.2.2,libjsoncpp-598fe3ba.so.1.9.5,ascend_transport.so,libglog-afa88425.so.0.6.0,libstdc++.so.6,libm.so.6,libgcc_s.so.1,libc.so.6
+$ORIGIN
+libmooncake_store.so
+=== 13:21:30 original-signature test (records in files)
+check complete record with phase1/total             ok
+RESULT: OK
+fork exit: 0
+T58FORK child=492 wrote=3
+T58FORK parent=457 child=492 child_exit=0 parent_wrote=55
+fork: parent 457 files 1 records 55; child 492 files 1 records 3 (exit 0)
+check fork (child: own file, 3 records; parent: 55 records, no hang): ok
+burst binary loads: /out/oldsig58/small/libmooncake_store.so
+burst exit: 0
+T58BURST records=20000
+burst: files 99, records in files 4586, stats records 2, last stats written=4586 dropped=15414 queue_max=4
+check full ring drops and counts (written = records in files, written + dropped = 20000, queue_max <= 4): ok
+=== 13:22:01 client_integration_test compiles (04b capture by files)
+rc=0 [3/3] Linking CXX executable mooncake-store/tests/client_integration_test
+=== 13:23:01 client_integration_test: the batch-write timing test (records read back from the files)
+rc=0
+[       OK ] ClientIntegrationTest.BatchWriteTimingHasOneCompletedRecordPerCall (273 ms)
+[  PASSED  ] 1 test.
+=== 13:23:07 done

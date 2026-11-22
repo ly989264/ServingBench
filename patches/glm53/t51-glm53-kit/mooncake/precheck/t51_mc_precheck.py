@@ -63,7 +63,7 @@ import struct
 import sysconfig
 import time
 
-TOOL = "glm53mc-5"
+TOOL = "glm53mc-6"
 DATA_B64 = None  # filled in by build_precheck.py
 REQUIRED_FLAGS = (("-I", "isolated"), ("-S", "no_site"), ("-B", "dont_write_bytecode"))
 MAX_TABLE = 96 * 1024 * 1024
@@ -367,7 +367,12 @@ def main():
     size, s16 = os.path.getsize(store), sha16(store)
     exp_f1 = data["site_f1"]
     same_f1 = size == exp_f1["size"] and s16 == exp_f1["sha16"]
-    if not same_f1:
+    # glm53mc-6: the loaded library may be the earlier replacement (v1) instead of the site's original: the upgrade
+    # v1 -> v2. The original's checks (build identity, export families) were done before v1 went in; here only the
+    # exports against v2, the consumers and v2's imports are checked, and the result is ok_upgrade.
+    uf = data.get("upgrade_from") or {}
+    is_v1 = bool(uf) and size == uf.get("size") and s16 == uf.get("sha16")
+    if not same_f1 and not is_v1:
         stop.append("STOP_changed")
     roots = [pkg] + [os.path.join(site_dir, d) for d in sorted(os.listdir(site_dir))
                      if d.startswith("mooncake") and d.endswith(".libs")]
@@ -387,7 +392,7 @@ def main():
     if second:
         stop.append("STOP_second_copy")
     say("mc_orig size=%d sha16=%s f1=%s soname=%s path=%s needed=%d tls=%d(lab %d) so_files=%d second_store=%s"
-        % (size, s16, "same" if same_f1 else "DIFFERS", st["soname"], st["path"], len(st["needed"]), st["tls"],
+        % (size, s16, "same" if same_f1 else ("replacement_%s" % uf.get("label", "v1") if is_v1 else "DIFFERS"), st["soname"], st["path"], len(st["needed"]), st["tls"],
            data["lab_tls"], len(files), ",".join(sorted({rel(p, site_dir) for p in second})) or "none"))
     lab_pb = [tuple(r) for r in data["lab_progbits"]]
     s_by = {r[3]: tuple(r[:3]) for r in st["progbits"]}
@@ -406,7 +411,9 @@ def main():
     p_pad8, p_align16 = rodata_predict(pairs, lp["rels"], lp["L"], data["rodata_end16"])
     predicted = p_pad8 + p_align16
     same_rels = sorted(rel for _, rel in pairs) == sorted(lp["rels"])
-    if not prefixes:
+    if is_v1:
+        verdict = "skipped_upgrade"
+    elif not prefixes:
         stop.append("STOP_model_inapplicable")
         verdict = "model_inapplicable"
     elif other or n_site != lp["N"] or not same_rels or len(set(prefixes)) != 1 or diff != predicted:
@@ -417,7 +424,9 @@ def main():
     # diagnostics only (no part of the verdict): where a difference is. The path strings sit in 8-byte slots, so a
     # difference that comes from the build path alone is also a multiple of 8; div4/div8 cannot tell it from code.
     hint = ""
-    if other:
+    if is_v1:   # not judged: the loaded library is v1, which is not the lab check build
+        pass
+    elif other:
         hint = " hint=codegen(sections_other)"
     elif verdict == "differs" and (len(set(prefixes)) != 1 or n_site != lp["N"] or not same_rels):
         hint = " hint=paths"
@@ -437,14 +446,21 @@ def main():
     site_b, site_names = buckets(st["exp"])
     lab_b, lab_names = buckets(lab)
     diff_f = [f for f in FAMILIES if site_b[f] != lab_b[f]]
+    if is_v1:   # the loaded library is v1, which differs from the lab check build by patch 04's 3 names only
+        diff_f = []
     removed_vs_site = st["exp"] - repl
     added_vs_site = repl - st["exp"]
-    delta_ok = not removed_vs_site and added_vs_site == set(data["patch_added"]) and len(added_vs_site) == data["expected_added_count"]
+    if is_v1:   # upgrade: v2 exports exactly what the loaded v1 exports
+        delta_ok = not removed_vs_site and not added_vs_site
+        want_added = 0
+    else:
+        delta_ok = not removed_vs_site and added_vs_site == set(data["patch_added"]) and len(added_vs_site) == data["expected_added_count"]
+        want_added = data["expected_added_count"]
     if not delta_ok:
         stop.append("STOP_export_delta")
     say("mc_exports site=%d/%s lab=%d/%s replacement=%d differing_families=%s replacement_vs_site=-%d/+%d(expected -0/+%d)%s"
         % (len(st["exp"]), hset(st["exp"]), len(lab), hset(lab), len(repl), ",".join(diff_f) or "none",
-           len(removed_vs_site), len(added_vs_site), data["expected_added_count"], "" if delta_ok else " DIFFERS"))
+           len(removed_vs_site), len(added_vs_site), want_added, "" if delta_ok else " DIFFERS"))
     fam = ["%s=%d/%s%s" % (f, site_b[f][0], site_b[f][1][:8], "" if f not in diff_f else "!lab=%d/%s" % (lab_b[f][0], lab_b[f][1][:8]))
            for f in FAMILIES]
     say("mc_fam " + " ".join(fam[:7]))
@@ -592,7 +608,7 @@ def main():
         fams = [f for f in FAMILIES if sb[f] != lb[f]]
         sib.append("%s=%d/%s!lab=%d(%s)" % (name, len(info["exp"]), hset(info["exp"])[:8], len(lab_s), "+".join(fams)))
     say("mc_sib " + " ".join(sib))
-    say("mc_pre result=%s" % ("ok_replace" if not stop else ",".join(stop)))
+    say("mc_pre result=%s" % (("ok_upgrade" if is_v1 else "ok_replace") if not stop else ",".join(stop)))
     out = lines[:-1][:19] + [lines[-1]]
     print("\n".join(out + extra))
     return 0 if not stop else 2

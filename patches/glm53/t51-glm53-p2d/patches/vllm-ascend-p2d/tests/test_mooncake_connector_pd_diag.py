@@ -77,7 +77,8 @@ def pd_records(request):
         if dump:
             with open(dump, "a") as out:
                 for record in handler.records:
-                    out.write(json.dumps({"scenario": request.node.name, "record": record}) + "\n")
+                    out.write(json.dumps({"scenario": request.node.name, "fake_clock": "clock" in request.fixturenames,
+                                          "record": record}) + "\n")
 
 
 class MockVllmConfig:
@@ -1174,3 +1175,515 @@ def test_failed_read_ends_the_request_with_error_under_policy_fail(pd_records, r
         assert request.status == RequestStatus.FINISHED_ERROR
         assert request.get_finished_reason() == FinishReason.ERROR
         assert request not in stub.skipped_waiting and stub._free_request.call_count == 1
+
+
+# 10. T56: the KV-load envelope (request_generation.kv_load_envelope_ns, task.request_done_ns) and the per-task
+#     maxima of the three receive stages (request_generation.task_max_*). The envelope runs from the earliest
+#     queued_ns of the request's tasks to the moment the task tracker marked the request done (right after
+#     update_done_task_count), which is before the done signal to P; the maxima are merged under the same lock
+#     as the task counts.
+
+ENVELOPE_SCOPE = "first_task_queued_to_request_marked_done"
+MAX_FIELDS = (
+    ("task_max_queue_wait_ns", None),
+    ("task_max_meta_fetch_ns", "meta_fetch"),
+    ("task_max_prepare_ns", "prepare"),
+)
+
+
+def check_envelope(tasks, summary):
+    """The relations that hold for every request (contract 1.4.0): exact recomputation from the task records,
+    lower bounds by the native-read envelope and by each task's own stages, upper bound by the last end_ns."""
+    first_queued = min(t["queued_ns"] for t in tasks)
+    done = [t for t in tasks if t["request_done_ns"] is not None]
+    assert len(done) == 1 and done[0]["tracker_completed"] is True
+    assert all("request_done_ns" in t for t in tasks)  # null on the other tasks, the key is kept
+    envelope = summary["kv_load_envelope_ns"]
+    assert envelope == done[0]["request_done_ns"] - first_queued
+    assert summary["kv_load_timing_scope"] == ENVELOPE_SCOPE
+    if summary["transfer_envelope_ns"] is not None:
+        assert envelope >= summary["transfer_envelope_ns"]
+    for t in tasks:
+        stages = t["associated_stages"]
+        own = t["queue_wait_ns"] + sum((stages.get(name) or {}).get("duration_ns") or 0 for name in ("meta_fetch", "prepare"))
+        own += t["stages"]["wait_for_transfer"]["duration_ns"] or 0
+        assert envelope >= own
+    assert envelope <= max(t["end_ns"] for t in tasks) - first_queued
+    assert summary["task_max_queue_wait_ns"] == max(t["queue_wait_ns"] for t in tasks)
+    for key, stage in MAX_FIELDS[1:]:
+        values = [t["associated_stages"][stage]["duration_ns"] for t in tasks if stage in t["associated_stages"]]
+        assert summary[key] == (max(values) if values else None)
+    for key, _ in MAX_FIELDS:
+        assert summary[key] is None or summary[key] <= envelope
+    assert "first_queued_ns" not in summary and "request_done_ns" not in summary  # raw moments stay internal
+    return envelope
+
+
+def queue_direct(receiver, clock, ports, gaps_ns, request_id="decode-a", last=True):
+    """Queue one task per port with add_request, advancing the clock by gaps_ns[i] before task i."""
+    for port in ports:
+        seed_peer(receiver, port)
+    receiver.task_tracker.add_req_to_process(request_id)
+    for i, (port, gap) in enumerate(zip(ports, gaps_ns)):
+        clock.advance(gap)
+        receiver.add_request(
+            request_id=request_id,
+            remote_request_id="prefill-a",
+            local_block_ids=([1],),
+            remote_block_ids=([3],),
+            group_pulls=[GroupPull(group_id=0, remote_tp_offset=i, num_group_pulls=1)],
+            remote_engine_id=REMOTE_ENGINE,
+            remote_host=REMOTE_HOST,
+            remote_handshake_port=port,
+            all_task_done=last and i == len(ports) - 1,
+            pd_execution_id="execution-run-1-56",
+            pd_offset=i,
+        )
+
+
+def run_direct(clock, durations, gaps_ns, before_ns, order=None, returns=None, raises=None, done_ns=DONE_NS):
+    engine = ClockEngine(clock, durations, returns, raises)
+    receiver = make_receiver(engine=engine)
+    receiver._send_done_recv_signal = lambda *args: clock.advance(done_ns)
+    t0 = clock.now
+    try:
+        queue_direct(receiver, clock, list(durations), gaps_ns)
+        items = drain(receiver)
+        for item in items:  # the counting _submit_request does, so the last task to finish completes the request
+            receiver._mark_request_task_submitted(item)
+        clock.advance(before_ns)
+        for i in order or range(len(items)):
+            receiver._handle_request(items[i])
+            clock.advance(GAP_NS)
+    finally:
+        receiver.executor.shutdown(wait=True)
+    return receiver, t0
+
+
+def test_t56_envelope_runs_from_first_queued_to_request_marked_done(pd_records, clock):
+    receiver, t0 = run_direct(clock, {30000: 1000, 30001: 2000}, gaps_ns=[0, 300], before_ns=1000)
+    first, second = pd_records.of("task")
+    (summary,) = pd_records.of("request_generation")
+    # first: queued t0, starts t0+1300, READ to t0+2300, done signal, gap; second: queued t0+300, starts
+    # t0+2810, READ to t0+4810, marked done there, then its done signal.
+    assert (first["queue_wait_ns"], second["queue_wait_ns"]) == (1300, 2510)
+    assert first["request_done_ns"] is None and second["request_done_ns"] == t0 + 4810
+    assert check_envelope([first, second], summary) == 4810
+    assert summary["transfer_envelope_ns"] == 3510
+    assert (summary["task_max_queue_wait_ns"], summary["task_max_meta_fetch_ns"], summary["task_max_prepare_ns"]) == (2510, 0, 0)
+    assert second["end_ns"] - t0 == 4810 + DONE_NS
+    assert receiver.task_tracker.get_and_clear_finished_requests() == {"decode-a"}
+
+
+def test_t56_envelope_when_the_tasks_finish_in_reverse_order(pd_records, clock):
+    _, t0 = run_direct(clock, {30000: 1000, 30001: 2000}, gaps_ns=[0, 300], before_ns=1000, order=[1, 0])
+    tasks = pd_records.of("task")
+    (summary,) = pd_records.of("request_generation")
+    by_port = {port_of(t): t for t in tasks}
+    # The second-queued task is handled first; the first-queued one completes the request.
+    assert by_port[30001]["request_done_ns"] is None
+    assert by_port[30000]["request_done_ns"] == t0 + 1300 + 2000 + DONE_NS + GAP_NS + 1000
+    assert check_envelope(tasks, summary) == 4810  # still from the earliest queued_ns
+    assert summary["task_max_queue_wait_ns"] == by_port[30000]["queue_wait_ns"] == 3810
+
+
+def test_t56_slow_done_signal_is_outside_the_envelope(pd_records, clock):
+    run_direct(clock, {30000: 1000}, gaps_ns=[0], before_ns=0, done_ns=50_000)
+    (task,) = pd_records.of("task")
+    (summary,) = pd_records.of("request_generation")
+    assert check_envelope([task], summary) == 1000
+    assert task["processing_duration_ns"] == 1000 + 50_000  # the ACK wait is in the task, not in the envelope
+    assert task["end_ns"] - task["request_done_ns"] == 50_000
+
+
+def test_t56_reformat_is_inside_the_envelope(pd_records, clock):
+    engine = ClockEngine(clock, {30000: 1000, 30001: 2000})
+    receiver = make_receiver(engine=engine)
+    receiver._send_done_recv_signal = lambda *args: clock.advance(DONE_NS)
+    receiver._apply_kv_cache_reformat = lambda *args, **kwargs: clock.advance(700)
+    try:
+        worker = make_worker(receiver, [30000, 30001])
+        worker._get_group_pulls_metadata.return_value = [
+            [[GroupPull(group_id=0, remote_tp_offset=k, num_group_pulls=1, is_group_transfer_end=True)] for k in range(2)]
+        ]
+        worker.start_load_kv(scheduled_metadata(make_scheduler(), "execution-run-1-57", [("decode-a", "prefill-a")]))
+        receiver.task_tracker.add_req_to_process("decode-a")
+        for item in drain(receiver):
+            receiver._handle_request(item)
+            clock.advance(GAP_NS)
+    finally:
+        receiver.executor.shutdown(wait=True)
+    first, last = pd_records.of("task")
+    (summary,) = pd_records.of("request_generation")
+    reformat = last["associated_stages"]["reformat"]
+    assert reformat["status"] == "ok" and reformat["duration_ns"] >= 700
+    assert reformat["end_ns"] <= last["request_done_ns"]  # marked done after the reformat
+    assert check_envelope([first, last], summary) == 1000 + DONE_NS + GAP_NS + 2000 + reformat["duration_ns"]
+
+
+def test_t56_failed_read_and_skipped_tasks_still_get_an_envelope(pd_records, clock):
+    receiver, _ = run_sequential(clock, [[30000, 30001, 30002]], {30000: 1000, 30001: 2000, 30002: 3000}, returns={30001: -1})
+    tasks = pd_records.of("task")
+    (summary,) = pd_records.of("request_generation")
+    assert [t["status"] for t in tasks] == ["succeeded", "failed", "skipped"]
+    assert summary["status"] == "failed" and summary["transfer_envelope_ns"] == 3510
+    # The skipped third task completes the request: marked done at its start (t0 + 4020).
+    assert tasks[2]["request_done_ns"] is not None
+    assert check_envelope(tasks, summary) == 4020
+    assert summary["task_max_prepare_ns"] == 0 and "prepare" not in tasks[2]["associated_stages"]
+    assert receiver.get_and_clear_invalid_block_ids() == {1}
+
+
+def test_t56_read_exception_on_the_last_task_still_gets_an_envelope(pd_records, clock):
+    run_sequential(clock, [[30000, 30001]], {30000: 1000, 30001: 2000}, raises={30001: OSError("reset")})
+    tasks = pd_records.of("task")
+    (summary,) = pd_records.of("request_generation")
+    assert [t["status"] for t in tasks] == ["succeeded", "failed"] and summary["status"] == "failed"
+    assert check_envelope(tasks, summary) == 1000 + DONE_NS + GAP_NS + 2000
+
+
+def test_t56_full_prefix_hit_has_an_envelope_without_stages(pd_records, clock):
+    engine = ClockEngine(clock, {30000: 1000})
+    receiver = make_receiver(engine=engine)
+    receiver._send_done_recv_signal = lambda *args: clock.advance(DONE_NS)
+    try:
+        worker = make_worker(receiver, [30000])
+        worker._get_kv_split_metadata.return_value = ([[30000]], [([],)], [([3, 4],)])
+        worker.start_load_kv(scheduled_metadata(make_scheduler(), "execution-run-1-58", [("decode-a", "prefill-a")]))
+        receiver.task_tracker.add_req_to_process("decode-a")
+        clock.advance(400)
+        for item in drain(receiver):
+            receiver._handle_request(item)
+    finally:
+        receiver.executor.shutdown(wait=True)
+    (task,) = pd_records.of("task")
+    (summary,) = pd_records.of("request_generation")
+    assert task["status"] == "skipped" and summary["transfer_envelope_ns"] is None and engine.calls == []
+    assert check_envelope([task], summary) == 400
+    assert (summary["task_max_queue_wait_ns"], summary["task_max_meta_fetch_ns"], summary["task_max_prepare_ns"]) == (400, None, None)
+
+
+def test_t56_without_the_final_task_there_is_no_envelope(pd_records, clock):
+    engine = ClockEngine(clock, {30000: 1000})
+    receiver = make_receiver(engine=engine)
+    try:
+        queue_direct(receiver, clock, [30000], [0], last=False)
+        for item in drain(receiver):
+            receiver._handle_request(item)
+    finally:
+        receiver.executor.shutdown(wait=True)
+    (task,) = pd_records.of("task")
+    assert task["tracker_completed"] is False and task["request_done_ns"] is None
+    assert pd_records.of("request_generation") == []
+    assert receiver.task_tracker.get_and_clear_finished_requests() == set()
+
+
+class _BrokenDiag(dict):
+    def __setitem__(self, key, value):
+        if key == "request_done_ns":
+            raise RuntimeError("diagnostics broken")
+        super().__setitem__(key, value)
+
+
+def test_t56_marking_the_request_done_never_breaks_the_transfer(pd_records):
+    assert MODULE._pd_mark_request_done({}) is None
+    assert MODULE._pd_mark_request_done({"_pd_diag": _BrokenDiag(x=1)}) is None
+    receiver = make_receiver(engine=TimedEngine())
+    try:
+        make_worker(receiver, [30000]).start_load_kv(
+            scheduled_metadata(make_scheduler(), "execution-run-1-59", [("decode-a", "prefill-a")])
+        )
+        receiver.task_tracker.add_req_to_process("decode-a")
+        (item,) = drain(receiver)
+        item["_pd_diag"] = _BrokenDiag(item["_pd_diag"])
+        receiver._handle_request(item)
+    finally:
+        receiver.executor.shutdown(wait=True)
+    # The tracker, the queue and the done signal behave as without diagnostics; only the envelope is missing.
+    assert receiver.task_tracker.get_and_clear_finished_requests() == {"decode-a"}
+    assert receiver._send_done_recv_signal.call_count == 1
+    (task,) = pd_records.of("task")
+    (summary,) = pd_records.of("request_generation")
+    assert task["status"] == "succeeded" and task["request_done_ns"] is None
+    assert summary["kv_load_envelope_ns"] is None and summary["kv_load_timing_scope"] == ENVELOPE_SCOPE
+
+
+def test_t56_maxima_take_meta_fetch_alone_and_each_tasks_prepare(pd_records, clock, monkeypatch):
+    # Port 30000's metadata is fetched (one 0.1 s ZMQ retry wait inside metadata_request, which lies inside
+    # meta_fetch); port 30001 is cached. Building the read list is made slower on the second task.
+    engine = ClockEngine(clock, {30000: 1000, 30001: 2000})
+    receiver = make_receiver(engine=engine)
+    receiver._send_done_recv_signal = lambda *args: clock.advance(DONE_NS)
+    sock = MagicMock()
+    sock.send.side_effect = [zmq.ZMQError(), None]
+    sock.recv.return_value = msgspec.msgpack.encode(_peer_metadata(receiver))
+    per_call_ns = [300, 900]  # each call of the block grouping inside "build the read list" costs this, per task
+    state = {"ns": 0, "calls": 0}
+    original = MODULE.group_concurrent_contiguous
+
+    def slow_grouping(*args, **kwargs):
+        clock.advance(state["ns"])
+        state["calls"] += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(MODULE, "group_concurrent_contiguous", slow_grouping)
+    try:
+        make_worker(receiver, [30000, 30001]).start_load_kv(
+            scheduled_metadata(make_scheduler(), "execution-run-1-60", [("decode-a", "prefill-a")])
+        )
+        receiver.task_tracker.add_req_to_process("decode-a")
+        _uncached_peer(receiver, sock)
+        calls = []
+        with patch.object(MODULE.logger, "warning"):
+            for item, ns in zip(drain(receiver), per_call_ns):
+                state.update(ns=ns, calls=0)
+                receiver._handle_request(item)
+                calls.append(state["calls"])
+                clock.advance(GAP_NS)
+    finally:
+        receiver.executor.shutdown(wait=True)
+    assert calls[0] == calls[1] > 0
+    first, second = pd_records.of("task")
+    (summary,) = pd_records.of("request_generation")
+    assert first["associated_stages"]["metadata_request"]["duration_ns"] == 100_000_000
+    assert first["associated_stages"]["meta_fetch"]["duration_ns"] == 100_000_000  # contains metadata_request
+    assert summary["task_max_meta_fetch_ns"] == 100_000_000  # not meta_fetch + metadata_request
+    assert [t["associated_stages"]["prepare"]["duration_ns"] for t in (first, second)] == [300 * calls[0], 900 * calls[1]]
+    assert summary["task_max_prepare_ns"] == 900 * calls[1]
+    check_envelope([first, second], summary)
+
+
+# 11. Multi-peer walk with real threads: 16 P ports handled in parallel by the 32-thread executor, done signals
+#     acknowledged over real ZMQ on the loopback, and a second request queued behind the first on every port.
+
+WALK_PORTS = list(range(45000, 45016))
+ACK_DELAY_S = {port: 0.005 for port in WALK_PORTS} | {45003: 0.02}
+
+
+def _ack_port(context, port, stop, ready):
+    """P's side channel for one port: answer every done signal with ACK after ACK_DELAY_S[port]."""
+    sock = context.socket(zmq.REP)
+    try:
+        sock.bind(f"tcp://127.0.0.1:{port}")
+        ready.release()
+        while not stop.is_set():
+            if sock.poll(50):
+                sock.recv()
+                time.sleep(ACK_DELAY_S[port])
+                sock.send(b"ACK")
+    finally:
+        sock.close(linger=0)
+
+
+def _walk(pd_records):
+    """Run the walk; return the request summaries and the task records by request id."""
+    durations = {port: 0.01 + 0.002 * (i % 5) for i, port in enumerate(WALK_PORTS)}
+    engine = TimedEngine(durations_s=durations)
+    receiver = make_receiver(engine=engine)
+    del receiver._send_done_recv_signal  # the real done signal, over ZMQ to the ACK server
+    stop, ready, context = threading.Event(), threading.Semaphore(0), zmq.Context()
+    servers = [threading.Thread(target=_ack_port, args=(context, port, stop, ready), daemon=True) for port in WALK_PORTS]
+    for server in servers:
+        server.start()
+    for _ in servers:
+        assert ready.acquire(timeout=5)
+    try:
+        worker = make_worker(receiver, WALK_PORTS)
+        worker._get_remote_host_info_by_port = lambda remote_port, port, host, engine_id, mapping: ("127.0.0.1", engine_id)
+        scheduler = make_scheduler()
+        for request_id, execution_id in (("decode-a", "execution-run-1-61"), ("decode-b", "execution-run-1-62")):
+            worker.start_load_kv(scheduled_metadata(scheduler, execution_id, [(request_id, "prefill-" + request_id)]))
+        for item in drain(receiver):  # all 32 tasks reach the executor before any is handled
+            receiver._submit_request(item)
+        deadline = time.monotonic() + 20
+        while len(pd_records.of("request_generation")) < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+    finally:
+        stop.set()
+        for server in servers:
+            server.join(timeout=5)
+        receiver.executor.shutdown(wait=True)
+        context.term()
+    summaries = {s["request_id"]: s for s in pd_records.of("request_generation")}
+    tasks = {rid: [t for t in pd_records.of("task") if t["request_id"] == rid] for rid in ("decode-a", "decode-b")}
+    return summaries, tasks
+
+
+def test_t56_walk_16_peers_in_parallel_with_real_done_acks(pd_records):
+    summaries, tasks = _walk(pd_records)
+    assert set(summaries) == {"decode-a", "decode-b"}
+    for rid in ("decode-a", "decode-b"):
+        assert len(tasks[rid]) == 16 and summaries[rid]["succeeded_tasks"] == 16
+        envelope = check_envelope(tasks[rid], summaries[rid])
+        reads = [t["stages"]["wait_for_transfer"]["duration_ns"] for t in tasks[rid]]
+        assert envelope >= max(reads) and envelope < sum(reads)  # parallel peers: at least the slowest, less than serial
+        done_task = next(t for t in tasks[rid] if t["request_done_ns"] is not None)
+        assert done_task["end_ns"] - done_task["request_done_ns"] >= 0.005e9  # the ACK wait is after the envelope
+    # One handler per peer: on every port, b's task starts only after a's task (with its ACK) ended.
+    a_by_port = {t["native_calls"][0]["session_id"]: t for t in tasks["decode-a"]}
+    for t in tasks["decode-b"]:
+        before = a_by_port[t["native_calls"][0]["session_id"]]
+        assert t["start_ns"] >= before["end_ns"]
+        assert t["queue_wait_ns"] >= before["processing_duration_ns"]
+    assert summaries["decode-b"]["task_max_queue_wait_ns"] > summaries["decode-a"]["task_max_queue_wait_ns"]
+
+
+# 12. Diagnostics level (T58): the level comes from pd_diagnostics.diag_level(), read once when the receiving thread
+#     is created; anything but 1, 2 or 3, or no such function (an older vLLM patch), is 3. Level 1 leaves out the
+#     four request-level fields below, and does not merge them; levels 2 and 3 write what T56 writes. Task and link
+#     records are the same at every level.
+
+LEVEL2_FIELDS = ("task_max_queue_wait_ns", "task_max_meta_fetch_ns", "task_max_prepare_ns", "transfer_envelope_ns")
+# Differ between two runs in one process: ids, and values from the real wall and perf_counter clocks (the fake
+# clock only replaces time.monotonic_ns).
+PER_RUN = {"timestamp_ns", "record_id", "native_tid", "transfer_scope_duration_ns", "wall_utc_offset_seconds"}
+PER_RUN_IDS = ("connector_id", "task_id", "request_generation", "call_id")
+
+
+def set_level(monkeypatch, level):
+    """level None: pd_diagnostics without diag_level (an older vLLM patch)."""
+    if level is None:
+        monkeypatch.delattr(diag, "diag_level", raising=False)
+    else:
+        monkeypatch.setattr(diag, "diag_level", lambda: level, raising=False)
+
+
+def normalised(records):
+    """The records of one run, ids replaced by their order of appearance, wall-clock and per-run fields left out."""
+    seen: dict[str, str] = {}
+
+    def norm(value, key=""):
+        if isinstance(value, dict):
+            return {k: norm(v, k) for k, v in value.items() if k not in PER_RUN and not k.endswith("_wall_ns")}
+        if isinstance(value, list):
+            return [norm(v) for v in value]
+        if key in PER_RUN_IDS and isinstance(value, str):
+            return seen.setdefault(value, f"{key}#{len(seen)}")
+        return value
+
+    return [norm(r) for r in records]
+
+
+def _two_tasks(clock):
+    run_direct(clock, {30000: 1000, 30001: 2000}, gaps_ns=[0, 300], before_ns=1000)
+
+
+def _shards(clock):
+    run_sequential(clock, [[30000, 30001], [30002]], {30000: 1000, 30001: 3000, 30002: 2000})
+
+
+def _failed_read(clock):
+    run_sequential(clock, [[30000, 30001]], {30000: 1000, 30001: 2000}, returns={30000: -1})
+
+
+def _reverse_order(clock):
+    run_direct(clock, {30000: 1000, 30001: 2000}, gaps_ns=[0, 300], before_ns=1000, order=[1, 0])
+
+
+SCENARIOS = [_two_tasks, _shards, _failed_read, _reverse_order]
+
+
+def records_at(level, scenario, pd_records, clock, monkeypatch):
+    set_level(monkeypatch, level)
+    clock.now = 1_000_000
+    pd_records.records.clear()
+    scenario(clock)
+    return list(pd_records.records)
+
+
+@pytest.mark.parametrize("value, level", [
+    (None, 3), (3, 3), (2, 2), (1, 1), (0, 3), (4, 3), ("2", 3), (" 2 ", 3), (True, 3), (2.0, 3), ("abc", 3),
+])
+def test_t58_level_is_1_2_or_3_and_anything_else_is_3(monkeypatch, value, level):
+    set_level(monkeypatch, value)
+    if value is None:
+        assert not hasattr(diag, "diag_level")
+    assert MODULE._pd_diag_level() == level
+    receiver = make_receiver()
+    try:
+        assert receiver.pd_diag_level == level
+    finally:
+        receiver.executor.shutdown(wait=True)
+
+
+def test_t58_an_error_in_diag_level_is_level_3(monkeypatch):
+    monkeypatch.setattr(diag, "diag_level", MagicMock(side_effect=RuntimeError("broken")), raising=False)
+    assert MODULE._pd_diag_level() == 3
+
+
+def test_t58_level_is_read_once_per_receiving_thread(pd_records, clock, monkeypatch):
+    calls = []
+    monkeypatch.setattr(diag, "diag_level", lambda: calls.append(1) or 2, raising=False)
+    receiver, _ = run_direct(clock, {30000: 1000, 30001: 2000}, gaps_ns=[0, 300], before_ns=1000)
+    assert len(calls) == 1 and receiver.pd_diag_level == 2
+    assert len(pd_records.of("task")) == 2 and len(pd_records.of("request_generation")) == 1
+
+
+@pytest.mark.parametrize("scenario", SCENARIOS, ids=lambda f: f.__name__.strip("_"))
+def test_t58_levels_2_and_3_write_exactly_what_no_level_writes(pd_records, clock, monkeypatch, scenario):
+    base = records_at(None, scenario, pd_records, clock, monkeypatch)
+    assert base and any(r["scope"] == "request_generation" for r in base)
+    for level in (3, 2):
+        got = records_at(level, scenario, pd_records, clock, monkeypatch)
+        assert normalised(got) == normalised(base), level
+        assert [list(r) for r in got] == [list(r) for r in base], level  # same fields, same order
+
+
+@pytest.mark.parametrize("scenario", SCENARIOS, ids=lambda f: f.__name__.strip("_"))
+def test_t58_level_1_leaves_out_exactly_the_four_request_fields(pd_records, clock, monkeypatch, scenario):
+    base = normalised(records_at(3, scenario, pd_records, clock, monkeypatch))
+    assert base and any(r["scope"] == "request_generation" for r in base)
+    raw = records_at(1, scenario, pd_records, clock, monkeypatch)
+    got = normalised(raw)
+    assert len(got) == len(base)
+    for want, have, record in zip(base, got, raw):
+        if want["scope"] == "request_generation":
+            assert set(LEVEL2_FIELDS) <= set(want) and not set(LEVEL2_FIELDS) & set(record)
+            assert have == {key: value for key, value in want.items() if key not in LEVEL2_FIELDS}
+            assert [k for k in record if k not in PER_RUN] == [k for k in want if k not in LEVEL2_FIELDS]  # order kept
+            assert have["kv_load_envelope_ns"] == want["kv_load_envelope_ns"]
+        else:
+            assert have == want  # task and link records: the same at every level
+
+
+def test_t58_level_1_does_not_merge_the_request_maxima_or_transfer_envelope(clock, monkeypatch):
+    for level, merged in ((1, False), (3, True)):
+        set_level(monkeypatch, level)
+        engine = ClockEngine(clock, {30000: 1000, 30001: 2000})
+        receiver = make_receiver(engine=engine)
+        receiver._send_done_recv_signal = lambda *args: clock.advance(DONE_NS)
+        try:
+            queue_direct(receiver, clock, [30000, 30001], [0, 300])
+            items = drain(receiver)
+            for item in items:
+                receiver._mark_request_task_submitted(item)
+            receiver._handle_request(items[0])  # the request is still open: one task left
+            summary = receiver.pd_request_tasks["decode-a"]
+            maxima = [summary[key] for key in LEVEL2_FIELDS[:3]]
+            envelope = (summary["transfer_start_ns"], summary["transfer_end_ns"])
+            assert summary["first_queued_ns"] is not None  # the KV-load envelope is merged at every level
+            if merged:
+                assert None not in maxima and None not in envelope
+            else:
+                assert maxima == [None, None, None] and envelope == (None, None)
+        finally:
+            receiver.executor.shutdown(wait=True)
+
+
+def test_t58_walk_16_peers_at_level_1(pd_records, monkeypatch):
+    set_level(monkeypatch, 1)
+    summaries, tasks = _walk(pd_records)
+    assert set(summaries) == {"decode-a", "decode-b"}
+    for rid in ("decode-a", "decode-b"):
+        summary = summaries[rid]
+        assert len(tasks[rid]) == 16 and summary["succeeded_tasks"] == 16
+        assert not set(LEVEL2_FIELDS) & set(summary)
+        first_queued = min(t["queued_ns"] for t in tasks[rid])
+        (done,) = [t for t in tasks[rid] if t["request_done_ns"] is not None]
+        envelope = summary["kv_load_envelope_ns"]
+        assert envelope == done["request_done_ns"] - first_queued
+        reads = [t["stages"]["wait_for_transfer"]["duration_ns"] for t in tasks[rid]]
+        assert envelope >= max(reads) and envelope < sum(reads)
+        for t in tasks[rid]:  # task records keep every timing at level 1
+            assert t["queue_wait_ns"] is not None and t["transfer_envelope_ns"] is not None
+            assert {"meta_fetch", "prepare"} <= set(t["associated_stages"])

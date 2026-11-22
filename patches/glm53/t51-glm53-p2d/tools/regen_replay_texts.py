@@ -1,5 +1,5 @@
 """Fill the generated part of replay_p2d.py from the replacement file, so the replay can only insert what the
-patch inserts. Each non-equal block of difflib(original, replacement) is one change C01..C28, in file order;
+patch inserts. Each non-equal block of difflib(original, replacement) is one change, in file order (C01..C14, C29, C15..C28);
 its text is the block with the indentation the replay will add removed (from the primary anchor on the
 original). Then BASE_FUNCTION_LINES and PATCHED_SHA256 are filled in.
 
@@ -21,10 +21,11 @@ blocks = [(tag, i1, i2, j1, j2) for tag, i1, i2, j1, j2 in difflib.SequenceMatch
 
 NAMES = ["C01", "TEXT_HELPERS", None, "TEXT_RECEIVER_STATE", "TEXT_ADD_REQUEST_PARAMS", "TEXT_ADD_REQUEST_DIAG",
          "TEXT_SUBMIT", "TEXT_HANDLE_WRAPPER", "TEXT_SKIPPED", "TEXT_TRANSFER_OUTCOME", "TEXT_TRANSFER_EXCEPTION",
-         "TEXT_TRACKER", "TEXT_REFORMAT_STAGE", "TEXT_REFORMAT_FAILURE", "TEXT_RECEIVER_METHODS", "TEXT_PREFIX_HIT",
+         "TEXT_TRACKER", "TEXT_REFORMAT_STAGE", "TEXT_REFORMAT_FAILURE", "TEXT_REQUEST_DONE", "TEXT_RECEIVER_METHODS",
+         "TEXT_PREFIX_HIT",
          "TEXT_META_BEGIN", "TEXT_META_REQUEST", "TEXT_META_END", "TEXT_PREPARE_BEGIN", "TEXT_PREPARE_END",
          "TEXT_NO_WORK", None, "TEXT_CONSUMER_LINK", "TEXT_PRODUCER_OFFER", "C26", "TEXT_KWARGS", "C28"]
-assert len(blocks) == len(NAMES) == 28, len(blocks)
+assert len(blocks) == len(NAMES) == 29, len(blocks)
 
 src = open(replay_path).read()
 begin, end = "# --- BEGIN GENERATED TEXTS", "# --- END GENERATED TEXTS ---"

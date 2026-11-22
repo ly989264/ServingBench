@@ -48,6 +48,24 @@ RECORDS: list[dict] = []
 NULL_EXECUTION_IDS = os.environ.get("JOINT_NULL_EXECUTION_IDS") == "1"
 
 
+def diag_level() -> int:
+    """The granularity this run is at, from the same place the code under test reads it. The full level records
+    everything; below it the native call list is not kept; at the lowest one the Pool task stages are not kept
+    either. Checks that assert what a level leaves out say so instead."""
+    try:
+        from vllm.v1.metrics import pd_diagnostics as diag
+
+        read = getattr(diag, "diag_level", None)
+        # It answers with (level, source); the source is for the line the vLLM side prints, not for here.
+        answer = 3 if read is None else read()
+        value = getattr(answer, "level", answer)
+        if isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= 3:
+            return value
+    except Exception:
+        pass
+    return 3
+
+
 def check(part, item, ok, detail=""):
     RESULTS.append({"part": part, "item": item, "ok": bool(ok), "detail": str(detail)[:400]})
     print(("PASS " if ok else "FAIL ") + f"[{part}] {item}" + (f"  -- {detail}" if detail and not ok else ""))
@@ -197,6 +215,10 @@ for name in VLLM_MODULES + ASCEND_MODULES:
     except BaseException as exc:  # report every failing import, keep going
         check("imports", name, False, f"{type(exc).__name__}: {exc}")
 check("imports", "stubbed NPU-only packages", True, ",".join(STUB_ROOTS))
+LEVEL = diag_level()
+NATIVE_SAYS = "recorded" if LEVEL >= 3 else "not recorded at this level"
+check("level", f"granularity of this run: {LEVEL}", True,
+      "everything" if LEVEL >= 3 else ("no native call list" if LEVEL == 2 else "no native call list, no Pool stages"))
 
 
 def runner_order_check():
@@ -655,8 +677,12 @@ def check_step_record(part, step, execution_id, request_ids, expect_load_submit)
               wait["calls"] == 1 and wait["status"] == "ok" and wait["exceptions"] == 0 and wait["measured_calls"] == 1
               and wait["skipped_calls"] == 0 and wait["unmeasured_calls"] == 0
               and wait["timing_scope"] == "released_request_save_fence", wait)
-    check(part, f"{execution_id}: stages.forward and stages.submit written",
-          "forward" in step["stages"] and "submit" in step["stages"], sorted(step["stages"]))
+    # stages.submit comes from the vLLM side's kv.load_submit span, which it leaves out on a decode node at
+    # level 1. This harness decides that before the chain runs and without a decode node's config, so at level 1
+    # the D step is not held to either answer here; what the vLLM side decides is driven in "kv load submit".
+    submit_undecided = part.startswith("chain D") and LEVEL == 1
+    check(part, f"{execution_id}: stages.forward written" + ("" if submit_undecided else " and stages.submit"),
+          "forward" in step["stages"] and (submit_undecided or "submit" in step["stages"]), sorted(step["stages"]))
     return wait
 
 
@@ -708,10 +734,12 @@ def check_chain_p(part, p_records):
         load = by_request["P-R1"]
         submit = steps["exec-p2"]["stages"].get("submit", {})
         forward = steps["exec-p2"]["stages"].get("forward", {})
-        check(part, "P-R1: succeeded, execution exec-p2, backend_get inside, Mooncake get recorded",
+        native = [c["operation"] for c in load["native_calls"]]
+        wanted = ["mooncake_get"] if LEVEL >= 3 else []
+        check(part, f"P-R1: succeeded, execution exec-p2, backend_get inside, Mooncake get {NATIVE_SAYS}",
               load["status"] == "succeeded" and load["execution_id"] == "exec-p2"
               and load["associated_stages"].get("backend_get", {}).get("calls") == 1
-              and [c["operation"] for c in load["native_calls"]] == ["mooncake_get"], load["status"])
+              and native == wanted, (load["status"], native))
         check(part, "P-R1: the load lies inside the step's stages.submit, before the forward (C11)",
               submit and submit["start_ns"] <= load["start_ns"] and load["end_ns"] <= submit["end_ns"]
               and submit["end_ns"] <= forward.get("start_ns", 0), (submit.get("start_ns"), load["start_ns"]))
@@ -719,10 +747,18 @@ def check_chain_p(part, p_records):
             check(part, "exec-p2: wait_for_put ends before the sync load starts",
                   wait2["end_ns"] <= load["start_ns"], (wait2["end_ns"], load["start_ns"]))
     saves = find(p_records, "pool_task", operation="save")
-    check(part, "pool_task[save] for both requests, succeeded, mooncake_put recorded",
+    def put_operations(record):
+        return [c["operation"] for c in record["native_calls"]]
+
+    wanted_put = ["mooncake_put"] if LEVEL >= 3 else []
+    check(part, f"pool_task[save] for both requests, succeeded, mooncake_put {NATIVE_SAYS}",
           sorted(r["request_id"] for r in saves) == ["P-R0", "P-R1"]
-          and all(r["status"] == "succeeded" and r["native_calls"][0]["operation"] == "mooncake_put" for r in saves),
-          [(r["request_id"], r["status"]) for r in saves])
+          and all(r["status"] == "succeeded" and put_operations(r) == wanted_put for r in saves),
+          [(r["request_id"], r["status"], put_operations(r)) for r in saves])
+    wanted_stages = ["build_key", "lookup", "prepare", "put", "sync"] if LEVEL >= 2 else []
+    check(part, "pool_task[save].stages: " + ("the five host stages" if LEVEL >= 2 else "none at this level"),
+          all(sorted(r["stages"]) == wanted_stages for r in saves),
+          [(r["request_id"], sorted(r["stages"])) for r in saves])
     submits = find(p_records, "pool_task", operation="save_submit")
     check(part, "pool_task[save_submit] per step, submission_returned",
           sorted(r["execution_id"] for r in submits) == ["exec-p1", "exec-p2"]
@@ -1324,15 +1360,58 @@ def check_startup_lines(p_lines, d_lines, w0_lines, w1_lines):
           p_lines)
     check(part, "D (EngineCore): one scheduler line, AsyncRecomputeScheduler, recompute on", d_lines == [d_expected],
           d_lines)
+    # A vLLM patch that knows about the granularity prints a line of its own; it is theirs, and it is checked
+    # separately so that the lines this package is responsible for are compared exactly, as before.
+    granularity = [line for line in p_lines + d_lines + w0_lines + w1_lines if line.startswith("PD_DIAG_STARTUP diag ")]
+    p_lines, d_lines, w0_lines, w1_lines = (
+        [line for line in lines if not line.startswith("PD_DIAG_STARTUP diag ")]
+        for lines in (p_lines, d_lines, w0_lines, w1_lines))
     runner_line = "PD_DIAG_STARTUP worker model_runner=vllm_ascend.worker.model_runner_v1.NPUModelRunner tp_rank={}"
     check(part, "Worker tp_rank 0: model_runner line, then device_timing=on after the first step, once each",
           w0_lines == [runner_line.format(0), "PD_DIAG_STARTUP worker device_timing=on tp_rank=0"], w0_lines)
     check(part, "Worker tp_rank 1: model_runner line, then device_timing=off (C14 is tp_rank 0 only), once each",
           w1_lines == [runner_line.format(1), "PD_DIAG_STARTUP worker device_timing=off tp_rank=1"], w1_lines)
+    if granularity:
+        wanted = [f"PD_DIAG_STARTUP diag level={LEVEL} source={source}" for source in ("default", "env", "invalid")]
+        check(part, f"the vLLM side's granularity line says level {LEVEL}, the level this run measured at",
+              all(line in wanted for line in granularity), granularity)
+
+
+def check_kv_load_submit():
+    """The vLLM side decides once per process whether the kv.load_submit span is opened: not on a PD decode
+    instance at level 1, opened everywhere else. Driving its real decision needs a config its own is_pd_decode()
+    calls a decode node; when this harness cannot present one, that is said rather than passed over."""
+    part = "kv load submit"
+    decide = getattr(diag, "decide_kv_load_submit", None)
+    if decide is None:
+        check(part, "the vLLM side does not offer this decision (an older patch): the span is always opened", True)
+        return
+    saved = getattr(diag, "_RECORDS_KV_LOAD_SUBMIT", None)
+    try:
+        config = SimpleNamespace(kv_transfer_config=SimpleNamespace(is_kv_consumer=True, is_kv_producer=False))
+        if not diag.is_pd_decode(config):
+            check(part, "a decode node could not be presented here, so the decision is not driven", True,
+                  "is_pd_decode said no; see the vllm-ascend condition")
+            return
+        diag._RECORDS_KV_LOAD_SUBMIT = None
+        on_decode = decide(config)
+        check(part, f"decode node at level {LEVEL}: the span is " + ("opened" if LEVEL != 1 else "left out"),
+              on_decode == (LEVEL != 1), on_decode)
+        if not on_decode:
+            diag._RECORDS_KV_LOAD_SUBMIT = None
+            opened = diag.kv_load_submit_span(config)
+            check(part, "and the span it hands back does nothing",
+                  type(opened).__name__ == "nullcontext", type(opened).__name__)
+        prefill = SimpleNamespace(kv_transfer_config=SimpleNamespace(is_kv_consumer=False, is_kv_producer=True))
+        diag._RECORDS_KV_LOAD_SUBMIT = None
+        check(part, f"prefill node at level {LEVEL}: the span is opened", decide(prefill) is True)
+    finally:
+        diag._RECORDS_KV_LOAD_SUBMIT = saved
 
 
 try:
     check_startup_lines(*run_startup_lines())
+    check_kv_load_submit()
 except BaseException as exc:
     check("startup lines", "startup lines ran", False, f"{type(exc).__name__}: {exc}\n{traceback.format_exc()[-1500:]}")
 

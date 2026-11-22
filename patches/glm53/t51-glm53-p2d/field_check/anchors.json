@@ -1,9 +1,9 @@
 {
   "script": "replay_p2d.py",
-  "script_sha256": "02304c8f76429780635870d17bac73558a2ecfafaadd744428c0ec93f457d4b3",
+  "script_sha256": "e62795bd63b146eb6813865d039d574d1fff067e1654f56f02a4458ca5e4a9e7",
   "base": "vllm-ascend d4ad49796, vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py",
   "base_sha256": "4e476a50afb5a7f13c274c071efc909ee823577383843b04e952bbdad21d1453",
-  "patched_sha256": "f953b27c3e53c125e6d931bb35d698b5e39662485b972e056447ef9b09a61909",
+  "patched_sha256": "01ce3b2a7dd5cdb10b630daa43c805d72f7d518407494d5199559ee78072c1de",
   "rule": "changes are applied in id order; each uses the first entry (primary, then alternatives in order) whose anchor matches exactly one line inside its function in the file as changed so far; a walk then moves from that line to the first line matching the walk anchor; a required change with no such entry stops the replay. C08 turns the body of _handle_request into _handle_request_body, so C09-C14 look there (function_in_unpatched_file names where the lines are before the replay); C14's anchor is the line C13 writes. The authoritative check is `replay_p2d.py --check` on the site file",
   "match_modes": {
     "equal": "the line with leading and trailing white space removed equals the anchor",
@@ -473,6 +473,41 @@
         "keeps_line": false
       },
       "alternatives": []
+    },
+    {
+      "id": "C29",
+      "name": "request marked done",
+      "function": "KVCacheRecvingThread._handle_request_body",
+      "function_in_unpatched_file": "KVCacheRecvingThread._handle_request",
+      "primary_anchor_written_by": null,
+      "required": true,
+      "module_level": false,
+      "primary": {
+        "rank": 1,
+        "match": "equal",
+        "anchor": "self.task_tracker.update_done_task_count(request_id)",
+        "op": "after",
+        "indent_relative_to_anchor": 0,
+        "walk": null,
+        "before_blank_lines": false,
+        "before_decorators": false,
+        "reads_from_line": null,
+        "keeps_line": false
+      },
+      "alternatives": [
+        {
+          "rank": 2,
+          "match": "prefix",
+          "anchor": "self.task_tracker.update_done_task_count(",
+          "op": "after",
+          "indent_relative_to_anchor": 0,
+          "walk": null,
+          "before_blank_lines": false,
+          "before_decorators": false,
+          "reads_from_line": null,
+          "keeps_line": false
+        }
+      ]
     },
     {
       "id": "C15",

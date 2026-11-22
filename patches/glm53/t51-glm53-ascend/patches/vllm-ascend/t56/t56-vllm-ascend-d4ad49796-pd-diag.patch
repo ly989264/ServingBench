@@ -1881,12 +1881,437 @@ index 0000000000000000000000000000000000000000..32e174366523b16e8e207ec264916e39
 +
 +if __name__ == "__main__":
 +    unittest.main()
+diff --git a/tests/ut/worker/test_pd_device_timing_t56.py b/tests/ut/worker/test_pd_device_timing_t56.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..f410f79ea58a0d245e05e3ba44387e391495efb5
+--- /dev/null
++++ b/tests/ut/worker/test_pd_device_timing_t56.py
+@@ -0,0 +1,419 @@
++"""Stdlib-only tests for the T56 part of vllm_ascend/worker/pd_device_timing.py.
++
++T51 measured two stages per step; T56 adds four more and makes them switchable, so that a prefill node -- and a
++decode node with the switch off -- writes exactly what the T51 version wrote. The device events are stubs on a
++scripted timeline, as in test_pd_device_timing.py; the vLLM side (pd_diagnostics, forward context) is a fake module
++installed into sys.modules, because the helper imports it at call time.
++"""
++
++from __future__ import annotations
++
++import importlib.util
++import os
++import sys
++import types
++import unittest
++from contextlib import contextmanager
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[3]
++spec = importlib.util.spec_from_file_location("pd_device_timing_t56_ut", ROOT / "vllm_ascend/worker/pd_device_timing.py")
++pdt = importlib.util.module_from_spec(spec)
++spec.loader.exec_module(pdt)
++MS = 1_000_000
++STREAM = object()
++# The order the stages actually run in on a decode node (draft last: it runs after bookkeeping there).
++STEP_ORDER = (
++    ("execute", "prepare_inputs"),
++    ("execute", "forward"),
++    ("execute", "lm_head"),
++    ("sample", "sampling"),
++    ("sample", "bookkeeping"),
++    ("sample", "draft"),
++)
++
++
++class Device:
++    def __init__(self):
++        self.now_ms = 0.0
++        self.completed = -1
++        self.count = 0
++
++    def complete_all(self):
++        self.completed = self.count
++
++    def event(self):
++        return Event(self)
++
++
++class Event:
++    def __init__(self, device):
++        self.device = device
++        self.index = None
++        self.ts = None
++
++    def record(self, stream):
++        assert stream is STREAM
++        self.device.count += 1
++        self.index = self.device.count
++        self.ts = self.device.now_ms
++
++    def query(self):
++        return self.index is not None and self.index <= self.device.completed
++
++    def elapsed_time(self, other):
++        return other.ts - self.ts
++
++
++class Batch:
++    """vLLM's diag.Batch as far as this module uses it: record-level fields."""
++
++    def __init__(self):
++        self.fields: dict = {}
++
++    def update(self, **fields):
++        self.fields.update(fields)
++
++
++class Claim:
++    def __init__(self):
++        self.stages: dict = {}
++        self.released = 0
++
++    def set_stage_fields(self, stage, **fields):
++        self.stages.setdefault(stage, {}).update(fields)
++        return True
++
++    def release(self):
++        self.released += 1
++
++
++class Side:
++    """The claim and record side of one process, keyed by phase."""
++
++    def __init__(self):
++        self.context = {"execution_id": None, "phase": None}
++        self.claims: dict[tuple, Claim] = {}
++        self.batches: dict[tuple, Batch] = {}
++
++    def key(self):
++        return (self.context["execution_id"], self.context["phase"])
++
++    def claim_finish(self):
++        if self.context["execution_id"] is None:
++            return None
++        return self.claims.setdefault(self.key(), Claim())
++
++    def current_batch(self):
++        if self.context["execution_id"] is None:
++            return None
++        return self.batches.setdefault(self.key(), Batch())
++
++
++def make(stages=pdt.OPTIONAL_STAGES, decode_node=True):
++    device, side = Device(), Side()
++    timing = pdt.DeviceTiming(
++        enabled=True,
++        new_event=device.event,
++        current_stream=lambda: STREAM,
++        capturing=lambda: False,
++        claim_finish=side.claim_finish,
++        current_context=lambda: dict(side.context),
++        current_batch=side.current_batch,
++        stages=stages,
++        decode_node=decode_node,
++    )
++    return timing, device, side
++
++
++def run_step(timing, device, side, execution_id, durations, synchronous=True):
++    """One step in the order the runner measures: the four T56 stages only when they are on."""
++    side.context.update(execution_id=execution_id, phase="execute")
++    timing.begin_execute()
++    for phase, name in STEP_ORDER:
++        if phase == "sample" and side.context["phase"] != "sample":
++            side.context["phase"] = "sample"
++            timing.begin_sample()
++        if name in pdt.OPTIONAL_STAGES and name not in timing.stages:
++            device.now_ms += durations.get(name, 0)
++            continue
++        with timing.measure(name):
++            device.now_ms += durations.get(name, 0)
++    if synchronous:
++        device.complete_all()
++    timing.end_sample(read_now=synchronous)
++
++
++def install_fake_vllm(spans=True, is_decode=True, batch=None):
++    """The three vLLM names this module imports at call time. Returns (batch, calls, undo)."""
++    saved = {name: sys.modules.get(name) for name in
++             ("vllm", "vllm.v1", "vllm.v1.metrics", "vllm.v1.metrics.pd_diagnostics")}
++    calls: list[str] = []
++    record = batch if batch is not None else Batch()
++
++    @contextmanager
++    def span(name, **fields):
++        calls.append(name)
++        yield {}
++
++    diag = types.ModuleType("vllm.v1.metrics.pd_diagnostics")
++    diag.span = span
++    diag.current_batch = lambda: record
++    diag._SPANS = {"runner." + name: name for name in pdt.OPTIONAL_STAGES} if spans else {}
++    if is_decode is not None:
++        diag.is_pd_decode = lambda vllm_config=None: is_decode
++    metrics = types.ModuleType("vllm.v1.metrics")
++    metrics.pd_diagnostics = diag
++    v1 = types.ModuleType("vllm.v1")
++    v1.metrics = metrics
++    vllm = types.ModuleType("vllm")
++    vllm.v1 = v1
++    sys.modules.update({"vllm": vllm, "vllm.v1": v1, "vllm.v1.metrics": metrics,
++                        "vllm.v1.metrics.pd_diagnostics": diag})
++
++    def undo():
++        for name, module in saved.items():
++            if module is None:
++                sys.modules.pop(name, None)
++            else:
++                sys.modules[name] = module
++
++    return record, calls, undo
++
++
++class Runner:
++    """What the hooks read off the model runner."""
++
++    def __init__(self, timing):
++        self._pd_device_timing = timing
++
++
++class SwitchTest(unittest.TestCase):
++    def test_unset_means_all_four_stages(self):
++        self.assertEqual(pdt._parse_stages(None), (pdt.OPTIONAL_STAGES, "default"))
++
++    def test_none_goes_back_to_the_t51_behaviour(self):
++        self.assertEqual(pdt._parse_stages("none"), ((), "env"))
++        self.assertEqual(pdt._parse_stages("NONE"), ((), "env"))
++        self.assertEqual(pdt._parse_stages(" none , lm_head "), ((), "env"))
++
++    def test_a_subset_keeps_the_step_order(self):
++        self.assertEqual(pdt._parse_stages("draft,lm_head"), (("lm_head", "draft"), "env"))
++        self.assertEqual(pdt._parse_stages(" bookkeeping , prepare_inputs "),
++                         (("prepare_inputs", "bookkeeping"), "env"))
++
++    def test_unknown_names_are_ignored_and_the_base_stages_are_not_switchable(self):
++        self.assertEqual(pdt._parse_stages("forward,sampling"), ((), "env"))
++        self.assertEqual(pdt._parse_stages("lm_head,typo"), (("lm_head",), "env"))
++        self.assertEqual(pdt._parse_stages(""), ((), "env"))
++
++    def test_runner_stages_tells_switched_off_apart_from_not_a_decode_node(self):
++        timing, _, _ = make(stages=("lm_head", "draft"))
++        self.assertEqual(timing.runner_stages, ("forward", "sampling", "lm_head", "draft"))
++        self.assertEqual(timing.stages_source, "default")
++        # Switched off on a decode node: the line still says so.
++        off, _, _ = make(stages=())
++        self.assertEqual(off.runner_stages, ("forward", "sampling"))
++        # Not a decode node (a prefill node, or no way to tell): nothing on the line, as in T51.
++        not_decode, _, _ = make(stages=pdt.OPTIONAL_STAGES, decode_node=False)
++        self.assertEqual(not_decode.runner_stages, ())
++        self.assertEqual(not_decode.stages, frozenset())
++        self.assertEqual(pdt._DISABLED.runner_stages, ())
++        self.assertEqual(pdt._DISABLED.stages, frozenset())
++
++    def test_a_disabled_timing_measures_nothing(self):
++        timing = pdt.DeviceTiming(enabled=False, stages=pdt.OPTIONAL_STAGES, decode_node=True)
++        self.assertEqual(timing.stages, frozenset())
++        self.assertFalse(timing.decode_node)
++
++
++class DecodeNodeTest(unittest.TestCase):
++    def fake(self, **kwargs):
++        record, calls, undo = install_fake_vllm(**kwargs)
++        self.addCleanup(undo)
++        return sys.modules["vllm.v1.metrics.pd_diagnostics"], record, calls
++
++    def test_decode_node_with_the_spans_registered(self):
++        diag, _, _ = self.fake()
++        self.assertTrue(pdt._is_decode_node(diag, object()))
++
++    def test_prefill_node(self):
++        diag, _, _ = self.fake(is_decode=False)
++        self.assertFalse(pdt._is_decode_node(diag, object()))
++
++    def test_an_older_vllm_patch_without_the_function_or_the_spans(self):
++        diag, _, _ = self.fake(is_decode=None)
++        self.assertFalse(pdt._is_decode_node(diag, object()))
++        diag, _, _ = self.fake(spans=False)
++        self.assertFalse(pdt._is_decode_node(diag, object()))
++
++    def test_a_raising_function_is_a_no(self):
++        diag, _, _ = self.fake()
++
++        def boom(vllm_config=None):
++            raise RuntimeError("sentinel")
++
++        diag.is_pd_decode = boom
++        self.assertFalse(pdt._is_decode_node(diag, object()))
++
++
++class SwitchGateTest(unittest.TestCase):
++    """DeviceTiming.switches(): the gate and the environment together, the way for_runner uses them."""
++
++    def setUp(self):
++        os.environ.pop(pdt._ENV_STAGES, None)
++        self.addCleanup(lambda: os.environ.pop(pdt._ENV_STAGES, None))
++
++    def fake(self, **kwargs):
++        _, _, undo = install_fake_vllm(**kwargs)
++        self.addCleanup(undo)
++        return sys.modules["vllm.v1.metrics.pd_diagnostics"]
++
++    def test_decode_node_defaults_to_all_four(self):
++        self.assertEqual(pdt.DeviceTiming.switches(self.fake(), None), (pdt.OPTIONAL_STAGES, "default", True))
++
++    def test_decode_node_with_the_switch_set(self):
++        os.environ[pdt._ENV_STAGES] = "draft"
++        self.assertEqual(pdt.DeviceTiming.switches(self.fake(), None), (("draft",), "env", True))
++
++    def test_prefill_node_measures_nothing_whatever_the_switch_says(self):
++        os.environ[pdt._ENV_STAGES] = "prepare_inputs,lm_head,draft,bookkeeping"
++        stages, _, decode = pdt.DeviceTiming.switches(self.fake(is_decode=False), None)
++        self.assertEqual((stages, decode), ((), False))
++
++    def test_an_older_vllm_patch_measures_nothing(self):
++        stages, _, decode = pdt.DeviceTiming.switches(self.fake(spans=False), None)
++        self.assertEqual((stages, decode), ((), False))
++
++
++class SixStageTest(unittest.TestCase):
++    def values(self, side, execution_id, phase):
++        return side.claims[(execution_id, phase)].stages
++
++    def test_each_stage_goes_to_its_own_record(self):
++        timing, device, side = make()
++        run_step(timing, device, side, "e1", {name: 1 for _, name in STEP_ORDER})
++        execute = self.values(side, "e1", "execute")
++        sample = self.values(side, "e1", "sample")
++        self.assertEqual(sorted(execute), ["forward", "lm_head", "prepare_inputs"])
++        self.assertEqual(sorted(sample), ["bookkeeping", "draft", "sampling"])
++        for stages in (execute, sample):
++            for fields in stages.values():
++                self.assertEqual(fields["device_duration_ns"], 1 * MS)
++
++    def test_the_step_envelope_spans_the_first_stage_to_the_last(self):
++        timing, device, side = make()
++        run_step(timing, device, side, "e1", {name: 2 for _, name in STEP_ORDER})
++        # Six stages of 2 ms each, measured end to end.
++        self.assertEqual(side.batches[("e1", "sample")].fields["step_device_span_ns"], 12 * MS)
++        self.assertNotIn("step_device_span_ns", side.batches[("e1", "execute")].fields)
++
++    def test_no_envelope_when_either_end_of_it_is_switched_off(self):
++        for stages in (("lm_head", "draft"), ("prepare_inputs", "lm_head")):
++            timing, device, side = make(stages=stages)
++            run_step(timing, device, side, "e1", {name: 2 for _, name in STEP_ORDER})
++            self.assertNotIn("step_device_span_ns", side.batches[("e1", "sample")].fields)
++
++    def test_a_switched_off_stage_is_not_in_the_record_at_all(self):
++        timing, device, side = make(stages=("lm_head",))
++        run_step(timing, device, side, "e1", {name: 1 for _, name in STEP_ORDER})
++        self.assertEqual(sorted(self.values(side, "e1", "execute")), ["forward", "lm_head"])
++        self.assertEqual(sorted(self.values(side, "e1", "sample")), ["sampling"])
++
++    def test_with_every_stage_off_the_records_are_what_t51_wrote(self):
++        timing, device, side = make(stages=())
++        self.assertEqual(timing.runner_stages, ("forward", "sampling"))  # the line still marks it a decode node
++        run_step(timing, device, side, "e1", {name: 1 for _, name in STEP_ORDER})
++        self.assertEqual(sorted(self.values(side, "e1", "execute")), ["forward"])
++        self.assertEqual(sorted(self.values(side, "e1", "sample")), ["sampling"])
++        for batch in side.batches.values():
++            self.assertEqual(batch.fields, {})
++
++    def test_events_that_never_complete_leave_the_stages_without_device_values(self):
++        timing, device, side = make()
++        run_step(timing, device, side, "e1", {name: 1 for _, name in STEP_ORDER}, synchronous=False)
++        for _ in range(pdt.SLOTS):
++            side.context.update(execution_id=None, phase=None)
++            timing.begin_execute()
++        self.assertEqual(self.values(side, "e1", "execute"), {})
++        self.assertEqual(side.batches[("e1", "sample")].fields, {})
++
++
++class HelperTest(unittest.TestCase):
++    def test_the_helper_opens_the_span_and_the_events_together(self):
++        timing, device, side = make()
++        _, calls, undo = install_fake_vllm()
++        self.addCleanup(undo)
++        side.context.update(execution_id="e1", phase="execute")
++        timing.begin_execute()
++        with pdt.stage(Runner(timing), "lm_head"):
++            device.now_ms += 3
++        device.complete_all()
++        timing.end_sample(read_now=True)
++        self.assertEqual(calls, ["runner.lm_head"])
++        self.assertEqual(side.claims[("e1", "execute")].stages["lm_head"]["device_duration_ns"], 3 * MS)
++
++    def test_a_stage_that_is_off_opens_nothing(self):
++        timing, device, side = make(stages=("draft",))
++        _, calls, undo = install_fake_vllm()
++        self.addCleanup(undo)
++        side.context.update(execution_id="e1", phase="execute")
++        timing.begin_execute()
++        ran = False
++        with pdt.stage(Runner(timing), "lm_head"):
++            ran = True
++        self.assertTrue(ran)
++        self.assertEqual(calls, [])
++        device.complete_all()
++        timing.end_sample(read_now=True)
++        self.assertEqual(side.claims[("e1", "execute")].stages, {})
++
++    def test_the_helper_never_raises_without_the_vllm_module(self):
++        timing, _, _ = make()
++        ran = False
++        with pdt.stage(Runner(timing), "draft"):
++            ran = True
++        self.assertTrue(ran)
++
++    def test_the_body_error_reaches_the_caller(self):
++        timing, _, _ = make()
++        _, _, undo = install_fake_vllm()
++        self.addCleanup(undo)
++        with self.assertRaises(ValueError):
++            with pdt.stage(Runner(timing), "draft"):
++                raise ValueError("sentinel")
++
++
++class CudagraphModeTest(unittest.TestCase):
++    def test_the_mode_is_written_on_the_execute_record(self):
++        timing, _, _ = make()
++        record, _, undo = install_fake_vllm()
++        self.addCleanup(undo)
++        pdt.note_cudagraph_mode(Runner(timing), types.SimpleNamespace(runtime_mode="FULL"), None)
++        self.assertEqual(record.fields, {"cudagraph_runtime_mode": "FULL"})
++
++    def test_the_enum_name_is_used_when_there_are_no_stats(self):
++        timing, _, _ = make()
++        record, _, undo = install_fake_vllm()
++        self.addCleanup(undo)
++        pdt.note_cudagraph_mode(Runner(timing), None, types.SimpleNamespace(name="PIECEWISE"))
++        self.assertEqual(record.fields, {"cudagraph_runtime_mode": "PIECEWISE"})
++
++    def test_nothing_is_written_when_every_stage_is_off(self):
++        timing, _, _ = make(stages=())
++        record, _, undo = install_fake_vllm()
++        self.addCleanup(undo)
++        pdt.note_cudagraph_mode(Runner(timing), types.SimpleNamespace(runtime_mode="FULL"), None)
++        self.assertEqual(record.fields, {})
++
++    def test_nothing_is_written_and_nothing_raises_without_a_mode(self):
++        timing, _, _ = make()
++        record, _, undo = install_fake_vllm()
++        self.addCleanup(undo)
++        pdt.note_cudagraph_mode(Runner(timing), None, None)
++        pdt.note_cudagraph_mode(Runner(timing))
++        self.assertEqual(record.fields, {})
++
++
++if __name__ == "__main__":
++    unittest.main()
 diff --git a/tests/ut/worker/test_pd_diag_runner_points.py b/tests/ut/worker/test_pd_diag_runner_points.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..636784fd699f8a22501f1aa38f24345365be4156
+index 0000000000000000000000000000000000000000..5e76ffce9ebf266388b8b2dff90415ccbf328ccb
 --- /dev/null
 +++ b/tests/ut/worker/test_pd_diag_runner_points.py
-@@ -0,0 +1,392 @@
+@@ -0,0 +1,458 @@
 +"""Stdlib-only tests for the runner's forward and sampling measurement points (d4ad49796 layout).
 +
 +Set VLLM_COMPACT_ROOT to the vLLM checkout that carries vllm/v1/metrics/pd_diagnostics.py.
@@ -2098,6 +2523,28 @@ index 0000000000000000000000000000000000000000..636784fd699f8a22501f1aa38f243453
 +    return found
 +
 +
++def stage_blocks(function, name=None):
++    """The `with pd_device_timing.stage(self, "<name>")` blocks inside this function, by stage name."""
++    found = {}
++
++    def visit(node):
++        if isinstance(node, ast.With):
++            for item in node.items:
++                call = item.context_expr
++                if (isinstance(call, ast.Call) and ast.unparse(call.func) == "pd_device_timing.stage"
++                        and len(call.args) == 2):
++                    found.setdefault(ast.literal_eval(call.args[1]), []).append(node)
++        for child in ast.iter_child_nodes(node):
++            visit(child)
++
++    visit(function)
++    return found if name is None else found.get(name, [])
++
++
++def calls_in(node):
++    return {ast.unparse(child.func) for child in ast.walk(node) if isinstance(child, ast.Call)}
++
++
 +class RunnerPlacementTest(unittest.TestCase):
 +    def test_v1_decorators_and_call_sites(self):
 +        v1 = runner_methods(V1)
@@ -2141,6 +2588,50 @@ index 0000000000000000000000000000000000000000..636784fd699f8a22501f1aa38f243453
 +        )
 +        # V2 keeps host timing only.
 +        self.assertNotIn("pd_device_timing", V2.read_text(encoding="utf-8"))
++
++    def test_v1_t56_stage_points(self):
++        """The four T56 stages: one block each, around the calls the segment is defined as."""
++        v1 = runner_methods(V1)
++        blocks = {name: stage_blocks(v1[name]) for name in ("execute_model", "sample_tokens")}
++        self.assertEqual(sorted(blocks["execute_model"]), ["lm_head", "prepare_inputs"])
++        self.assertEqual(sorted(blocks["sample_tokens"]), ["bookkeeping", "draft"])
++        for name, found in blocks.items():
++            for stage, nodes in found.items():
++                self.assertEqual(len(nodes), 1, f"{stage} must be measured in one place in {name}")
++
++        prepare = calls_in(blocks["execute_model"]["prepare_inputs"][0])
++        for call in ("self._update_states", "self._prepare_inputs", "self._determine_batch_execution_and_padding",
++                     "self._build_attention_metadata", "self._preprocess", "self.synchronize_input_prep"):
++            self.assertIn(call, prepare)
++        self.assertNotIn("self._model_forward", prepare)  # the forward stage keeps its own events
++
++        lm_head = calls_in(blocks["execute_model"]["lm_head"][0])
++        self.assertIn("self.model.compute_logits", lm_head)
++        self.assertNotIn("self._model_forward", lm_head)
++
++        bookkeeping = calls_in(blocks["sample_tokens"]["bookkeeping"][0])
++        self.assertIn("self._bookkeeping_sync", bookkeeping)
++        self.assertNotIn("self.propose_draft_token_ids", bookkeeping)
++
++        # The draft block sits inside the closure, so it covers each of its call sites exactly once.
++        draft_block = blocks["sample_tokens"]["draft"][0]
++        draft = calls_in(draft_block)
++        for call in ("self.propose_draft_token_ids", "self._skip_drafting", "self._copy_draft_token_ids_to_cpu"):
++            self.assertIn(call, draft)
++        closures = [node for node in ast.walk(v1["sample_tokens"])
++                    if isinstance(node, ast.FunctionDef) and node.name == "propose_draft_token_ids"]
++        self.assertEqual(len(closures), 1)
++        self.assertIn(draft_block, list(ast.iter_child_nodes(closures[0])))
++        self.assertGreaterEqual(len(call_spans(v1["sample_tokens"], "propose_draft_token_ids")), 2)
++
++        # The graph mode of the step, once, next to where the runner works it out.
++        self.assertEqual(len(call_spans(v1["execute_model"], "pd_device_timing.note_cudagraph_mode")), 1)
++
++    def test_v1_t56_stages_are_not_on_the_dummy_paths(self):
++        v1 = runner_methods(V1)
++        for name in ("_dummy_run", "_dummy_sampler_run", "profile_run", "capture_model"):
++            self.assertEqual(stage_blocks(v1[name]), {}, f"{name} must not measure a T56 stage")
++            self.assertEqual(call_spans(v1[name], "pd_device_timing.note_cudagraph_mode"), [])
 +
 +    def test_imports_name_the_vllm_patch_symbols(self):
 +        for path in (V1, V2):
@@ -4568,7 +5059,7 @@ index 9c2c2763a356f59b6cb9690473208ba905ca9bb9..5d497d3a341151c502b7c0a792dd3b6a
              if self.enable_kv_events:
                  event_block_size = (
 diff --git a/vllm_ascend/worker/model_runner_v1.py b/vllm_ascend/worker/model_runner_v1.py
-index 30c76975b5ec629e97a95f274e1765f5483efd21..5bd5ccf541aa0be1614f94965cb99a3a8e68eede 100644
+index 30c76975b5ec629e97a95f274e1765f5483efd21..fa91dc053afbb830a3ae32be7bc5e73ba32b08c5 100644
 --- a/vllm_ascend/worker/model_runner_v1.py
 +++ b/vllm_ascend/worker/model_runner_v1.py
 @@ -85,6 +85,7 @@ from vllm.v1.kv_cache_interface import (
@@ -4611,7 +5102,39 @@ index 30c76975b5ec629e97a95f274e1765f5483efd21..5bd5ccf541aa0be1614f94965cb99a3a
  
          # If ngram_gpu is used, we need to copy the scheduler_output to avoid
          # the modification has influence on the scheduler_output in engine core process.
-@@ -2760,6 +2765,7 @@ class NPUModelRunner(GPUModelRunner):
+@@ -2282,7 +2287,10 @@ class NPUModelRunner(GPUModelRunner):
+             get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
+ 
+         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+-        with record_function_or_nullcontext("prepare input"):
++        with (
++            record_function_or_nullcontext("prepare input"),
++            pd_device_timing.stage(self, "prepare_inputs"),
++        ):
+             with self.synchronize_input_prep():
+                 # Fix up prev_req_id_to_index for requests that were discarded
+                 # in the previous sample_tokens step. If a request has
+@@ -2387,6 +2395,7 @@ class NPUModelRunner(GPUModelRunner):
+                     force_eager=self.model_config.enforce_eager,
+                     num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
+                 )
++                pd_device_timing.note_cudagraph_mode(self, cudagraph_stats, cudagraph_mode)
+ 
+                 if logger.isEnabledFor(logging.DEBUG):
+                     logger.debug(
+@@ -2630,8 +2639,9 @@ class NPUModelRunner(GPUModelRunner):
+                     self._finalize_dump_data()
+                     return output
+ 
+-                sample_hidden_states = hidden_states[logits_indices]
+-                logits = self.model.compute_logits(sample_hidden_states)
++                with pd_device_timing.stage(self, "lm_head"):
++                    sample_hidden_states = hidden_states[logits_indices]
++                    logits = self.model.compute_logits(sample_hidden_states)
+             else:
+                 # Rare case.
+                 assert not self.is_pooling_model
+@@ -2760,6 +2770,7 @@ class NPUModelRunner(GPUModelRunner):
          self._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only=True)
  
      @torch.inference_mode()
@@ -4619,7 +5142,7 @@ index 30c76975b5ec629e97a95f274e1765f5483efd21..5bd5ccf541aa0be1614f94965cb99a3a
      def sample_tokens(
          self, grammar_output: "GrammarOutput | None"
      ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
-@@ -2781,6 +2787,7 @@ class NPUModelRunner(GPUModelRunner):
+@@ -2781,6 +2792,7 @@ class NPUModelRunner(GPUModelRunner):
              output.kv_connector_output = kv_connector_output
              return output
  
@@ -4627,7 +5150,98 @@ index 30c76975b5ec629e97a95f274e1765f5483efd21..5bd5ccf541aa0be1614f94965cb99a3a
          # Unpack ephemeral state.
          (
              scheduler_output,
-@@ -2950,10 +2957,11 @@ class NPUModelRunner(GPUModelRunner):
+@@ -2825,27 +2837,29 @@ class NPUModelRunner(GPUModelRunner):
+         )
+ 
+         def propose_draft_token_ids(sampled_token_ids):
+-            if not input_fits_in_drafter:
+-                self._skip_drafting(
++            # One stage per step whichever of the three call sites below runs.
++            with pd_device_timing.stage(self, "draft"):
++                if not input_fits_in_drafter:
++                    self._skip_drafting(
++                        scheduler_output,
++                        sampled_token_ids if use_padded_batch else None,
++                    )
++                    return
++                assert spec_decode_common_attn_metadata is not None
++                self._draft_token_ids = self.propose_draft_token_ids(
++                    sampled_token_ids,
++                    self.input_batch.sampling_metadata,
+                     scheduler_output,
+-                    sampled_token_ids if use_padded_batch else None,
++                    spec_decode_metadata,
++                    spec_decode_common_attn_metadata,
++                    positions,
++                    scheduler_output.total_num_scheduled_tokens,
++                    hidden_states,
++                    aux_hidden_states,
++                    sample_hidden_states,
++                    batch_desc,
+                 )
+-                return
+-            assert spec_decode_common_attn_metadata is not None
+-            self._draft_token_ids = self.propose_draft_token_ids(
+-                sampled_token_ids,
+-                self.input_batch.sampling_metadata,
+-                scheduler_output,
+-                spec_decode_metadata,
+-                spec_decode_common_attn_metadata,
+-                positions,
+-                scheduler_output.total_num_scheduled_tokens,
+-                hidden_states,
+-                aux_hidden_states,
+-                sample_hidden_states,
+-                batch_desc,
+-            )
+-            self._copy_draft_token_ids_to_cpu(scheduler_output)
++                self._copy_draft_token_ids_to_cpu(scheduler_output)
+ 
+         output_spec_token_ids = None
+         use_padded_batch = False
+@@ -2868,23 +2882,24 @@ class NPUModelRunner(GPUModelRunner):
+                 with record_function_or_nullcontext("draft_token"):
+                     propose_draft_token_ids(sampler_output.sampled_token_ids)
+ 
+-        (
+-            num_nans_in_logits,
+-            num_nans_device,
+-            logprobs_lists,
+-            valid_sampled_token_ids,
+-            prompt_logprobs_dict,
+-            req_ids_output_copy,
+-            req_id_to_index_output_copy,
+-            invalid_req_indices,
+-        ) = self._bookkeeping_sync(
+-            scheduler_output,
+-            sampler_output,
+-            logits,
+-            hidden_states,
+-            scheduler_output.total_num_scheduled_tokens,
+-            spec_decode_metadata,
+-        )
++        with pd_device_timing.stage(self, "bookkeeping"):
++            (
++                num_nans_in_logits,
++                num_nans_device,
++                logprobs_lists,
++                valid_sampled_token_ids,
++                prompt_logprobs_dict,
++                req_ids_output_copy,
++                req_id_to_index_output_copy,
++                invalid_req_indices,
++            ) = self._bookkeeping_sync(
++                scheduler_output,
++                sampler_output,
++                logits,
++                hidden_states,
++                scheduler_output.total_num_scheduled_tokens,
++                spec_decode_metadata,
++            )
+ 
+         with record_function_or_nullcontext("draft_token"):
+             if self.speculative_config:
+@@ -2950,10 +2965,11 @@ class NPUModelRunner(GPUModelRunner):
                  self._update_states_after_model_execute(sampler_output.sampled_token_ids, scheduler_output)
  
          if not self.use_async_scheduling:
@@ -4640,7 +5254,7 @@ index 30c76975b5ec629e97a95f274e1765f5483efd21..5bd5ccf541aa0be1614f94965cb99a3a
              model_runner_output=model_runner_output,
              sampled_token_ids=sampler_output.sampled_token_ids,
              logprobs_tensors=sampler_output.logprobs_tensors,
-@@ -2966,6 +2974,7 @@ class NPUModelRunner(GPUModelRunner):
+@@ -2966,6 +2982,7 @@ class NPUModelRunner(GPUModelRunner):
              async_output.sampled_token_ids_cpu,
              async_output.async_copy_ready_event,
          )
@@ -4648,7 +5262,7 @@ index 30c76975b5ec629e97a95f274e1765f5483efd21..5bd5ccf541aa0be1614f94965cb99a3a
          return async_output
  
      # overwrite _sample for lmhead_tp_enable and need_accepted_tokens
-@@ -2976,20 +2985,28 @@ class NPUModelRunner(GPUModelRunner):
+@@ -2976,20 +2993,28 @@ class NPUModelRunner(GPUModelRunner):
          if spec_decode_metadata is None:
              if lmhead_tp_enable() and logits is not None:
                  logits = logits[: self.input_batch.num_reqs]
@@ -4687,7 +5301,7 @@ index 30c76975b5ec629e97a95f274e1765f5483efd21..5bd5ccf541aa0be1614f94965cb99a3a
          return sampler_output
  
      def _get_nans_in_logits(self, logits: torch.Tensor | None) -> dict[str, int]:
-@@ -3244,9 +3261,17 @@ class NPUModelRunner(GPUModelRunner):
+@@ -3244,9 +3269,17 @@ class NPUModelRunner(GPUModelRunner):
              if self.enable_enpu:
                  # The soft segmentation scenario requires event.record first, then event.wait
                  self._update_full_graph_params_if_needed(forward_context, num_tokens_padded)
@@ -4709,17 +5323,23 @@ index 30c76975b5ec629e97a95f274e1765f5483efd21..5bd5ccf541aa0be1614f94965cb99a3a
              # A forward that raises must still retire the device-metadata
 diff --git a/vllm_ascend/worker/pd_device_timing.py b/vllm_ascend/worker/pd_device_timing.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..9d4ac0341739bbd9a3d414a1f963d5170a359b13
+index 0000000000000000000000000000000000000000..ca2646b685a0939b32d2b4e734f31ecf07d422e0
 --- /dev/null
 +++ b/vllm_ascend/worker/pd_device_timing.py
-@@ -0,0 +1,345 @@
-+"""Device-event timing of the V1 runner's forward and sampling, for the [PD_DIAG] worker_summary records.
+@@ -0,0 +1,516 @@
++"""Device-event timing of the V1 runner's steps, for the [PD_DIAG] worker_summary records.
 +
 +On tp_rank 0 only, each step records a pair of NPU events, on the current compute stream, right around the target
 +model call ("forward") and around the sampler call ("sampling"). The step's two worker_summary records (phase
 +"execute" and "sample") are held open with vLLM's pd_claim_finish() and written, strictly in step order, once the
-+events are read; the value goes into stages.forward / stages.sampling as device_duration_ns, next to the unchanged
-+host duration_ns. Reading never waits: query() both events first, elapsed_time() only when both completed.
++events are read; the value goes into stages.<name> as device_duration_ns, next to the unchanged host duration_ns.
++Reading never waits: query() both events first, elapsed_time() only when both completed.
++
++T56 adds four more stages around the rest of the step -- "prepare_inputs", "lm_head" (execute), "draft",
++"bookkeeping" (sample) -- through stage(), which opens the host span and the device events together. They are
++written only on a PD decode node (is_pd_decode(), T56 convention 0.8) and only for the stages VLLM_PD_DEVICE_STAGES
++leaves on, so a prefill node's records stay byte-identical to the T51 version. The six stages run one after another
++on the same compute stream, so their device intervals do not overlap and may be summed.
 +
 +Where the events are read:
 +  - synchronous runs (P): when sample_tokens returns; the sampled tokens were already copied to the host there;
@@ -4734,23 +5354,52 @@ index 0000000000000000000000000000000000000000..9d4ac0341739bbd9a3d414a1f963d517
 +
 +import atexit
 +import math
++import os
 +import threading
 +from collections import deque
 +from contextlib import contextmanager
 +from typing import Any
 +
 +SLOTS = 4  # event pairs kept per stage; also the number of steps a read may lag
-+_PHASE_OF_STAGE = {"forward": "execute", "sampling": "sample"}
++# The order the stages run in within one step; also the order the startup line lists them.
++STAGE_ORDER = ("forward", "sampling", "prepare_inputs", "lm_head", "draft", "bookkeeping")
++# T51 measures these two unconditionally; VLLM_PD_DEVICE_STAGES never touches them.
++BASE_STAGES = ("forward", "sampling")
++# T56 adds these; each one can be switched off, and all of them are off unless this is a decode node.
++OPTIONAL_STAGES = ("prepare_inputs", "lm_head", "draft", "bookkeeping")
++_PHASE_OF_STAGE = {
++    "forward": "execute",
++    "sampling": "sample",
++    "prepare_inputs": "execute",
++    "lm_head": "execute",
++    "draft": "sample",
++    "bookkeeping": "sample",
++}
++_ENV_STAGES = "VLLM_PD_DEVICE_STAGES"      # unset: all four; a comma-separated subset; "none": back to T51
++# The envelope of one step: the start of the first stage to the end of the last one.
++_SPAN_FROM, _SPAN_TO = "prepare_inputs", "draft"
++
++
++def _parse_stages(raw: str | None) -> tuple[tuple[str, ...], str]:
++    """(stages to measure, where that came from). Unknown names are ignored; the startup line shows what took
++    effect. forward/sampling are not switchable, so naming them here does nothing."""
++    if raw is None:
++        return OPTIONAL_STAGES, "default"
++    wanted = {part.strip() for part in raw.split(",")}
++    if "none" in {part.lower() for part in wanted}:
++        return (), "env"
++    return tuple(name for name in OPTIONAL_STAGES if name in wanted), "env"
 +
 +
 +class _Step:
-+    __slots__ = ("seq", "execution_id", "slot", "claims", "recorded", "repeated", "settled", "broken")
++    __slots__ = ("seq", "execution_id", "slot", "claims", "batches", "recorded", "repeated", "settled", "broken")
 +
 +    def __init__(self, seq: int, execution_id: Any, slot: int | None):
 +        self.seq = seq
 +        self.execution_id = execution_id
 +        self.slot = slot
 +        self.claims: dict[str, Any] = {}
++        self.batches: dict[str, Any] = {}
 +        self.recorded: set[str] = set()
 +        self.repeated: set[str] = set()
 +        self.settled = False
@@ -4759,13 +5408,18 @@ index 0000000000000000000000000000000000000000..9d4ac0341739bbd9a3d414a1f963d517
 +
 +class DeviceTiming:
 +    def __init__(self, *, enabled: bool, new_event=None, current_stream=None, capturing=None, claim_finish=None,
-+                 current_context=None):
++                 current_context=None, current_batch=None, stages: tuple[str, ...] = (), stages_source: str = "default",
++                 decode_node: bool = False):
 +        self.enabled = enabled
 +        self._new_event = new_event
 +        self._current_stream = current_stream
 +        self._capturing = capturing
 +        self._claim_finish = claim_finish
 +        self._current_context = current_context
++        self._current_batch = current_batch
++        self.decode_node = bool(decode_node) and enabled
++        self.stages = frozenset(stages) if self.decode_node else frozenset()
++        self._stages_source = stages_source
 +        self._lock = threading.Lock()
 +        self._steps: deque[_Step] = deque()
 +        self._events: list[dict[str, tuple[Any, Any]]] = [{} for _ in range(SLOTS)]
@@ -4774,8 +5428,31 @@ index 0000000000000000000000000000000000000000..9d4ac0341739bbd9a3d414a1f963d517
 +        if enabled:
 +            atexit.register(self.release_all)
 +
++    @property
++    def runner_stages(self) -> tuple[str, ...]:
++        """What the Worker startup line lists, in step order. Empty on anything but a decode node, so the line --
++        and the records -- stay byte-identical to the T51 version there. On a decode node it always lists at least
++        forward and sampling, so "switched off here" (forward,sampling) reads differently from "not a decode node"
++        (no runner_stages on the line at all)."""
++        if not self.decode_node:
++            return ()
++        return tuple(name for name in STAGE_ORDER if name in BASE_STAGES or name in self.stages)
++
++    @property
++    def stages_source(self) -> str:
++        return self._stages_source
++
 +    @classmethod
-+    def for_runner(cls, tp_rank: int) -> DeviceTiming:
++    def switches(cls, diag: Any, vllm_config: Any) -> tuple[tuple[str, ...], str, bool]:
++        """What this process measures beyond T51: (stages, where that came from, is this a decode node). A prefill
++        node -- or no way to tell -- measures none of it, whatever the environment says."""
++        stages, source = _parse_stages(os.environ.get(_ENV_STAGES))
++        if not _is_decode_node(diag, vllm_config):
++            return (), source, False
++        return stages, source, True
++
++    @classmethod
++    def for_runner(cls, tp_rank: int, vllm_config: Any = None) -> DeviceTiming:
 +        if tp_rank != 0:
 +            return cls(enabled=False)
 +        try:
@@ -4783,6 +5460,7 @@ index 0000000000000000000000000000000000000000..9d4ac0341739bbd9a3d414a1f963d517
 +            from vllm.v1.metrics import pd_diagnostics as diag
 +            from vllm.v1.worker.worker_base import pd_claim_finish
 +
++            stages, source, decode = cls.switches(diag, vllm_config)
 +            npu = torch.npu
 +            return cls(
 +                enabled=True,
@@ -4791,6 +5469,10 @@ index 0000000000000000000000000000000000000000..9d4ac0341739bbd9a3d414a1f963d517
 +                capturing=npu.is_current_stream_capturing,
 +                claim_finish=pd_claim_finish,
 +                current_context=diag.current,
++                current_batch=diag.current_batch,
++                stages=stages,
++                stages_source=source,
++                decode_node=decode,
 +            )
 +        except Exception:  # no NPU events or no claim interface: host timing only
 +            return cls(enabled=False)
@@ -4817,13 +5499,14 @@ index 0000000000000000000000000000000000000000..9d4ac0341739bbd9a3d414a1f963d517
 +                if slot is not None:
 +                    self._owner[slot] = step
 +                step.claims["execute"] = claim
++                self._hold_batch_locked(step, "execute")
 +                self._steps.append(step)
 +        except Exception:
 +            self._disable()
 +
 +    @contextmanager
 +    def measure(self, stage: str):
-+        """Around the target model call ("forward") or the sampler call ("sampling")."""
++        """Around the call this stage times. The two record() calls are what the step pays on the host for it."""
 +        pair = None
 +        if self.enabled:
 +            try:
@@ -4856,6 +5539,7 @@ index 0000000000000000000000000000000000000000..9d4ac0341739bbd9a3d414a1f963d517
 +                claim = self._claim_finish()
 +                if claim is not None:
 +                    step.claims["sample"] = claim
++                    self._hold_batch_locked(step, "sample")
 +        except Exception:
 +            self._disable()
 +
@@ -4900,6 +5584,17 @@ index 0000000000000000000000000000000000000000..9d4ac0341739bbd9a3d414a1f963d517
 +        except Exception:
 +            return None
 +
++    def _hold_batch_locked(self, step: _Step, phase: str) -> None:
++        """Keep this phase's open record, for the step's own fields (the claim only reaches the stages)."""
++        if not self.stages or self._current_batch is None:
++            return
++        try:
++            batch = self._current_batch()
++        except Exception:
++            return
++        if batch is not None:
++            step.batches[phase] = batch
++
 +    def _current_step_locked(self) -> _Step | None:
 +        if not self._steps:
 +            return None
@@ -4932,23 +5627,35 @@ index 0000000000000000000000000000000000000000..9d4ac0341739bbd9a3d414a1f963d517
 +        except Exception:
 +            pass
 +
++    @staticmethod
++    def _duration_ns(start: Any, end: Any) -> int | None:
++        ms = start.elapsed_time(end)
++        if isinstance(ms, (int, float)) and not isinstance(ms, bool) and math.isfinite(ms) and ms >= 0:
++            return int(round(ms * 1_000_000))
++        return None
++
 +    def _collect_locked(self) -> None:
 +        while self._steps:
 +            step = self._steps[0]
 +            if not step.settled:
 +                return
 +            values: dict[str, int] = {}
++            span_ns = None
 +            done = True
 +            if not step.broken and step.slot is not None:
 +                try:
++                    events = self._events[step.slot]
 +                    for stage in sorted(step.recorded):
-+                        start, end = self._events[step.slot][stage]
++                        start, end = events[stage]
 +                        if not (end.query() and start.query()):
 +                            done = False
 +                            break
-+                        ms = start.elapsed_time(end)
-+                        if isinstance(ms, (int, float)) and not isinstance(ms, bool) and math.isfinite(ms) and ms >= 0:
-+                            values[stage] = int(round(ms * 1_000_000))
++                        value = self._duration_ns(start, end)
++                        if value is not None:
++                            values[stage] = value
++                    if done and _SPAN_FROM in step.recorded and _SPAN_TO in step.recorded:
++                        # The whole step on the device: the first stage's start event to the last one's end event.
++                        span_ns = self._duration_ns(events[_SPAN_FROM][0], events[_SPAN_TO][1])
 +                except Exception:
 +                    step.broken = True
 +            if not done and not step.broken and self._seq - step.seq < SLOTS:
@@ -4961,12 +5668,26 @@ index 0000000000000000000000000000000000000000..9d4ac0341739bbd9a3d414a1f963d517
 +                            claim.set_stage_fields(stage, device_duration_ns=ns)
 +                        except Exception:
 +                            pass
++                if span_ns is not None:
++                    self._update_batch(step, "sample", step_device_span_ns=span_ns)
 +            self._release_locked(step)
++
++    @staticmethod
++    def _update_batch(step: _Step, phase: str, **fields: Any) -> None:
++        """A field on the step's own record. Ignored once that record has been written."""
++        batch = step.batches.get(phase)
++        if batch is None:
++            return
++        try:
++            batch.update(**fields)
++        except Exception:
++            pass
 +
 +    def _release_locked(self, step: _Step) -> None:
 +        self._steps.popleft()
 +        if step.slot is not None and self._owner[step.slot] is step:
 +            self._owner[step.slot] = None
++        step.batches.clear()
 +        for phase in ("execute", "sample"):
 +            claim = step.claims.get(phase)
 +            if claim is not None:
@@ -4984,6 +5705,20 @@ index 0000000000000000000000000000000000000000..9d4ac0341739bbd9a3d414a1f963d517
 +_DISABLED = DeviceTiming(enabled=False)
 +
 +
++def _is_decode_node(diag: Any, vllm_config: Any) -> bool:
++    """T56 convention 0.8: vllm-ascend's own condition, through the vLLM patch's shared function. Also requires the
++    four spans to be registered there, so an older vLLM patch leaves this at the T51 behaviour instead of a half-on
++    state (the Worker startup line then lists no runner_stages, which the upgrade check catches)."""
++    try:
++        is_pd_decode = getattr(diag, "is_pd_decode", None)
++        if is_pd_decode is None or not is_pd_decode(vllm_config):
++            return False
++        spans = getattr(diag, "_SPANS", {})
++        return all("runner." + name in spans for name in OPTIONAL_STAGES)
++    except Exception:
++        return False
++
++
 +def _timing(runner, create: bool = False) -> DeviceTiming:
 +    timing = getattr(runner, "_pd_device_timing", None)
 +    if timing is not None or not create:
@@ -4996,7 +5731,7 @@ index 0000000000000000000000000000000000000000..9d4ac0341739bbd9a3d414a1f963d517
 +        return _DISABLED
 +    if tp_rank is None:  # outside a worker_summary step: decide later
 +        return _DISABLED
-+    timing = DeviceTiming.for_runner(tp_rank)
++    timing = DeviceTiming.for_runner(tp_rank, getattr(runner, "vllm_config", None))
 +    try:
 +        runner._pd_device_timing = timing
 +    except Exception:
@@ -5016,6 +5751,56 @@ index 0000000000000000000000000000000000000000..9d4ac0341739bbd9a3d414a1f963d517
 +        return _timing(runner).measure(stage)
 +    except Exception:
 +        return _DISABLED.measure(stage)
++
++
++@contextmanager
++def stage(runner, name: str):
++    """A T56 stage: the host span and the device events together, or nothing at all when this stage is off. Off is
++    the whole stage, so a node that does not measure it writes the same record as the T51 version."""
++    span = None
++    timing = _DISABLED
++    try:
++        timing = _timing(runner)
++        if name in timing.stages:
++            from vllm.v1.metrics import pd_diagnostics as diag
++
++            span = diag.span("runner." + name)
++    except Exception:
++        span = None
++    if span is None:
++        yield
++        return
++    measured = None
++    try:
++        measured = timing.measure(name)
++    except Exception:
++        measured = None
++    if measured is None:
++        with span:
++            yield
++        return
++    with span, measured:
++        yield
++
++
++def note_cudagraph_mode(runner, stats: Any = None, mode: Any = None) -> None:
++    """The graph mode this step's target model actually ran in, onto the open execute record. Same gate as the T56
++    stages, so a node that measures none of them writes the same record as the T51 version."""
++    try:
++        if not _timing(runner).stages:
++            return
++        value = getattr(stats, "runtime_mode", None)
++        if value is None:
++            value = getattr(mode, "name", None)
++        if value is None:
++            return
++        from vllm.v1.metrics import pd_diagnostics as diag
++
++        batch = diag.current_batch()
++        if batch is not None:
++            batch.update(cudagraph_runtime_mode=str(value))
++    except Exception:
++        pass
 +
 +
 +def begin_sample(runner) -> None:

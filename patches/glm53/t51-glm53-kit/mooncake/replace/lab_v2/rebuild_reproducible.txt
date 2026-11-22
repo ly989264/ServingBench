@@ -1,0 +1,9 @@
+ninja rc=0
+[1/4] Building CXX object mooncake-store/src/CMakeFiles/mooncake_store_client_objects.dir/client_buffer_allocation.cpp.o
+[2/4] Building CXX object mooncake-store/src/CMakeFiles/mooncake_store_client_objects.dir/client_service.cpp.o
+[3/4] Building CXX object mooncake-store/src/CMakeFiles/mooncake_store_client_objects.dir/client_metric.cpp.o
+[4/4] Linking CXX shared library
+ninja: no work to do.
+37a3aaf8acb53c6a3cdb9251b9e6d3e1edc0c13789c8d4138d111b1d71cc4a6f  /out/libmooncake_store.so
+37a3aaf8acb53c6a3cdb9251b9e6d3e1edc0c13789c8d4138d111b1d71cc4a6f  /out/v2_rebuilt.so
+rebuilt library: byte-identical to the delivered v2

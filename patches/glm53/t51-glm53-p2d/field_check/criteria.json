@@ -1,6 +1,6 @@
 {
   "script": "replay_p2d.py",
-  "script_sha256": "02304c8f76429780635870d17bac73558a2ecfafaadd744428c0ec93f457d4b3",
+  "script_sha256": "e62795bd63b146eb6813865d039d574d1fff067e1654f56f02a4458ca5e4a9e7",
   "base": "vllm-ascend d4ad49796, vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py",
   "base_sha256": "4e476a50afb5a7f13c274c071efc909ee823577383843b04e952bbdad21d1453",
   "how": "facts are computed with Python's ast module on the site file before the replay (compute_facts); every 'stop' fact must equal the value of the d4ad49796 original, or the replay writes nothing",
@@ -203,6 +203,12 @@
       "fact": "reqmeta.is_dataclass",
       "expected": true,
       "why": "ReqMeta 仍是 dataclass；pd_execution_id 作为最后一个带默认值的字段加入"
+    },
+    {
+      "id": "F32",
+      "fact": "handle_request.update_done_after_last_task",
+      "expected": true,
+      "why": "task_tracker.update_done_task_count 是一行语句，在 if <_mark_request_task_done 的结果>: 的块里，即请求最后一个任务完成时才调用；C29 紧跟其后记下 request_done_ns，kv_load_envelope_ns 的终点就是这一刻"
     }
   ],
   "note": [
@@ -372,9 +378,11 @@
   },
   "after_replay_checks": [
     "the result parses (ast.parse) and compiles (py_compile)",
-    "pd_diagnostics is imported once; the five module-level helpers exist",
+    "pd_diagnostics is imported once; the seven module-level helpers exist (T56 adds _pd_mark_request_done, T58 _pd_diag_level)",
+    "(T58) KVCacheRecvingThread.__init__ sets self.pd_diag_level",
     "_transfer_kv_cache_all_groups has no direct batch_transfer_sync_read and exactly one _transfer_batch",
     "_handle_request_body, _pd_reformat_stage, _pd_finish_task, _transfer_batch exist in KVCacheRecvingThread",
+    "(T56) in _handle_request_body, _pd_mark_request_done(req_meta) is the statement right after update_done_task_count",
     "the consumer link is created in the same loop as add_new_req",
     "the producer offer is a body-level statement of request_finished before the delay_free_blocks return",
     "pd_offset = 0 is right before the loops that call add_request, and pd_offset += 1 is in the block of that call",

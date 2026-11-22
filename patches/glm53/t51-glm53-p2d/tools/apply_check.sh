@@ -5,7 +5,7 @@
 #         /out (replayed files for the follow-up test run).
 set -e
 F=vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py
-PATCH=/p/t51-vllm-ascend-d4ad49796-p2d-diag.patch
+PATCH=/p/t58-vllm-ascend-d4ad49796-p2d-diag.patch
 mkdir -p /t && tar -xf /in/d4ad49796.tar -C /t && cd /t/vllm-ascend
 git init -q && git add -A && git -c user.name=t -c user.email=t@example.invalid commit -qm d4ad49796
 echo "== before: $(sha256sum $F | cut -c1-64)"
