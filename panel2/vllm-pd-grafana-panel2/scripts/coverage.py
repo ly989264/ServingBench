@@ -13,6 +13,10 @@ With segment definitions that count a shared cache-pool task for each member (sh
 a block before the summary line tells, for each of P's segments from those records, in how many requests the value
 comes from a task shared by several requests (members[] has more than one request): the dashboard keeps a request's
 largest record per column, and a shared task is often larger than the request's own. Only here, not on the dashboard.
+T58 (v3.3-extra): every segment has a from_level (segments.json), the lowest PD_DIAG_LEVEL that records it; each request
+document carries diag_level per side (from its core_summary[request] records, 3 when they have none). A segment is
+counted only over the requests whose side ran at its level or above; a request below it is "未采" (told on the segment's
+line), and a segment that no request of the window could have recorded is listed as "按粒度不记", not as FAIL.
 Runs ClickHouse queries as the admin account inside the cluster's container (bin/lib.sh ch_sql), like the other checks.
 """
 import json
@@ -27,6 +31,10 @@ ONLY_SOME = {
     "p.start_load_kv": "只在命中缓存池的请求上有值", "p.start_load_kv.submit": "只在命中缓存池的请求上有值",
     "p.start_load_kv.wait_for_transfer": "只在命中缓存池的请求上有值",
     "b.wait_for_save": "只在 P 保存了 KV 的请求上有值",
+    # T56 (D side): the maxima the connector writes on request_generation, and the scheduler's wait.
+    "d.start_load_kv.receive_queue": "只在从 P 读 KV 的请求上有值；各任务中的最大值，任务数 = P 的 TP 端口数 × shard 数",
+    "d.start_load_kv.prepare_read": "只在从 P 读 KV 的请求上有值；取对端信息、组读表各自在各任务中的最大值之和",
+    "d.kv_ready_wait": "只在走过异步加载的请求上有值；从调度器得知 KV 到齐算起，比字节到齐晚一步；字节到齐在 start_load_kv（接收线程的墙钟包络）里",
 }
 
 
@@ -120,22 +128,61 @@ def main():
     if not docs:
         print("RESULT: FAIL（这段时间没有请求：先发一批请求再跑）")
         return 1
-    have, empty, nosrc = [], [], []
-    for key, node in seg:
-        sourced = any(m.src for m in node.walk())
-        k = sum(1 for d in docs if isinstance(value(d, key), (int, float)))
+    have, empty, nosrc, by_level = [], [], [], []
+    compare = []
+
+    def side_level(doc, key):
+        # T58: the request's PD_DIAG_LEVEL on the segment's side; documents before v3.3-extra have none (level 3);
+        # 0: the request has no instance on that side (sent to D directly)
+        lv = doc.get("diag_level")
+        if not isinstance(lv, dict):
+            return 3
+        return lv.get("p" if key[0] in "pb" else "d", 3)
+
+    def can_have(doc, key, node):
+        # a request with no record on the side counts for the level-1 segments, as before v3.3-extra, never for the others
+        lv = side_level(doc, key)
+        return lv >= node.from_level or (lv == 0 and node.from_level == 1)
+
+    def name_of(key):
         side = "P" if key[0] in "pb" else "D"
-        name = "%s %s%s" % (side, {"b": "后台 ", "bd": "后台 ", "r": "第二步起 "}.get(key.split(".")[0], ""), key.split(".", 1)[1].replace(".", "/"))
-        print("  %-48s %4d / %d%s" % (name, k, len(docs), ("（%s）" % ONLY_SOME[key]) if key in ONLY_SOME else ""))
+        return "%s %s%s" % (side, {"b": "后台 ", "bd": "后台 ", "r": "第二步起 "}.get(key.split(".")[0], ""), key.split(".", 1)[1].replace(".", "/"))
+
+    for key, node in seg:
+        k = sum(1 for d in docs if isinstance(value(d, key), (int, float)))
+        if node.compare:
+            compare.append((key, node, k))   # T56: a comparison row is not a segment; listed apart below
+            continue
+        sourced = any(m.src for m in node.walk())
+        name = name_of(key)
+        able = [d for d in docs if can_have(d, key, node)]
+        skip = len(docs) - len(able)
+        k = sum(1 for d in able if isinstance(value(d, key), (int, float)))
+        notes = ([ONLY_SOME[key]] if key in ONLY_SOME else []) + (
+            ["未采 %d：这些请求那一侧的粒度低于 %d 级" % (skip, node.from_level)] if skip and able else [])
+        if able or not sourced:
+            print("  %-48s %4d / %d%s" % (name, k, len(able), ("（%s）" % "；".join(notes)) if notes else ""))
+        else:
+            print("  %-48s 未采（粒度 %d 级；这一段从 %d 级起记）" % (name, max(side_level(d, key) for d in docs), node.from_level))
         if not sourced:
             nosrc.append(name)
+        elif not able:
+            by_level.append(name)
         elif k:
             have.append(name)
         else:
             empty.append(name)
+    if compare:
+        print("对照行（不是段，不计入合计）：")
+        for key, node, k in compare:
+            print("  %-48s %4d / %d（%s）" % (name_of(key), k, len(docs), node.label))
+            if not k:
+                empty.append(name_of(key))
     shared_report(tree, seg, ids, minutes)
-    total = len(seg)
+    total = len(seg) - len(compare)
     print("%d 段里 %d 段有值；没有来源、按设计为空的 %d 段：%s" % (total, len(have), len(nosrc), "、".join(nosrc) or "无"))
+    if by_level:
+        print("按粒度不记的 %d 段（这些请求的粒度低于这几段的起记级别，不算失败）：%s" % (len(by_level), "、".join(by_level)))
     if empty:
         print("RESULT: FAIL（有来源但这些请求里都为空的 %d 段：%s）" % (len(empty), "、".join(empty)))
         return 1

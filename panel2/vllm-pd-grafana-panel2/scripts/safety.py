@@ -35,7 +35,7 @@ sys.path.insert(0, HERE)
 import criteria as C  # noqa: E402
 
 PACK_LOG_DIR = "/var/log/pd-diag"   # line.log_dir of the pack's segments.json, before deploy.env replaces it
-UPGRADE_FROM = ("v3",)              # --pre-upgrade: the versions this pack upgrades from (and rolls back to)
+UPGRADE_FROM = ("v3.3-extra",)      # --pre-upgrade: the versions this pack upgrades from (and rolls back to)
 TABLES = ("phase_line", "diag_event", "filter_selfcheck", "filter_file", "filter_other")
 NOT_IN_SUMS = ("deploy.env", "inventory.json", "segments.json")
 
@@ -424,6 +424,39 @@ def item_filter(c, o, facts, states):
             o.verdict(v)
 
 
+def item_level(c, o):
+    """T58: the PD_DIAG_LEVEL each instance runs at, from the filter's self-check lines of the last 3 minutes (the filter
+    of v3.3-extra writes diag_level; an earlier filter, before vLLM is restarted after the update, writes none). WARN when
+    the processes of one instance run at different levels."""
+    rows, err = ch(c, "SELECT instance, groupUniqArrayIf(diag_level, isNotNull(diag_level)) AS lv, countIf(isNull(diag_level)) AS old "
+                      "FROM vllm_pd.filter_selfcheck WHERE ts >= now64(3) - INTERVAL 3 MINUTE GROUP BY instance")
+    if rows is None:
+        if "diag_level" in (err or ""):
+            o.add("INFO", "粒度：自检表还没有 diag_level 列（v3.3-extra 以前的面板；升级以后才有）")
+        else:
+            o.add("WARN", "粒度：查不了自检表的 diag_level（%s）" % (err or "")[:200])
+        return
+    if not rows:
+        return
+    mixed = sorted(r["instance"] for r in rows if len(r["lv"] or []) > 1)
+    if mixed:
+        o.add("WARN", "粒度：%s 的几个进程粒度不同（自检行的 diag_level）；同一个实例的进程要用同一个 PD_DIAG_LEVEL" % " ".join(mixed))
+    count = {}
+    old = 0
+    for r in rows:
+        lv = r["lv"] or []
+        if not lv:
+            old += 1
+            continue
+        side = "P" if r["instance"].startswith("P") else "D"
+        key = (side, min(int(x) for x in lv))
+        count[key] = count.get(key, 0) + 1
+    parts = ["%s %d 级 %d 个实例" % (s, l, n) for (s, l), n in sorted(count.items(), key=lambda kv: (kv[0][0] != "P", kv[0][1]))]
+    if old:
+        parts.append("%d 个实例的自检行没有粒度（过滤器还是 v3.3-extra 以前的，重启 vLLM 以后才有）" % old)
+    o.add("INFO", "粒度：" + "；".join(parts))
+
+
 def item_chain(c, o, states):
     th = C.chain_thresholds(c.line, c.get("PULL_INTERVAL_S", "10"))
     url = "http://%s:%s/status" % (c.get("MONITOR_HOST"), c.get("PULLER_METRICS_PORT"))
@@ -524,6 +557,7 @@ def check(c, pre, wait):
     while True:
         part = Out()
         item_filter(c, part, facts, states)
+        item_level(c, part)
         item_chain(c, part, states)
         if not part.counts()["FAIL"] or time.time() >= deadline:
             break

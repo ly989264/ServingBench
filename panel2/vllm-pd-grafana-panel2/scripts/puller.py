@@ -4,10 +4,12 @@
 Offsets, new files and reading from where it stopped are Vector's job; copying is rsync's. This is only the small loop around them: a thread per
 machine so that one machine cannot hold up another, a timeout on each run, no second run while one is going, and the time of the last success.
 Settings come from the environment (bin/lib.sh loads deploy.env).
-v3.1-extra adds two optional sources, both off by default:
-  PROXY_COLLECT=1     the proxy's log folder PROXY_LOG_DIR on PROXY_MACHINE, mirrored the same way into PULL_DIR/_proxy/<machine>;
-  MOONCAKE_LOG_COLLECT=1  Mooncake's timing lines from MOONCAKE_LOG_FILES, fetched and paired with the pool's save records
-                      (scripts/native_put.py) into PULL_DIR/_native/<machine>/<instance>.
+v3.1-extra adds an optional source, off by default:
+  PROXY_COLLECT=1     the proxy's log folder PROXY_LOG_DIR on PROXY_MACHINE, mirrored the same way into PULL_DIR/_proxy/<machine>.
+v3.3-extra (T58): Mooncake's own files (<node log folder>/mooncake/mc.*.log) come back with the node folder; a second
+thread pairs them with the pool's save records every round (scripts/native_put.py) into PULL_DIR/_native/<machine>/<instance>.
+Always on, nothing to switch: with no Mooncake files it pairs nothing. MOONCAKE_LOG_COLLECT, MOONCAKE_LOG_FILES and
+MOONCAKE_TID_FALLBACK (v3.1-extra, v3.2-extra) are not read.
 """
 import atexit
 import http.server
@@ -189,25 +191,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 
 def native_loop(nat, ok):
-    """Mooncake's timing lines: fetch from every source (at most PULL_CONCURRENCY machines at a time), then pair them."""
+    """Mooncake's timing: pair the mirrored files with the pool's save records, every round."""
     last_clean = 0.0
     while True:
         started = time.time()
-        threads = []
-        for addr in nat.sources:
-            def one(a=addr):
-                with LIMIT:
-                    try:
-                        nat.fetch(a)
-                    except Exception as e:  # noqa: BLE001
-                        nat.errors[a] = str(e)[:200]
-            t = threading.Thread(target=one, daemon=True)
-            t.start()
-            threads.append(t)
-        for t in threads:
-            t.join(TIMEOUT)
         try:
             nat.run_once()
+            nat.errors.pop("associate", None)
             ok[0] = time.time()
             if time.time() - last_clean > 600:
                 nat.clean()
@@ -234,19 +224,13 @@ def main():
     Handler.machines = ms
     for m in ms:
         m.start()
-    if ENV.get("MOONCAKE_LOG_COLLECT") == "1":
-        try:
-            nat = native_put.Puller(ENV, str(PULL_DIR), str(STATE), folder_name, ssh_options, run)
-        except ValueError as e:
-            raise SystemExit("错误：%s" % e)
-        if not nat.sources:
-            raise SystemExit("错误：MOONCAKE_LOG_COLLECT=1 时要填 MOONCAKE_LOG_FILES")
-        Handler.native = nat
-        threading.Thread(target=native_loop, args=(nat, Handler.native_ok), daemon=True).start()
+    nat = native_put.Puller(ENV, str(PULL_DIR), str(STATE))
+    Handler.native = nat
+    threading.Thread(target=native_loop, args=(nat, Handler.native_ok), daemon=True).start()
     addr = ("0.0.0.0", int(ENV.get("PULLER_METRICS_PORT") or 9598))
     print("拉取程序已启动：%d 台机器，每 %g 秒一轮，读 %s，镜像到 %s%s%s" % (
         len(ms), INTERVAL, ",".join(sources), PULL_DIR, "；proxy %s:%s" % (ENV.get("PROXY_MACHINE"), ENV.get("PROXY_LOG_DIR")) if ENV.get("PROXY_COLLECT") == "1" else "",
-        "；Mooncake 计时行 %d 个来源" % sum(len(v) for v in Handler.native.sources.values()) if Handler.native else ""), flush=True)
+        "；Mooncake 计时文件：随节点目录拉回，从镜像里关联"), flush=True)
     http.server.ThreadingHTTPServer(addr, Handler).serve_forever()
 
 

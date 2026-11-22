@@ -27,6 +27,11 @@ TABLE = "vllm_pd.phase_line"
 LINE = "vllm_pd.phase_line_cur"
 PROXY = "vllm_pd.proxy_line"     # v3.1-extra: one row per request from the proxy's line, read when a proxy segment has a src
 EVENT = "vllm_pd.diag_event"
+# T58: the dashboard variable "层级" (1, 2, 3): rows, spans and Top-20 detail columns deeper than it are not shown.
+LEVEL = "${level}"
+# Top-20 detail columns: an L2 name ends with one zero-width space, an L3 name with two (column_name); a column whose name
+# has ${level} or more of them is left out by the panel's "filter fields by name" (checked on Grafana 12.4.2).
+LEVEL_COL_RE = "^(?!.*(\\u200b){${level},}).*$"
 SEL = "${instance:singlequote}"
 REQ_FILTER = f"s.model = '$model' AND (s.p_instance IN ({SEL}) OR s.d_instance IN ({SEL}))"
 WIDE_WINDOW = "ts >= $__fromTime - INTERVAL 5 MINUTE AND ts < $__toTime + INTERVAL 1 HOUR"
@@ -92,10 +97,12 @@ def col(alias, name):
 def side_total(tree, role, alias="s"):
     """P 合计 / D 合计: each side's API server, from receiving the request to the last byte (api_summary[http] end_ns - start_ns)."""
     own = col(alias, "p_total_ms" if role == "prefill" else "d_total_ms")
-    # Segments measured by the proxy (v3.1-extra, a src on the proxy line) stay out of the total: P 合计 and D 合计 are the
-    # API server's own (decision C5). Those without a src are always empty, as in v3.
+    # Segments measured by the proxy (v3.1-extra, a src on the proxy line): D 合计 stays the API server's own (decision C5).
+    # T64 (item 5, 甲): P 合计 = the proxy's segments + P's API server; a request without a proxy line counts its proxy as 0.
+    # Those without a src are always empty, as in v3.
     sourced = {c for c, _ in tree.proxy_sourced()}
-    head = "+".join(f"ifNull({col(alias, n.column)}, 0)" for n in tree.sides[role]["proxy"] if n.column not in sourced) or "0"
+    head = "+".join(f"ifNull({col(alias, n.column)}, 0)" for n in tree.sides[role]["proxy"]
+                    if role == "prefill" or n.column not in sourced) or "0"
     return f"if({own} > 0, {head} + {own}, NULL)"
 
 
@@ -138,8 +145,8 @@ def api_anchor(nulls, where_rows, having):
     return (
         "(SELECT *, t_min AS ts FROM (SELECT request_id, min(ts) AS t_min, any(model) AS model,\n"
         "    anyIf(instance, role = 'prefill') AS p_instance, anyIf(instance, role = 'decode') AS d_instance,\n"
-        "    coalesce(minIf(api_start_ts, role = 'prefill'), minIf(ts, role = 'prefill')) AS p_ts,\n"
-        "    coalesce(minIf(api_start_ts, role = 'decode'), minIf(ts, role = 'decode')) AS d_ts,\n"
+        "    coalesce(minIf(api_start_ts, role = 'prefill'), minIf(toNullable(ts), role = 'prefill')) AS p_ts,\n"
+        "    coalesce(minIf(api_start_ts, role = 'decode'), minIf(toNullable(ts), role = 'decode')) AS d_ts,\n"
         "    maxIf(api_end_ts, role = 'prefill') AS p_end_ts, maxIf(api_end_ts, role = 'decode') AS d_end_ts,\n"
         "    countIf(role = 'prefill') > 0 AS has_p, countIf(role = 'decode') > 0 AS has_d,\n"
         "    maxIf(official_e2e_ms, role = 'prefill') AS p_e2e_ms, maxIf(official_e2e_ms, role = 'decode') AS d_e2e_ms,\n"
@@ -169,9 +176,12 @@ def one_anchor(tree, rid="'${request_id}'"):
 # ---- one row per request and side: the segments ---------------------------------------------------------------------
 
 class Row:
-    def __init__(self, label, source, expr, procs, opt=False, share=True, rest=False, columns=()):
+    def __init__(self, label, source, expr, procs, opt=False, share=True, rest=False, columns=(), depth=1, lvl=1, kind="seg"):
         self.label, self.source, self.expr, self.procs = label, source, expr, procs
         self.opt, self.share, self.rest, self.columns = opt, share, rest, columns
+        self.depth, self.lvl = depth, lvl      # T58: the segment's depth (层级) and from_level (the lowest PD_DIAG_LEVEL that records it)
+        # T64: "seg", "else", "total", or "header" (a group's title row in the two segment tables: a name, blank cells)
+        self.kind = kind
 
 
 def tree_label(node):
@@ -189,25 +199,85 @@ def tree_label(node):
     return pre + head + node.label
 
 
-def rows_of(tree, role):
+def seg_share(node):
+    """Whether a segment's row takes a share of its side's total: not the background, comparison rows or segments outside
+    the total; a proxy segment with a src only on P (T64 item 5: P 合计 includes it; D 合计 is the API server's own, C5)."""
+    if node.phase == "background" or node.outside_total:
+        return False
+    if node.phase == "proxy" and node.src:
+        return node.role == "prefill"
+    return True
+
+
+# T64 (items 7, 10): the segment tables group a side's rows under title rows; the group's segments sit one level in.
+GROUP_BACK, GROUP_FIRST, GROUP_REST = "后台任务", "第一步", "第二步起 · 每步"
+# The step words of the D segments' names (forward（第一步）): a table row under its group's title row goes without them.
+STEP_SUFFIX = re.compile(r"（(第一步|第二步起)）$")
+
+
+def table_name(node):
+    return STEP_SUFFIX.sub("", node.label.replace("设备侧，", ""))
+
+
+def grouped_label(node):
+    """The row name of a segment inside a group: one level in under the title row (the group's last first-level segment
+    takes '└ ', the others '├ '; the levels below follow on, as tree_label draws them)."""
+    top = node
+    while top.parent is not None:
+        top = top.parent
+    siblings = top.role_tops
+    last_top = siblings[-1] is top
+    if node.depth == 1:
+        return ("└ " if last_top else "├ ") + table_name(node)
+    return ("\u00a0" * 3 if last_top else "│ ") + tree_label(node)
+
+
+def else_expr(tree, role, alias=None):
+    """T64 item 2: per request, the side's total minus its first-level segments that take a share (empty counts 0); no
+    sub-segments, comparison rows, background or segments outside the total. Empty when the side has no
+    core_summary[request] for the request (rlv = 0, levels_sql); below 0 it is 0."""
+    kids = [n for ph in ("proxy", "ttft", "tpot") for n in tree.sides[role][ph] if seg_share(n)]
+    tot = f"toFloat64({side_total(tree, role, alias)})"
+    rest = " + ".join(f"ifNull(toFloat64({value_expr(n, alias_of(n, alias) if alias else None)}), 0)" for n in kids) or "0"
+    return f"if(rlv = 0 OR isNull({tot}), NULL, greatest(0, {tot} - ({rest})))"
+
+
+def rows_of(tree, role, with_else=True):
+    """The rows of a side's segment tables. P: the proxy and first-token segments, else, P 合计, then the background under
+    「后台任务」. D: the proxy segment, the first step under 「第一步」, the later steps under 「第二步起 · 每步」, else, D 合计.
+    The single-request tables leave else out (with_else=False)."""
     side = tree.sides[role]
     rows = []
 
-    def add(node):
-        procs = node.procs()
+    def add(node, grouped=False):
         source = "summary" if node.phase == "proxy" else "fold"
-        # A proxy segment with a src is measured outside the API server's total (C5): no share of it.
-        share = node.phase != "background" and not (node.phase == "proxy" and node.src)
-        rows.append(Row(tree_label(node), source, value_expr(node), procs, node.optional, share, node.phase == "tpot", node.columns_below()))
+        label = grouped_label(node) if grouped else (table_name(node) if node.depth == 1 else tree_label(node))
+        rows.append(Row(label, source, value_expr(node), node.procs(), node.optional, seg_share(node), node.phase == "tpot",
+                        node.columns_below(), node.depth, node.from_level))
         for c in node.children:
-            add(c)
+            add(c, grouped)
 
-    for ph in ("proxy", "ttft", "tpot"):
-        for top in side[ph]:
-            add(top)
-    rows.append(Row(side["total_label"], "summary", side_total(tree, role, None), {"proxy"}))
-    for top in side["background"]:
+    def group(title, tops):
+        if not tops:
+            return
+        for t in tops:
+            t.role_tops = tops
+        rows.append(Row(title, "header", "CAST(NULL AS Nullable(Float64))", set(), share=False, depth=0, kind="header"))
+        for top in tops:
+            add(top, True)
+
+    for top in side["proxy"]:
         add(top)
+    if role == "prefill":
+        for top in side["ttft"]:
+            add(top)
+    else:
+        group(GROUP_FIRST, side["ttft"])
+        group(GROUP_REST, side["tpot"])
+    if with_else:
+        rows.append(Row("else", "summary", else_expr(tree, role), {"proxy"}, kind="else"))
+    rows.append(Row(side["total_label"], "summary", side_total(tree, role, None), {"proxy"}, kind="total"))
+    group(GROUP_BACK, side["background"])
     return rows
 
 
@@ -357,7 +427,8 @@ def bar_series(tree, role):
     """(series name, top-level node) for the stacked bars and the largest-stage column: the segment's full label, the same
     name as in the distribution tables, so host-side timing and first or later steps read the same everywhere."""
     side = tree.sides[role]
-    return [(n.label, n) for n in side["ttft"]] + [(n.label, n) for n in side["tpot"]]
+    # T56: comparison rows and segments outside the total overlap the others; a bar of them would count time twice.
+    return [(n.label, n) for n in side["ttft"] + side["tpot"] if not n.outside_total]
 
 
 def top_stage(tree, role, a):
@@ -381,6 +452,29 @@ def proxy_cols(tree, role):
     return ", ".join(f"s.{n.column} AS {n.column}" for n in tree.sides[role]["proxy"])
 
 
+def levels_sql(where):
+    """T58: each request's PD_DIAG_LEVEL per side, from its core_summary[request] records (diag_level is written only at
+    levels 1 and 2; a side whose records lack it ran at 3). 0 when the request has no core_summary[request] on that side;
+    level_of() takes that as 3 (a missing record is missing data, not a level), and the per-request JSON says 0 only for
+    a side the request has no instance on (views_sql). One row per request (x)."""
+    side_lv = "toUInt8(if(countIf(side = '{s}') = 0, 0, ifNull(minIf(lv, side = '{s}'), 3)))"
+    return (
+        f"SELECT x AS request_id, {side_lv.format(s='prefill')} AS p_level, {side_lv.format(s='decode')} AS d_level "
+        f"FROM (SELECT x, side, JSONExtract(raw, 'diag_level', 'Nullable(UInt8)') AS lv FROM {EVENT} WHERE event = 'core_summary[request]' AND x != '' AND {where}) "
+        "GROUP BY x"
+    )
+
+
+def level_of(alias, role):
+    """The side's level of a request joined from levels_sql (0, a request with no row, is 3)."""
+    c = f"{alias}.{'p_level' if role == 'prefill' else 'd_level'}"
+    return f"if({c} = 0, toUInt8(3), {c})"
+
+
+def arr(values):
+    return "[" + ", ".join(str(v) for v in values) + "]"
+
+
 def dist_parts(tree, rows, role, s_cte="s"):
     """Quantiles per segment over the requests of the window (a sample of them for windows longer than a day).
     Only requests this side has finished (its total is known): a request still running has only part of its segments."""
@@ -393,12 +487,28 @@ def dist_parts(tree, rows, role, s_cte="s"):
     per = f"if(r = 1 AND {steps} > 0, ms / {steps}, ms)"
     pc = proxy_cols(tree, role)
     f = fold(tree, role, f"{WIDE_WINDOW} AND {SAMPLED} AND request_id IN (SELECT request_id FROM {s_cte})")
+    lv = levels_sql(f"{WIDE_WINDOW} AND x IN (SELECT request_id FROM {s_cte})")
     # Only the columns used here come along from the window's requests (s is sampled already, see s_window_cte).
     keep = ", ".join(["request_id", total] + [n.column for n in tree.sides[role]["proxy"]])
+    lcol = "p_level" if role == "prefill" else "d_level"
+    # n: the requests with a value in the segment; n_all (T55): the requests the segment could have (finished on this side;
+    # for a later-step row, with at least one step after the first). The aggregates skip NULL, so they read as before.
+    # T58: a request whose side ran below the segment's from_level cannot have it: it counts in n_skip ("未采"), not in
+    # n_all, and skip_lv is the highest such level.
+    # T64 (乙): the share is the segment's time over those n_all requests (empty counts 0) divided by their total
+    # (ssum / tsum) over the same requests on every row, later-step rows included (a request without later steps counts 0
+    # there), so the first-level rows and else add up to the total; rlv is the side's level as levels_sql has it (0: no
+    # core_summary[request]), for the else row.
+    ok = f"(r = 0 OR {steps} > 0)"
     return (
-        f"SELECT toUInt8(idx) AS idx, count() AS n, quantilesExact(0.5, 0.9, 0.99)({per}) AS q, quantileExactIf(0.5)({per}, o = 0 OR ms > 0) AS p50, avg(ms) AS accum, avgIf({per}, r = 0 OR {steps} > 0) AS mean\n"
-        f"  FROM (SELECT f.*, s.{total} AS {total}{', ' + pc if pc else ''} FROM ({f}) AS f INNER JOIN (SELECT {keep} FROM {s_cte}) AS s ON s.request_id = f.request_id)\n"
-        f"  ARRAY JOIN {idx} AS idx, {vals} AS ms, {opt} AS o, {rest} AS r WHERE isNotNull(ms) AND (r = 0 OR {steps} > 0) AND ifNull({total}, 0) > 0 GROUP BY idx"
+        f"SELECT toUInt8(idx) AS idx, countIf({ok} AND isNotNull(ms) AND sl >= fl) AS n, countIf({ok} AND sl >= fl) AS n_all, countIf({ok} AND sl < fl) AS n_skip, maxIf(sl, {ok} AND sl < fl) AS skip_lv, "
+        f"quantilesExactIf(0.5, 0.9, 0.99)({per}, {ok}) AS q, quantileExactIf(0.5)({per}, {ok} AND (o = 0 OR ms > 0)) AS p50, avgIf({per}, {ok}) AS mean, "
+        f"sumIf(ifNull(ms, 0), sl >= fl) AS ssum, sumIf(tot, sl >= fl) AS tsum\n"
+        f"  FROM (SELECT f.*, s.{total} AS {total}{', ' + pc if pc else ''}, {level_of('dl', role)} AS sl, ifNull(dl.{lcol}, 0) AS rlv,"
+        f" toFloat64({side_total(tree, role, None)}) AS tot FROM ({f}) AS f INNER JOIN (SELECT {keep} FROM {s_cte}) AS s ON s.request_id = f.request_id\n"
+        f"        LEFT JOIN ({lv}) AS dl ON dl.request_id = f.request_id)\n"
+        f"  ARRAY JOIN {idx} AS idx, {vals} AS ms, {opt} AS o, {rest} AS r, {arr(r.lvl for r in rows)} AS fl\n"
+        f"  WHERE ifNull({total}, 0) > 0 GROUP BY idx"
     )
 
 
@@ -426,84 +536,167 @@ def steps_sql(tree, role, label):
     )
 
 
-def dist_label(r):
-    """A distribution table shows a later-step row per step (quantiles and mean of ms / steps), so its name says so."""
-    if not r.rest:
-        return r.label
-    return r.label[:-1] + "，每步）" if r.label.endswith("）") else r.label + "（每步）"
+HDR = -1   # T64: what a title row's cells hold; the segment tables map it to a blank (style_segment_table)
 
 
-def fit_dist_names(panel, names, cols=("p50", "p90", "p99", "均值")):
-    """The name column of a distribution table as wide as its longest name; the quantile and mean columns give up the
-    same width together, so the table stays as wide as before."""
-    def width(name):
-        return next(p["value"] for p in by_name(panel, name)["properties"] if p["id"] == "custom.width")
-    have, need = width("阶段"), max(header_width(n) for n in names)
-    if need <= have:
+def hdr_of(rows, idx):
+    return f"{arr(1 if r.kind == 'header' else 0 for r in rows)}[{idx}]"
+
+
+def cell(rows, idx, expr):
+    """A segment table's cell: blank on a title row, else the expression."""
+    return f"if({hdr_of(rows, idx)} = 1, {HDR}, {expr})"
+
+
+DIST_GAUGE_MIN = 100     # T56: the share gauge still readable
+NUM_W, NUM_MIN = 98, 88  # T64 item 4: the quantile and mean columns; 88 px still holds 0.0663 ms
+TABLE_W = 772            # what a half-width table holds on the board's 1600 px page (Grafana 12.4.2, the lab's measurement)
+HAS_VALUE = "有值 / 请求"   # T55: how many of the window's requests have a value in the row, out of those that could
+HAS_VALUE_W = 143      # T64: room for "999 / 999，未采 99"
+# T64 item 3: the column is hidden unless deploy.env says BOARD_HAS_VALUE=1 (bin/has_value.sh show | hide)
+SHOW_HAS_VALUE = (os.environ.get("BOARD_HAS_VALUE") or "").strip() == "1"
+GROUP_BG = "rgba(87, 148, 242, 0.22)"
+
+
+def text_w(s):
+    """Pixels a cell's text needs at the table's font (measured on Grafana 12.4.2), with the cell's padding."""
+    return int(sum(13.5 if ord(c) > 0x2fff else 9 if 0x2500 <= ord(c) < 0x2600 else 3.5 if c in "  " else 7.1 for c in s)) + 20
+
+
+def width_of(panel, name):
+    o = by_name(panel, name)
+    return next((p["value"] for p in o["properties"] if p["id"] == "custom.width"), None) if o else None
+
+
+def take(panel, need, name, floor):
+    """Takes up to `need` px from a column, down to `floor`; returns what is still missing."""
+    w = width_of(panel, name)
+    if need <= 0 or not w:
+        return need
+    t = min(need, max(0, w - floor))
+    if t:
+        set_props(panel, name, custom__width=w - t)
+    return need - t
+
+
+def style_segment_table(panel, rows, dist):
+    """T64: a segment table's title rows (one background over the row, blank cells) and its widths. A distribution table:
+    p50, p90, p99, 均值 at NUM_W and 有值 / 请求 wide enough for its text (hidden unless SHOW_HAS_VALUE); the room comes from
+    the name column (down to its longest name), then the share gauge (down to DIST_GAUGE_MIN), then the four number
+    columns (down to NUM_MIN). A single-request table keeps its widths, the name column as wide as its longest name."""
+    fc = panel["fieldConfig"]
+    fc["defaults"].setdefault("mappings", []).append({"type": "value", "options": {str(HDR): {"text": " ", "color": "transparent", "index": 0}}})
+    heads = [r.label for r in rows if r.kind == "header"]
+    set_props(panel, "阶段", custom__cellOptions={"type": "color-background", "mode": "basic", "applyToRow": True},
+              color={"mode": "fixed", "fixedColor": "transparent"},
+              mappings=[{"type": "value", "options": {x: {"color": GROUP_BG, "index": i} for i, x in enumerate(heads)}}])
+    need = max(text_w(r.label) for r in rows)
+    if not dist:
+        set_props(panel, "阶段", custom__width=max(need, width_of(panel, "阶段")))
         return
-    cut = -(-(need - have) // len(cols))
-    for c in cols:
-        set_props(panel, c, custom__width=width(c) - cut)
-    set_props(panel, "阶段", custom__width=need)
+    nums = ("p50", "p90", "p99", "均值")
+    for c in nums:
+        set_props(panel, c, custom__width=NUM_W)
+    if SHOW_HAS_VALUE:
+        set_props(panel, HAS_VALUE, custom__width=HAS_VALUE_W, custom__align="right", custom__hidden=False)
+    else:
+        set_props(panel, HAS_VALUE, custom__hidden=True)
+    set_props(panel, "阶段", custom__width=max(need, width_of(panel, "阶段")))
+    shown = ("阶段", "均值占比") + nums + ((HAS_VALUE,) if SHOW_HAS_VALUE else ())
+    over = sum(width_of(panel, c) or 0 for c in shown) - TABLE_W
+    over = take(panel, over, "阶段", need)
+    over = take(panel, over, "均值占比", DIST_GAUGE_MIN)
+    if over > 0:
+        cut = -(-over // len(nums))
+        for c in nums:
+            set_props(panel, c, custom__width=max(NUM_MIN, NUM_W - cut))
+        over -= min(cut, NUM_W - NUM_MIN) * len(nums)
+    if over > 0:
+        print("注意：%s 比半宽面板宽 %d 像素，右边要横向滚动" % (panel.get("title"), over))
+
+
+def has_value_expr(d, hdr="0"):
+    """T55 + T58 + T64 item 8: "k / n"; "k / n，未采 m" when m requests ran below the segment's level; "未采 m" when all did.
+    「未采」 is written only here, every number in it a count of requests; the number cells show 「—」 as for no value."""
+    return (f"multiIf({hdr} = 1, '{HDR}', ifNull({d}.n_all, 0) = 0 AND ifNull({d}.n_skip, 0) > 0, concat('未采 ', toString({d}.n_skip)), "
+            f"ifNull({d}.n_all, 0) = 0, NULL, "
+            f"ifNull({d}.n_skip, 0) > 0, concat(toString({d}.n), ' / ', toString({d}.n_all), '，未采 ', toString({d}.n_skip)), "
+            f"concat(toString({d}.n), ' / ', toString({d}.n_all)))")
 
 
 def dist_sql(tree, role):
     rows = rows_of(tree, role)
-    labels = "[" + ", ".join("'%s'" % dist_label(r) for r in rows) + "]"
+    labels = "[" + ", ".join("'%s'" % r.label for r in rows) + "]"
     shares = "[" + ", ".join("1" if r.share else "0" for r in rows) + "]"
     return (
-        f"WITH {s_window_cte(tree)},\n"
-        f"(SELECT avg({side_total(tree, role)}) FROM s) AS total_avg\n"
-        f"SELECT {labels}[idx] AS \"阶段\", if(d.n = 0, NULL, q[1]) AS p50, if(d.n = 0, NULL, q[2]) AS p90, if(d.n = 0, NULL, q[3]) AS p99,\n"
-        f"       if(d.n = 0, NULL, {no_nan('mean')}) AS \"均值\", if({shares}[idx] = 1 AND d.n > 0, {no_nan('accum / total_avg')}, NULL) AS \"均值占比\"\n"
-        f"FROM (SELECT toUInt8(number + 1) AS idx FROM numbers({len(rows)})) AS i LEFT JOIN (\n  {dist_parts(tree, rows, role)}\n) AS d USING idx\nORDER BY idx"
+        f"WITH {s_window_cte(tree)}\n"
+        f"SELECT {labels}[idx] AS \"阶段\", {cell(rows, 'idx', 'if(d.n = 0, NULL, q[1])')} AS p50, {cell(rows, 'idx', 'if(d.n = 0, NULL, q[2])')} AS p90, "
+        f"{cell(rows, 'idx', 'if(d.n = 0, NULL, q[3])')} AS p99,\n"
+        f"       {cell(rows, 'idx', 'if(d.n = 0, NULL, ' + no_nan('mean') + ')')} AS \"均值\", "
+        f"{cell(rows, 'idx', f'if({shares}[idx] = 1 AND d.n > 0, ' + no_nan('ssum / tsum') + ', NULL)')} AS \"均值占比\",\n"
+        f"       {has_value_expr('d', hdr_of(rows, 'idx'))} AS \"{HAS_VALUE}\"\n"
+        f"FROM (SELECT toUInt8(number + 1) AS idx FROM numbers({len(rows)})) AS i LEFT JOIN (\n  {dist_parts(tree, rows, role)}\n) AS d USING idx\n"
+        f"WHERE {arr(r.depth for r in rows)}[idx] <= {LEVEL}\nORDER BY idx"
     )
 
 
 def request_rows(tree, rows, role):
-    """One request's segments as rows; the request row gives the side total and the (empty) proxy segments."""
+    """One request's segments as rows; the request row gives the side total and the proxy segments."""
     total = "p_total_ms" if role == "prefill" else "d_total_ms"
     idx = "[" + ", ".join(str(i) for i in range(1, len(rows) + 1)) + "]"
     vals = ", ".join(f"toFloat64({r.expr})" for r in rows)
     steps = "toUInt32(0)" if role == "prefill" else "f.steps_rest"
     where = "request_id = '${request_id}'"
     pc = proxy_cols(tree, role)
+    lvq = levels_sql("x = '${request_id}'")
     return (
-        f"SELECT idx, ms, total_ms, steps FROM (SELECT f.*, s.{total} AS {total}{', ' + pc if pc else ''}, toFloat64({side_total(tree, role)}) AS total_ms, {steps} AS steps\n"
+        f"SELECT idx, ms, total_ms, steps, sl FROM (SELECT f.*, s.{total} AS {total}{', ' + pc if pc else ''}, toFloat64({side_total(tree, role)}) AS total_ms, {steps} AS steps, {level_of('dl', role)} AS sl\n"
         f"    FROM {one_anchor(tree)} AS s\n"
-        f"    LEFT JOIN ({fold(tree, role, where)}) AS f ON s.request_id = f.request_id)\n"
+        f"    LEFT JOIN ({fold(tree, role, where)}) AS f ON s.request_id = f.request_id\n"
+        f"    LEFT JOIN ({lvq}) AS dl ON dl.request_id = s.request_id)\n"
         f"  ARRAY JOIN {idx} AS idx, [{vals}] AS ms"
     )
 
 
+def detail_ms(rows):
+    """T64 item 8: a segment the request's side did not record at its level is empty, its name as always."""
+    return f"if(r.sl < {arr(x.lvl for x in rows)}[r.idx], NULL, r.ms)"
+
+
 def detail_p(tree):
-    rows = rows_of(tree, "prefill")
+    rows = rows_of(tree, "prefill", with_else=False)
     labels = "[" + ", ".join("'%s'" % r.label for r in rows) + "]"
     shares = "[" + ", ".join("1" if r.share else "0" for r in rows) + "]"
     opts = "[" + ", ".join("1" if r.opt else "0" for r in rows) + "]"
+    ms, H = detail_ms(rows), "r.idx"
     return (
         f"WITH {s_window_cte(tree)}\n"
-        f"SELECT {labels}[r.idx] AS \"阶段\", r.ms AS \"耗时\", if({shares}[r.idx] = 1, r.ms / r.total_ms, NULL) AS \"占P合计\", {no_nan('w.p50')} AS \"窗口 p50\",\n"
-        f"       if({opts}[r.idx] = 1 AND r.ms = 0, NULL, {no_nan('r.ms / nullIf(w.p50, 0)')}) AS \"相对 p50\"\n"
-        f"FROM (\n  {request_rows(tree, rows, 'prefill')}\n) AS r\nLEFT JOIN (\n  {dist_parts(tree, rows, 'prefill')}\n) AS w ON w.idx = r.idx\nORDER BY r.idx"
+        f"SELECT {labels}[r.idx] AS \"阶段\", {cell(rows, H, ms)} AS \"耗时\", {cell(rows, H, f'if({shares}[r.idx] = 1, {ms} / r.total_ms, NULL)')} AS \"占P合计\", "
+        f"{cell(rows, H, no_nan('w.p50'))} AS \"窗口 p50\",\n"
+        f"       {cell(rows, H, f'if({opts}[r.idx] = 1 AND r.ms = 0, NULL, ' + no_nan(f'{ms} / nullIf(w.p50, 0)') + ')')} AS \"相对 p50\"\n"
+        f"FROM (\n  {request_rows(tree, rows, 'prefill')}\n) AS r\nLEFT JOIN (\n  {dist_parts(tree, rows, 'prefill')}\n) AS w ON w.idx = r.idx\n"
+        f"WHERE {arr(x.depth for x in rows)}[r.idx] <= {LEVEL}\nORDER BY r.idx"
     )
 
 
 def detail_d(tree):
-    rows = rows_of(tree, "decode")
+    rows = rows_of(tree, "decode", with_else=False)
     labels = "[" + ", ".join("'%s'" % r.label for r in rows) + "]"
     rests = "[" + ", ".join("1" if r.rest else "0" for r in rows) + "]"
     shares = "[" + ", ".join("1" if r.share else "0" for r in rows) + "]"
+    ms, H = detail_ms(rows), "r.idx"
     return (
         f"WITH {s_window_cte(tree)}\n"
-        f"SELECT {labels}[r.idx] AS \"阶段\", r.ms AS \"耗时\", if({shares}[r.idx] = 1, r.ms / r.total_ms, NULL) AS \"占D合计\",\n"
-        f"       if({rests}[r.idx] = 1 AND r.steps > 0 AND isNotNull(r.ms), r.steps, NULL) AS \"步数\",\n"
-        f"       if({rests}[r.idx] = 1 AND r.steps > 0, r.ms / r.steps, NULL) AS \"每步均值\",\n"
-        f"       if({rests}[r.idx] = 0, {no_nan('w.p50')}, NULL) AS \"窗口 p50\",\n"
-        f"       if({rests}[r.idx] = 1, {no_nan('w.p50')}, NULL) AS \"窗口每步 p50\",\n"
-        f"       {no_nan(f'if({rests}[r.idx] = 1, if(r.steps > 0, (r.ms / r.steps) / nullIf(w.p50, 0), NULL), r.ms / nullIf(w.p50, 0))')} AS \"相对 p50\"\n"
-        f"FROM (\n  {request_rows(tree, rows, 'decode')}\n) AS r\nLEFT JOIN (\n  {dist_parts(tree, rows, 'decode')}\n) AS w ON w.idx = r.idx\nORDER BY r.idx"
+        f"SELECT {labels}[r.idx] AS \"阶段\", {cell(rows, H, ms)} AS \"耗时\", {cell(rows, H, f'if({shares}[r.idx] = 1, {ms} / r.total_ms, NULL)')} AS \"占D合计\",\n"
+        f"       {cell(rows, H, f'if({rests}[r.idx] = 1 AND r.steps > 0 AND isNotNull({ms}), r.steps, NULL)')} AS \"步数\",\n"
+        f"       {cell(rows, H, f'if({rests}[r.idx] = 1 AND r.steps > 0, {ms} / r.steps, NULL)')} AS \"每步均值\",\n"
+        f"       {cell(rows, H, f'if({rests}[r.idx] = 0, ' + no_nan('w.p50') + ', NULL)')} AS \"窗口 p50\",\n"
+        f"       {cell(rows, H, f'if({rests}[r.idx] = 1, ' + no_nan('w.p50') + ', NULL)')} AS \"窗口每步 p50\",\n"
+        f"       {cell(rows, H, no_nan(f'if({rests}[r.idx] = 1, if(r.steps > 0, ({ms} / r.steps) / nullIf(w.p50, 0), NULL), {ms} / nullIf(w.p50, 0))'))} AS \"相对 p50\"\n"
+        f"FROM (\n  {request_rows(tree, rows, 'decode')}\n) AS r\nLEFT JOIN (\n  {dist_parts(tree, rows, 'decode')}\n) AS w ON w.idx = r.idx\n"
+        f"WHERE {arr(x.depth for x in rows)}[r.idx] <= {LEVEL}\nORDER BY r.idx"
     )
+
 
 
 def label_short(req, rn="rn"):
@@ -553,7 +746,8 @@ def column_name(node):
         for w in STEP_WORDS:
             name = name.replace(w, "")
         return name
-    return ".".join(node.path[1:])
+    # T58: one zero-width space per level below L1, for the panel's filter on the 层级 variable (LEVEL_COL_RE)
+    return ".".join(node.path[1:]) + "\u200b" * (node.depth - 1)
 
 
 def detail_columns(nodes):
@@ -581,8 +775,9 @@ def timeline(tree):
     Nothing is clamped: with skewed clocks the gap between P's end and D's start can be negative."""
     empty = "CAST([], 'Array(Map(String, String))')"
 
-    def span(name, parent, svc, base, off, dur, tags=empty):
-        return f"tuple('{name}', '{parent}', '{svc}', toFloat64({base}) + toFloat64({off}), toFloat64({dur}), {tags})"
+    def span(name, parent, svc, base, off, dur, tags=empty, depth=1):
+        # T58: the 7th element is the segment's depth; the spans below the 层级 variable are left out
+        return f"tuple('{name}', '{parent}', '{svc}', toFloat64({base}) + toFloat64({off}), toFloat64({dur}), {tags}, toUInt8({depth}))"
 
     spans = []
     pb, db = "toUnixTimestamp64Milli(s.p_ts)", "toUnixTimestamp64Milli(s.d_ts)"
@@ -595,7 +790,7 @@ def timeline(tree):
         if tag_steps:
             tags = (f"[map('key', 'steps', 'value', toString({alias}.steps_rest)), map('key', 'per_step_ms', 'value', "
                     f"toString(round({filled_expr(node, alias)} / greatest({alias}.steps_rest, 1), 3)))]")
-        spans.append(span(name, parent_name, svc, base, off, filled_expr(node, alias), tags))
+        spans.append(span(name, parent_name, svc, base, off, filled_expr(node, alias), tags, node.depth))
         child_off = off
         for c in node.children:
             lay(c, alias, svc, letter, name, base, child_off, tag_steps)
@@ -632,12 +827,19 @@ def timeline(tree):
     spans.append(span("decode", "request", "decode", db, "0", "s.d_total_ms"))
     off = "0"
     for top in d["ttft"]:
+        # T56: comparison rows are not spans of the request; a segment outside the total is drawn where it starts but does
+        # not move the next one, as it overlaps the segments beside it.
+        if top.compare:
+            continue
         lay(top, "d", "decode", "D", "decode", db, off)
-        off = f"{off}+{filled_expr(top, 'd')}"
+        if not top.outside_total:
+            off = f"{off}+{filled_expr(top, 'd')}"
     first = "ifNull(s.d_ttft_ms, 0)"
     spans.append(span("D 第一个 token", "decode", "decode", db, first, "0"))
     spans.append(span("D 第二步起", "decode", "decode", db, first, f"ifNull(s.d_total_ms, 0) - {first}", "[map('key', 'steps', 'value', toString(d.steps_rest))]"))
     for top in d["tpot"]:
+        if top.compare:
+            continue
         lay(top, "d", "decode", "D", "D 第二步起", db, first, tag_steps=True)
     parallel(d, "d", "decode", "D", db, "并行（不计入合计，所有步之和）")
     where = "request_id = '${request_id}'"
@@ -648,7 +850,7 @@ def timeline(tree):
         f"LEFT JOIN ({fold(tree, 'prefill', where)}) AS p ON p.request_id = s.request_id\n"
         f"LEFT JOIN ({fold(tree, 'decode', where)}) AS d ON d.request_id = s.request_id\n"
         "ARRAY JOIN [" + ",\n".join(spans) + "] AS x\n"
-        "WHERE (x.5 > 0 OR x.1 = 'D 第一个 token') AND isNotNull(x.4)\nORDER BY startTime, x.5 DESC"
+        f"WHERE (x.5 > 0 OR x.1 = 'D 第一个 token') AND isNotNull(x.4) AND x.7 <= {LEVEL}\nORDER BY startTime, x.5 DESC"
     )
 
 
@@ -718,8 +920,8 @@ def views_sql(tree):
     if d["background"]:
         dbv, dbt = json_group(d["background"], "d")
         bg.append(("d", dbv, dbt))
-    p_l1 = "+".join(filled_expr(x, "p") for x in p["ttft"])
-    d_l1 = "+".join(filled_expr(x, "d") for x in d["ttft"])
+    p_l1 = "+".join(filled_expr(x, "p") for x in p["ttft"] if not x.outside_total)
+    d_l1 = "+".join(filled_expr(x, "d") for x in d["ttft"] if not x.outside_total)
 
     def recorded(role, alias):
         items = [f"if(isNotNull({alias}.{m.column}), {m.level}, 0)" for m in tree.nodes(role, "ttft", "tpot", "background")]
@@ -755,6 +957,10 @@ def views_sql(tree):
         f"tuple({', '.join(v for _, v, _ in bg)}), "
         f"tuple(if(s.p_total_ms > 0, {n % ('s.p_total_ms - (' + p_l1 + ')')}, NULL), if(s.d_first_ms > 0, {n % ('s.d_first_ms - (' + d_l1 + ')')}, NULL)), "
         f"tuple({recorded('prefill', 'p')}, {recorded('decode', 'd')}), "
+        # T58: 0 only when the request has no instance on that side (sent to D directly); a side whose summary record
+        # is missing counts as level 3, so its missing values still read as missing, not as "未采"
+        "tuple(toUInt8(if(isNull(nullIf(toString(s.p_instance), '')), 0, if(lvl.p_level = 0, 3, lvl.p_level))), "
+        "toUInt8(if(isNull(nullIf(toString(s.d_instance), '')), 0, if(lvl.d_level = 0, 3, lvl.d_level)))), "
         "greatest(ifNull(p.attempts, 0), ifNull(d.attempts, 0)), "
         f"arrayConcat({missing}, {missing_px + ', ' if missing_px else ''}if(ifNull(p.lines, 0) = {len(REQUEST_PROCS)}, [], [concat('prefill: ', toString(ifNull(p.lines, 0)), "
         f"' of {len(REQUEST_PROCS)} processes')]), "
@@ -772,6 +978,7 @@ def views_sql(tree):
         f"background Tuple({', '.join(k + ' ' + t for k, _, t in bg)}), "
         "checks Tuple(p_unattributed_ms Nullable(Float64), d_first_unattributed_ms Nullable(Float64)), "
         "recorded_level Tuple(p UInt8, d UInt8), "
+        "diag_level Tuple(p UInt8, d UInt8), "
         "attempts UInt32, missing Array(String))"
     )
     cfg = tree.raw.get("config_id", "")
@@ -783,7 +990,8 @@ def views_sql(tree):
         f"SELECT s.request_id AS request_id, toJSONString(CAST({expr}, '{typ}')) AS doc\n"
         f"FROM {anchor(tree, idw)} AS s\n"
         f"LEFT JOIN ({fold(tree, 'prefill', idw)}) AS p ON s.request_id = p.request_id\n"
-        f"LEFT JOIN ({fold(tree, 'decode', idw)}) AS d ON s.request_id = d.request_id;\n"
+        f"LEFT JOIN ({fold(tree, 'decode', idw)}) AS d ON s.request_id = d.request_id\n"
+        f"LEFT JOIN ({levels_sql('x = {id:String}')}) AS lvl ON s.request_id = lvl.request_id;\n"
         "-- One request event by event: SELECT * FROM vllm_pd.request_events(id = '<request id>')\n"
         "CREATE OR REPLACE VIEW vllm_pd.request_events AS\n"
         # The API server's own events carry only the observation ID (x is empty); they are found through the request's
@@ -852,7 +1060,7 @@ SELFCHECK_TABLE = """CREATE TABLE IF NOT EXISTS vllm_pd.filter_selfcheck
     seen UInt64, written UInt64, dropped UInt64, no_event UInt64, rank_dropped UInt64, accumulated UInt64, empty_key_dropped UInt64,
     errors UInt64, partials_written UInt64, evicted UInt64, forced UInt64, config_reloads UInt64, config_errors UInt64, inflight UInt64,
     files Array(String), instance_source LowCardinality(String), dp_rank_argv Nullable(Int32),
-    pair_unmatched UInt64, pair_negative UInt64, version_dropped UInt64
+    pair_unmatched UInt64, pair_negative UInt64, version_dropped UInt64, diag_level Nullable(UInt8)
 )
 ENGINE = MergeTree
 PARTITION BY toDate(ts)
@@ -972,7 +1180,8 @@ SETTINGS ttl_only_drop_parts = 1;""",
         out.append(f"ALTER TABLE {TABLE} ADD COLUMN IF NOT EXISTS {c} {t};")
     # Columns added after the first version of the self-check table, for a ClickHouse that keeps an earlier install's data.
     for c, t in (("instance_source", "LowCardinality(String)"), ("dp_rank_argv", "Nullable(Int32)"),
-                 ("pair_unmatched", "UInt64"), ("pair_negative", "UInt64"), ("version_dropped", "UInt64")) + CAND_COUNTS * bool(tree.raw.get("candidate")) + \
+                 ("pair_unmatched", "UInt64"), ("pair_negative", "UInt64"), ("version_dropped", "UInt64"),
+                 ("diag_level", "Nullable(UInt8)")) + CAND_COUNTS * bool(tree.raw.get("candidate")) + \
             FALLBACK_COUNTS * bool(acc_lists(tree.raw)) + EXEC_COUNTS * bool(tree.raw.get("missing_execution_id")):
         out.append(f"ALTER TABLE vllm_pd.filter_selfcheck ADD COLUMN IF NOT EXISTS {c} {t};")
     # Retention follows deploy.env every time this runs (EVENT_TTL_DAYS, SUMMARY_TTL_DAYS).
@@ -1139,6 +1348,14 @@ def build_board(tree):
         f"SELECT DISTINCT instance AS name FROM {LINE} WHERE $__timeFilter(ts) AND proc = 'api' AND part = '' "
         "ORDER BY startsWith(name, 'D'), toUInt32OrZero(substring(name, 2))"
     )
+    tl = board["templating"]["list"]
+    if not any(v["name"] == "level" for v in tl):
+        # T58: 层级 (1, 2, 3), default 3 (the user's choice): how deep the distribution tables, the single-request page and
+        # the Top-20 detail tables go
+        at_v = next((i + 1 for i, v in enumerate(tl) if v["name"] == "instance"), len(tl))
+        tl.insert(at_v, {"name": "level", "label": "层级", "type": "custom", "query": "1,2,3", "hide": 0, "multi": False, "includeAll": False,
+                         "current": {"selected": True, "text": "3", "value": "3"},
+                         "options": [{"selected": v == "3", "text": v, "value": v} for v in ("1", "2", "3")]})
     for v in board["templating"]["list"]:
         if v["name"] == "model":
             v["query"] = f"SELECT DISTINCT model FROM {LINE} WHERE $__timeFilter(ts) ORDER BY model"
@@ -1157,7 +1374,7 @@ def build_board(tree):
     sql("dist_p", dist_sql(tree, "prefill"))
     sql("dist_d", dist_sql(tree, "decode"))
     for key, role in (("dist_p", "prefill"), ("dist_d", "decode")):
-        fit_dist_names(get(key), [dist_label(r) for r in rows_of(tree, role)])
+        style_segment_table(get(key), rows_of(tree, role), True)
     add_steps_tables(panels, by_key, tree)
     sql("top", top_table(tree), title="Top-%d 最慢请求" % TOP_TABLE_N)
     top_paged(panels, get("top"))
@@ -1250,6 +1467,8 @@ def build_board(tree):
         panel["gridPos"] = dict(template["gridPos"], y=y0 + i * h)
         panel["title"] = "Top-20 子段明细 · %s（ms）" % name
         panel["targets"][0]["rawSql"] = top_detail(tree, total_label, role, cols)
+        panel["transformations"] = [x for x in panel.get("transformations", []) if x.get("id") != "filterFieldsByName"] + [
+            {"id": "filterFieldsByName", "options": {"include": {"pattern": LEVEL_COL_RE}}}]
         panels.insert(at + i, panel)
         by_key[panel["key"]] = panel
         fit_columns(panel, [name for name, _ in cols], gauges)
@@ -1267,9 +1486,12 @@ def build_board(tree):
     sql("timeline", timeline(tree))
     sql("detail_p", detail_p(tree))
     sql("detail_d", detail_d(tree))
+    style_segment_table(get("detail_p"), rows_of(tree, "prefill", with_else=False), False)
+    style_segment_table(get("detail_d"), rows_of(tree, "decode", with_else=False), False)
     sql("events", events_sql())
     rows_p, rows_d = len(rows_of(tree, "prefill")), len(rows_of(tree, "decode"))
     fit_height(by_key, ["dist_p", "dist_d"], max(rows_p, rows_d))
+    rows_p, rows_d = len(rows_of(tree, "prefill", with_else=False)), len(rows_of(tree, "decode", with_else=False))
     fit_height(by_key, ["detail_p", "detail_d"], max(rows_p, rows_d))
     for p_ in panels:
         p_.pop("key", None)

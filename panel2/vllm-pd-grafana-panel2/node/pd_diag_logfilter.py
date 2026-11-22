@@ -29,6 +29,7 @@ What it does in each process, driven by segments.json (the same file the monitor
     named pairs (cand_maps), the values added (cand_applied), steps whose named requests did not get every value before
     the step left the buffer (cand_unpaired), and steps pushed out by hold_steps before hold_seconds (cand_evicted_full);
   - every minute it writes one self-check line (event "pd_filter_selfcheck");
+    T58: the line carries diag_level, the PD_DIAG_LEVEL in effect in this process (1, 2 or 3; see _diag_level);
   - when segments.json changes on disk it is read again, without restarting vLLM.
 Any error is caught and counted here; nothing is raised into vLLM.
 
@@ -300,6 +301,24 @@ class _Req:
 
 class _File:
     __slots__ = ("role", "path", "fh", "bytes", "seq", "proc")
+
+
+def _diag_level():
+    """T58: the PD_DIAG_LEVEL in effect in this process, for the self-check line. The patches' own pd_diagnostics.diag_level()
+    (a (level, source) pair) when that module is already loaded (nothing is imported here), else the same rule on the
+    environment: exactly "1", "2" or "3" is that level; unset, empty or anything else (" 2 ", "2x", "0") is 3. Never raises."""
+    try:
+        mod = sys.modules.get("vllm.v1.metrics.pd_diagnostics")
+        fn = getattr(mod, "diag_level", None) if mod is not None else None
+        if fn is not None:
+            v = fn()
+            v = getattr(v, "level", v)
+            if isinstance(v, int) and not isinstance(v, bool) and v in (1, 2, 3):
+                return v
+    except Exception:
+        pass
+    v = os.environ.get("PD_DIAG_LEVEL")
+    return int(v) if v in ("1", "2", "3") else 3
 
 
 class PdDiagHandler(logging.Handler):
@@ -750,7 +769,7 @@ class PdDiagHandler(logging.Handler):
                    instance=self._instance, host=self._host, pid=os.getpid(), inflight=len(self._reqs),
                    instance_source=self._instance_source, dp_rank_argv=self._dp_rank,
                    files=sorted(os.path.basename(f.path) for f in self._files.values()),
-                   python=sys.version.split()[0], timestamp_ns=time.monotonic_ns())
+                   python=sys.version.split()[0], diag_level=_diag_level(), timestamp_ns=time.monotonic_ns())
         payload = json.dumps(row, separators=(",", ":"))
         for role, f in list(self._files.items()):
             self._write_raw(role, f.proc, payload)

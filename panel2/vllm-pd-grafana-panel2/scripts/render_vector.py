@@ -36,6 +36,12 @@ API_EVENT = "api_summary"
 PREFIXES = r"^(?:chatcmpl-|cmpl-|resp[-_])"
 PROC_OF_ROLE = {"api": "api", "engine": "engine", "worker": "worker", "pool": "save"}
 NATIVE_EVENT = "pd_native_put"
+# T58: Mooncake's own files (patch 04b, /data/pd-diag/logs/mooncake/mc.<start>.<pid>.<seq>.log) come back with the node
+# folder, as <machine>/mooncake/ or <machine>/d<n>/mooncake/. They are not node files: their names do not match the node
+# files' path pattern (api|engine|worker|pool), so read as node files every line would fail to parse. The puller pairs
+# them (scripts/native_put.py) and writes pd_native_put into _native/; the collector reads only that.
+NODE_EXCLUDE = ("/pull/*/mooncake/**", "/pull/*/d*/mooncake/**")
+EXTRA_EXCLUDE = ("/pull/_proxy/**", "/pull/_mooncake/**")
 # v3.1-extra: the proxy's files (proxy patch), /pull/_proxy/<machine>/<instance>/proxy.<start>.<pid>.<seq>.log, same line format.
 PROXY_PARSE = r'''
 file_path = string!(.file)
@@ -110,8 +116,10 @@ def collect(tree, raw):
                 for src in node.src or []:
                     if "event" not in src or "ranges" in src:
                         continue
+                    # T56: a comparison row reads vLLM's own figures, which are in seconds (unit "s"); everything else is ns.
+                    scale = 1000.0 if src.get("unit") == "s" else 1e-6
                     out.setdefault((side, src["event"]), []).append(dict(
-                        col=node.column, field=src.get("field", "duration_ns"), where=src.get("where") or {}, scale=1e-6, how="sum"))
+                        col=node.column, field=src.get("field", "duration_ns"), where=src.get("where") or {}, scale=scale, how="sum"))
         for name, spec in raw.get("request", {}).items():
             scale = 1000.0 if spec.get("unit") == "s" else (1e-6 if spec["field"].endswith("_ns") else None)
             out.setdefault((side, spec["event"]), []).append(dict(
@@ -324,7 +332,7 @@ if is_string(.ev.observation_id) { .observation_id = .ev.observation_id }
     w("sources:\n  vector_metrics:\n    type: internal_metrics\n    scrape_interval_secs: 5\n  timing:\n    type: file\n"
       "    include: [\"/pull/**/*.log\"]\n%s    read_from: beginning\n    ignore_older_secs: 604800\n    max_line_bytes: 1048576\n"
       "    fingerprint:\n      strategy: checksum\n      lines: 1\n    oldest_first: true" % (
-          "    exclude: [\"/pull/_proxy/**\", \"/pull/_mooncake/**\"]\n" if extra_dirs else ""))
+          "    exclude: [%s]\n" % ", ".join(json.dumps(x) for x in NODE_EXCLUDE + (EXTRA_EXCLUDE if extra_dirs else ()))))
     if proxy_cols:
         w("  proxy_files:\n    type: file\n    include: [\"/pull/_proxy/**/*.log\"]\n    read_from: beginning\n    ignore_older_secs: 604800\n"
           "    max_line_bytes: 1048576\n    fingerprint:\n      strategy: checksum\n      lines: 1\n    oldest_first: true")
@@ -452,6 +460,8 @@ e = .ev
      "partials_written": e.partials_written, "evicted": e.evicted, "forced": e.forced, "config_reloads": e.config_reloads,
      "config_errors": e.config_errors, "inflight": e.inflight, "python": e.python, "files": e.files, "role": .role,
      "instance_source": e.instance_source, "dp_rank_argv": e.dp_rank_argv, "version_dropped": e.version_dropped}
+# T58: the PD_DIAG_LEVEL in effect in the filter's process; null from a filter before T58
+if is_integer(e.diag_level) { .diag_level = e.diag_level }
 ''' + ("""if is_integer(e.cand_maps) { .cand_maps = e.cand_maps; .cand_applied = e.cand_applied; .cand_unpaired = e.cand_unpaired; .cand_evicted_full = e.cand_evicted_full }
 """ if raw.get("candidate") else "") + ("""if is_object(e.acc_fallback) { .acc_fallback = e.acc_fallback }
 """ if any(isinstance(a.get("value"), list) for a in raw.get("accumulate", [])) else "") + ("""if is_integer(e.exec_missing) { .exec_missing = e.exec_missing }

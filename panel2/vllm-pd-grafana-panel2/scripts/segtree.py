@@ -36,6 +36,18 @@ class Node:
         # "parallel": overlaps other segments in time (EngineCore and Worker wrappers around the steps); listed below the
         # side's total, never added to it, drawn on the timeline beside the segments it overlaps.
         self.parallel = bool(raw.get("parallel"))
+        # T56: "compare": a comparison row (vLLM's own figure, or the receive thread's wall clock), placed right after the
+        # segments it compares with, never a segment: no share of the side's total, not in the bars, the sum checks or the
+        # timeline. "outside_total": a segment that overlaps others in time (host time beside device time, the overhead
+        # A/B's host variant): shown, no share, not added into the side's first-level sums or bars.
+        self.compare = bool(raw.get("compare"))
+        self.outside_total = bool(raw.get("outside_total")) or self.compare
+        # T58: "from_level": the lowest PD_DIAG_LEVEL (1, 2, 3) at which the patches record this segment; a request whose
+        # side ran below it has no value here by design ("未采"), which the dashboard, the T55 column and coverage tell
+        # apart from a missing value. Default 1 (recorded at every level); never below the parent's.
+        self.from_level = raw.get("from_level", parent.from_level if parent is not None else 1)
+        if self.from_level not in (1, 2, 3) or (parent is not None and self.from_level < parent.from_level):
+            raise SystemExit("segments.json：%s 的 from_level 只能是 1、2、3，且不小于上一层的" % where)
         # Where the value comes from: a list of {"event": ..., "where": ..., "field": ...} (a field of a request-level record),
         # {"acc": ..., "part": ...} (the filter's per-request sums), or {"event": ..., "ranges": ..., "total": ..., "part":
         # "first" | "rest"} (the range of a request-level record's per-call list whose execution_id is the request's first
@@ -53,6 +65,8 @@ class Node:
                 raise SystemExit("segments.json：%s 的 part 只能是 total、first、rest" % where)
             if "ranges" in s and (s.get("part") not in ("first", "rest") or "total" not in s):
                 raise SystemExit("segments.json：%s 的 ranges 要写 total，part 只能是 first、rest" % where)
+            if s.get("unit", "ns") not in ("ns", "s") or ("unit" in s and "event" not in s):
+                raise SystemExit("segments.json：%s 的 unit 只能写在 event 来源上，取 ns（缺省）或 s" % where)
         self.children = []
         seen = set()
         for c in raw.get("children", []):
@@ -61,6 +75,8 @@ class Node:
                 raise SystemExit("segments.json：%s 下有两个 %s" % (where, child.id))
             seen.add(child.id)
             self.children.append(child)
+        if self.compare and (self.children or not self.src or parent is not None):
+            raise SystemExit("segments.json：%s 是对照行（compare），只能是第一层、没有子段、要写 src" % where)
         if phase == "proxy":
             self.proc = "proxy"
         if self.proc not in PROCS:

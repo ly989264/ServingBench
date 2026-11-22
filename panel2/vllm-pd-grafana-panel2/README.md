@@ -944,10 +944,12 @@ bin/panel2_cluster.sh quality <集群名>
 | 单请求拆解 | 官方 E2E：P / D；官方 TTFT：P / D；TPOT；tokens；路由与结果；P / D 时间线；P、D 两侧分段明细 |
 | 单请求事件 | 这个请求两侧的请求级记录，按时间排列（保留 `EVENT_TTL_DAYS` 天） |
 
-段和 L1 / L2 / L3 一致：P 侧 api 网关、P/D LB proxy、req_resolve、tokenizer、add_request、schedule（queue_time、hash、lookup、alloc、other）、等 put 完成、start_load_kv（submit、wait_for_transfer）、forward、sampling、detokenizer，后台 wait_for_save（build_key、lookup、prepare、sync、put：submit、wait_for_transfer、finalize）；D 侧 P/D LB proxy、req_resolve、tokenizer、add_request、schedule（queue_time、alloc、other）、start_load_kv（submit、wait_for_transfer）、第一步的 forward、sampling、detokenizer，第二步起的 schedule（alloc、other）、forward、sampling、detokenizer。每段取自哪条记录的哪个字段：
+段和 L1 / L2 / L3 一致：P 侧 api 网关、P/D LB proxy、req_resolve、tokenizer、add_request、schedule（queue_time、hash、lookup、alloc、other）、wait_for_put、start_load_kv（submit、wait_for_transfer）、forward、sampling、detokenizer，后台 wait_for_save（build_key、lookup、prepare、sync、put：submit、wait_for_transfer、finalize）；D 侧 P/D LB proxy、req_resolve、tokenizer、add_request、schedule（queue_time、alloc、other）、start_load_kv（submit、wait_for_transfer）、第一步的 forward、sampling、detokenizer，第二步起的 schedule（alloc、other）、forward、sampling、detokenizer。每段取自哪条记录的哪个字段：
 
 - **官方 E2E、官方 TTFT、TPOT、token 数、结束原因**：`api_summary`（`scope` 为 `request`）的 `official`，vLLM 自己统计的值，各侧从本侧收到请求算起。P、D 两侧分列，不相加：客户端视角的 E2E 和 TTFT 要 proxy 补丁之后才有。
-- **P 合计、D 合计**：`api_summary`（`scope` 为 `http`）的 `end_ns − start_ns`，各侧 API server 从收到请求到最后一个字节。
+- **P 合计、D 合计**：`api_summary`（`scope` 为 `http`）的 `end_ns − start_ns`，各侧 API server 从收到请求到最后一个字节。P 合计另加 P/D LB proxy（proxy 行的 `proxy_to_p_ms`），没有 proxy 行的请求按 0 加；D 合计不加 proxy。
+- **else**：两张分布表在合计的正上方各一行。每个请求的 else 是这一侧的合计减去算占比的一级段之和（段为空按 0，不减子段、对照行和后台），小于 0 记为 0；这一侧没有 `core_summary[request]` 的请求为空。单请求页没有这一行。
+- **均值占比**：这一段在这一侧已结束的请求上的耗时之和（为空按 0）除以同一批请求的合计之和。按粒度不记这一段的请求不算进这一批。
 - **req_resolve**：`api_summary[http]` 的 `stages.req_resolve` 加 `stages.render`；**tokenizer**：`stages.tokenize`；**add_request**：`api_summary[engine_submission]` 的 `stages.add_request`。add_request 的起点比 tokenize 的结束早几十微秒，照日志的值显示，不扣。
 - **detokenizer**：P 是 `api_summary[request]` 的 `terminal.detokenize_duration_ns`。D 的第一步是 `stages.detokenize.ranges[]` 里 `execution_id` 等于这个请求第一步的那一条（第一步由节点上的过滤器按这个请求最早出现的 `core_summary[execution]` 记下），第二步起是合计减第一步。ranges 有条数上限：第一步那一条不在里面时，D 的这两段都为空，部署后核验报这样的请求有几个。
 - **schedule 下的 queue_time、hash**：`core_summary`（`scope` 为 `request`）的 `stages.queue.initial_wait_ns`、`stages.hash.duration_ns`。一个请求有几条时只取 `timestamp_ns` 最晚的一条，部署后核验报这样的请求有几个。
@@ -956,8 +958,9 @@ bin/panel2_cluster.sh quality <集群名>
 - **P 侧轮次、D 侧总步数**：`core_summary[request]` 的 `members[]` 里这个请求那一项的 `executions`（有几条时取最晚的一条），各次尝试加在一起。P 侧是分块 prefill 的块数，被抢占后重做的步也算；D 侧是第一步加上第二步起的步数。
 - **排序依据**：总时间（D 官方 E2E）、P 官方 TTFT、P 侧执行最慢（P 侧合计）、D 侧执行最慢（D 侧合计）、TPOT。它决定取哪些请求；表头点击只把已经取出的请求重新排。
 - **时间段里的请求超过 20 万个时**，轮次、步数、分段时延分布和单请求拆解里的「窗口 p50」按请求抽样算：每 n 个请求取一个（按请求键的哈希），n 是请求数除以 20 万向上取整，所以查询的内存有上限。抽样的分位数和全量的差在抽样误差以内。
-- **分段时延分布**只算这一侧已经结束的请求（有 P 合计或 D 合计）：还在进行的请求只有一部分段，不计入。D 侧「第二步起」各行的 p50、p90、p99、均值是每步的值（每个请求的值除以它第二步起的步数），行名带「每步」；同一行的均值占比和下面的 D 合计是所有步之和。
-- **为空的段**：api 网关、P/D LB proxy（要 proxy 补丁）；等 put 完成、start_load_kv 及其子段、wait_for_save 及其子段（这一版日志里没有 KV 传输、KV 池的记录）。看板上为空，不计入分位数。
+- **分段时延分布**只算这一侧已经结束的请求（有 P 合计或 D 合计）：还在进行的请求只有一部分段，不计入。P 表的后台 wait_for_save 在标题行「后台任务」下；D 表分「第一步」「第二步起 · 每步」两组，各在一行标题行下。「第二步起 · 每步」各行的 p50、p90、p99、均值是每步的值（每个请求的值除以它第二步起的步数）；同一行的均值占比和下面的 D 合计是所有步之和。
+- **有值 / 请求**：两张分布表的最后一列，默认隐藏；在集群目录里执行 `bin/has_value.sh show` 显示，`bin/has_value.sh hide` 隐藏（改 deploy.env 的 `BOARD_HAS_VALUE`，再重新导入看板）。写法是 `k / n`；有 m 个请求的粒度低于这一段的起记级别时写 `k / n，未采 m`，全部低于时写 `未采 m`。
+- **为空的段**：api 网关、P/D LB proxy（要 proxy 补丁）；wait_for_put、start_load_kv 及其子段、wait_for_save 及其子段（这一版日志里没有 KV 传输、KV 池的记录）。看板上为空，不计入分位数。
 
 看板只读 `config_id` 等于这份 `segments.json` 的行（视图 `vllm_pd.phase_line_cur`）。更早版本写的行留在表里，到保留天数自然删掉，不在这一版的看板上出现。
 

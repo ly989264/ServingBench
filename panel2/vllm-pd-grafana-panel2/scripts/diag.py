@@ -569,34 +569,40 @@ def port_of(p):
     return m.group(1) if m else None
 
 
+def api_of(p, by_pid):
+    """The process itself when it is an API server, else its nearest API-server ancestor; None when there is none
+    (a process above vllm serve in the launch chain, such as a launcher script and the per-rank processes it starts)."""
+    seen = 0
+    while p is not None and seen < 32:
+        if is_api(p):
+            return p
+        p = by_pid.get(p["ppid"])
+        seen += 1
+    return None
+
+
 def to_procs(addr, names, clock, procs):
     """criteria.Proc for each vLLM process: instance from the --port of its API-server ancestor; an API server carries
     the PD_DIAG_INSTANCE_SOURCE its children see (the filter sets it in the parent's environment after exec, so
-    /proc/<pid>/environ of the parent never shows it)."""
+    /proc/<pid>/environ of the parent never shows it). Processes without an API-server ancestor are left out: they
+    are above vllm serve, belong to no instance and never write a record."""
     if not clock:
         return []
     now, up, hz = float(clock[0]), float(clock[1]), float(clock[2] or 100)
     by_pid = {p["pid"]: p for p in procs}
     name_of = {port: n for n, port in names}
 
-    def api_of(p):
-        seen = 0
-        while p is not None and seen < 32:
-            if is_api(p):
-                return p
-            p = by_pid.get(p["ppid"])
-            seen += 1
-        return None
-
     src_of_api = {}
     for p in procs:
-        a = api_of(p)
+        a = api_of(p, by_pid)
         if a is not None and a is not p and p["env"].get("PD_DIAG_INSTANCE_SOURCE"):
             src_of_api.setdefault(a["pid"], p["env"]["PD_DIAG_INSTANCE_SOURCE"])
     out = []
     for p in procs:
-        a = api_of(p)
-        inst = name_of.get(port_of(a) or "", "") if a is not None else ""
+        a = api_of(p, by_pid)
+        if a is None:
+            continue
+        inst = name_of.get(port_of(a) or "", "")
         env = {k: v for k, v in p["env"].items() if k in ENV_KEYS}
         if a is p and p["pid"] in src_of_api and not env.get("PD_DIAG_INSTANCE_SOURCE"):
             env["PD_DIAG_INSTANCE_SOURCE"] = src_of_api[p["pid"]]
@@ -933,6 +939,13 @@ def check_container(c, r, addr, cname, rows, conf_host, log_host, conf_in, log_i
     if not procs:
         r.add("FAIL", "%s %s：容器里没有找到 vLLM 进程（命令行含 vllm 的）" % (addr, cname))
         return
+    # processes above vllm serve (launch chain): no API-server ancestor, so neither children nor checked for variables
+    by_pid = {p["pid"]: p for p in procs}
+    above = [p for p in procs if api_of(p, by_pid) is None]
+    if above:
+        r.add("INFO", "%s %s：%d 个进程往上找不到 vLLM 主进程（多是启动链上 vllm serve 之上的进程），不算子进程，不进按实例的判断，不核对环境变量（%s）" % (
+            addr, cname, len(above), "，".join("%s pid %s" % (p["comm"], p["pid"]) for p in above[:6])))
+        procs = [p for p in procs if p not in above]
     api = [p for p in procs if is_api(p)]
     kids = [p for p in procs if p not in api]
     unread = [p for p in procs if not p["readable"]]
