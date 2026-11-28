@@ -1,0 +1,350 @@
+{
+ "schema": "vllm_pd.request.v2",
+ "cluster": "lab",
+ "seq": 1795771205242769,
+ "doc_version": 1,
+ "closed": "complete",
+ "request_id": "dd555cd5-4a4d-4919-8402-753c45c3f000",
+ "session_id": null,
+ "client_request_id": "t69-G21124175030-CAL-w300-000",
+ "model": "glm53-test",
+ "ts": "2026-11-24T09:50:26.631Z",
+ "route": {
+  "p": "P0",
+  "d": "D0",
+  "retries": 0
+ },
+ "result": {
+  "status": "completed",
+  "finish_reason": "length",
+  "http_status": 200
+ },
+ "tokens": {
+  "prompt": 420,
+  "cached": 0,
+  "output": 1
+ },
+ "latency_ms": {
+  "e2e": 72.545,
+  "starts_at": "proxy",
+  "ttft": 71.227,
+  "tpot": null,
+  "p_total": 9.904,
+  "d_total": 60.544,
+  "retry_ms": null,
+  "official": {
+   "p": {
+    "e2e": 6.054,
+    "ttft": 6.054
+   },
+   "d": {
+    "e2e": 56.994,
+    "ttft": 56.809,
+    "tpot": null
+   }
+  }
+ },
+ "ttft": {
+  "p": {
+   "api_gateway": {
+    "level": 1,
+    "ms": null
+   },
+   "lb_proxy": {
+    "level": 1,
+    "ms": 0.3
+   },
+   "req_resolve": {
+    "level": 1,
+    "ms": 2.23
+   },
+   "tokenizer": {
+    "level": 1,
+    "ms": 0.921
+   },
+   "add_request": {
+    "level": 1,
+    "ms": 0.6
+   },
+   "schedule": {
+    "level": 1,
+    "ms": 5.506,
+    "sub": {
+     "queue_time": {
+      "level": 2,
+      "ms": 5.36
+     },
+     "hash": {
+      "level": 2,
+      "ms": 0.044
+     },
+     "lookup": {
+      "level": 2,
+      "ms": 0.031
+     },
+     "alloc": {
+      "level": 2,
+      "ms": 0.021
+     },
+     "other": {
+      "level": 2,
+      "ms": 0.05
+     }
+    }
+   },
+   "wait_for_put": {
+    "level": 1,
+    "ms": 0.04
+   },
+   "start_load_kv": {
+    "level": 1,
+    "ms": null,
+    "sub": {
+     "submit": {
+      "level": 2,
+      "ms": null
+     },
+     "wait_for_transfer": {
+      "level": 2,
+      "ms": null
+     }
+    }
+   },
+   "forward": {
+    "level": 1,
+    "ms": 1.936
+   },
+   "sampling": {
+    "level": 1,
+    "ms": 0.12
+   },
+   "detokenizer": {
+    "level": 1,
+    "ms": 0.2
+   }
+  },
+  "d": {
+   "lb_proxy": {
+    "level": 1,
+    "ms": 0.4
+   },
+   "req_resolve": {
+    "level": 1,
+    "ms": 2.23
+   },
+   "tokenizer": {
+    "level": 1,
+    "ms": 0.921
+   },
+   "add_request": {
+    "level": 1,
+    "ms": 0.6
+   },
+   "schedule": {
+    "level": 1,
+    "ms": 0.175,
+    "sub": {
+     "queue_time": {
+      "level": 2,
+      "ms": 0.12
+     },
+     "alloc": {
+      "level": 2,
+      "ms": 0.015
+     },
+     "other": {
+      "level": 2,
+      "ms": 0.04
+     }
+    }
+   },
+   "start_load_kv": {
+    "level": 1,
+    "ms": 3.034,
+    "sub": {
+     "submit": {
+      "level": 2,
+      "ms": 0.05
+     },
+     "receive_queue": {
+      "level": 2,
+      "ms": 0.18
+     },
+     "prepare_read": {
+      "level": 2,
+      "ms": 0.31
+     },
+     "wait_for_transfer": {
+      "level": 2,
+      "ms": 2.434
+     }
+    }
+   },
+   "kv_ready_wait": {
+    "level": 1,
+    "ms": 25.477
+   },
+   "kv_wait_vllm": {
+    "level": 1,
+    "ms": 26.307
+   },
+   "prepare_inputs": {
+    "level": 1,
+    "ms": 0.901
+   },
+   "forward": {
+    "level": 1,
+    "ms": 16.38
+   },
+   "lm_head": {
+    "level": 1,
+    "ms": 0.36
+   },
+   "sampling": {
+    "level": 1,
+    "ms": 0.25
+   },
+   "draft": {
+    "level": 1,
+    "ms": 0.45
+   },
+   "first_step_vllm": {
+    "level": 1,
+    "ms": 30.502
+   },
+   "detokenizer": {
+    "level": 1,
+    "ms": 0.15
+   }
+  }
+ },
+ "tpot": {
+  "steps": 0,
+  "d": {
+   "schedule": {
+    "level": 1,
+    "ms": 0.0,
+    "per_step_ms": null,
+    "sub": {
+     "alloc": {
+      "level": 2,
+      "ms": 0.0,
+      "per_step_ms": null
+     },
+     "other": {
+      "level": 2,
+      "ms": 0.0,
+      "per_step_ms": null
+     }
+    }
+   },
+   "prepare_inputs": {
+    "level": 1,
+    "ms": 0.0,
+    "per_step_ms": null
+   },
+   "forward": {
+    "level": 1,
+    "ms": 0.0,
+    "per_step_ms": null
+   },
+   "lm_head": {
+    "level": 1,
+    "ms": 0.0,
+    "per_step_ms": null
+   },
+   "sampling": {
+    "level": 1,
+    "ms": 0.0,
+    "per_step_ms": null
+   },
+   "draft": {
+    "level": 1,
+    "ms": 0.0,
+    "per_step_ms": null
+   },
+   "detokenizer": {
+    "level": 1,
+    "ms": 0.0,
+    "per_step_ms": null
+   },
+   "rest_vllm": {
+    "level": 1,
+    "ms": 0.186,
+    "per_step_ms": null
+   }
+  }
+ },
+ "background": {
+  "p": {
+   "wait_for_save": {
+    "level": 1,
+    "ms": 3.303,
+    "sub": {
+     "build_key": {
+      "level": 2,
+      "ms": 0.03
+     },
+     "lookup": {
+      "level": 2,
+      "ms": 0.2
+     },
+     "prepare": {
+      "level": 2,
+      "ms": 0.18
+     },
+     "sync": {
+      "level": 2,
+      "ms": 0.025
+     },
+     "put": {
+      "level": 2,
+      "ms": 2.55,
+      "sub": {
+       "submit": {
+        "level": 3,
+        "ms": 0.18
+       },
+       "wait_for_transfer": {
+        "level": 3,
+        "ms": 0.83
+       },
+       "finalize": {
+        "level": 3,
+        "ms": 0.14
+       }
+      }
+     }
+    }
+   }
+  }
+ },
+ "checks": {
+  "p_unattributed_ms": -1.949,
+  "d_first_unattributed_ms": 5.88
+ },
+ "recorded_level": {
+  "p": 3,
+  "d": 2
+ },
+ "diag_level": {
+  "p": 3,
+  "d": 3
+ },
+ "attempts": 1,
+ "missing": [
+  "session_id",
+  "ttft.p.api_gateway",
+  "ttft.p.start_load_kv.sub.wait_for_transfer"
+ ],
+ "sides": {
+  "p": {
+   "start": "2026-11-24T09:50:26.631Z",
+   "executions": 1
+  },
+  "d": {
+   "start": "2026-11-24T09:50:26.642Z",
+   "executions": 1
+  }
+ }
+}

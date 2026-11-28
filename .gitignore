@@ -2,7 +2,7 @@
 local/
 # 打包输出
 panel1/dist/
-panel2/vllm-pd-grafana-panel2/generated/
+panel2-v3/vllm-pd-grafana-panel2/generated/
 *_filled.py
 *已填路径*
 .DS_Store

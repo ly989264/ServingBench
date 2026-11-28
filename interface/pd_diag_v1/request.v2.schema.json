@@ -1,0 +1,139 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "pd_diag/v1/request.v2.schema.json",
+  "title": "请求文档 vllm_pd.request.v2",
+  "description": "接口一的请求文档：一个请求一份。只固定结构，不列举段名；当前的段经段定义接口传递，段对象的路径为段定义的 doc_path。",
+  "type": "object",
+  "required": ["schema", "cluster", "seq", "doc_version", "closed", "request_id", "session_id", "client_request_id", "model", "ts",
+               "route", "result", "tokens", "latency_ms", "ttft", "tpot", "background", "checks", "recorded_level", "diag_level",
+               "attempts", "missing", "sides"],
+  "properties": {
+    "schema": {"const": "vllm_pd.request.v2"},
+    "cluster": {"type": "string", "pattern": "^[a-z0-9-]+$"},
+    "seq": {"type": "integer", "minimum": 1},
+    "doc_version": {"type": "integer", "minimum": 0},
+    "closed": {"enum": ["complete", "no_proxy", "incomplete", "evicted"]},
+    "request_id": {"type": "string", "minLength": 1},
+    "session_id": {"type": ["string", "null"]},
+    "client_request_id": {"type": ["string", "null"]},
+    "model": {"type": "string"},
+    "ts": {"$ref": "#/$defs/time"},
+    "route": {
+      "type": "object",
+      "required": ["p", "d", "retries"],
+      "properties": {
+        "p": {"type": ["string", "null"]},
+        "d": {"type": ["string", "null"]},
+        "retries": {"type": ["integer", "null"], "minimum": 0, "maximum": 255}
+      }
+    },
+    "result": {
+      "type": "object",
+      "required": ["status", "finish_reason", "http_status"],
+      "properties": {
+        "status": {"type": ["string", "null"]},
+        "finish_reason": {"type": ["string", "null"]},
+        "http_status": {"type": ["integer", "null"]}
+      }
+    },
+    "tokens": {
+      "type": "object",
+      "required": ["prompt", "cached", "output"],
+      "properties": {
+        "prompt": {"$ref": "#/$defs/count"},
+        "cached": {"$ref": "#/$defs/count"},
+        "output": {"$ref": "#/$defs/count"}
+      }
+    },
+    "latency_ms": {
+      "type": "object",
+      "required": ["e2e", "starts_at", "ttft", "tpot", "p_total", "d_total", "retry_ms", "official"],
+      "properties": {
+        "e2e": {"$ref": "#/$defs/ms"},
+        "starts_at": {"enum": ["proxy", "instance"]},
+        "ttft": {"$ref": "#/$defs/ms"},
+        "tpot": {"$ref": "#/$defs/ms"},
+        "p_total": {"$ref": "#/$defs/ms"},
+        "d_total": {"$ref": "#/$defs/ms"},
+        "retry_ms": {"$ref": "#/$defs/ms"},
+        "official": {
+          "type": "object",
+          "required": ["p", "d"],
+          "properties": {
+            "p": {"type": "object", "required": ["e2e", "ttft"],
+                  "properties": {"e2e": {"$ref": "#/$defs/ms"}, "ttft": {"$ref": "#/$defs/ms"}}},
+            "d": {"type": "object", "required": ["e2e", "ttft", "tpot"],
+                  "properties": {"e2e": {"$ref": "#/$defs/ms"}, "ttft": {"$ref": "#/$defs/ms"}, "tpot": {"$ref": "#/$defs/ms"}}}
+          }
+        }
+      }
+    },
+    "ttft": {
+      "type": "object",
+      "required": ["p", "d"],
+      "properties": {"p": {"$ref": "#/$defs/segments"}, "d": {"$ref": "#/$defs/segments"}},
+      "additionalProperties": false
+    },
+    "tpot": {
+      "type": "object",
+      "required": ["steps", "d"],
+      "properties": {"steps": {"type": "integer", "minimum": 0}, "d": {"$ref": "#/$defs/step_segments"}},
+      "additionalProperties": false
+    },
+    "background": {
+      "type": "object",
+      "properties": {"p": {"$ref": "#/$defs/segments"}, "d": {"$ref": "#/$defs/segments"}},
+      "additionalProperties": false
+    },
+    "checks": {
+      "type": "object",
+      "required": ["p_unattributed_ms", "d_first_unattributed_ms"],
+      "properties": {"p_unattributed_ms": {"$ref": "#/$defs/ms_signed"}, "d_first_unattributed_ms": {"$ref": "#/$defs/ms_signed"}}
+    },
+    "recorded_level": {"$ref": "#/$defs/levels"},
+    "diag_level": {"$ref": "#/$defs/levels"},
+    "attempts": {"type": "integer", "minimum": 0},
+    "missing": {"type": "array", "items": {"type": "string"}},
+    "sides": {
+      "type": "object",
+      "properties": {"p": {"$ref": "#/$defs/side"}, "d": {"$ref": "#/$defs/side"}},
+      "additionalProperties": false
+    }
+  },
+  "$defs": {
+    "time": {"type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$"},
+    "count": {"type": ["integer", "null"], "minimum": 0},
+    "ms": {"type": ["number", "null"], "minimum": 0},
+    "ms_signed": {"type": ["number", "null"]},
+    "level": {"type": ["integer", "null"], "minimum": 0, "maximum": 3},
+    "levels": {"type": "object", "required": ["p", "d"], "properties": {"p": {"$ref": "#/$defs/level"}, "d": {"$ref": "#/$defs/level"}}},
+    "segment": {
+      "type": "object",
+      "required": ["level", "ms"],
+      "properties": {
+        "level": {"type": "integer", "minimum": 1, "maximum": 3},
+        "ms": {"$ref": "#/$defs/ms_signed"},
+        "sub": {"$ref": "#/$defs/segments"}
+      },
+      "additionalProperties": false
+    },
+    "step_segment": {
+      "type": "object",
+      "required": ["level", "ms", "per_step_ms"],
+      "properties": {
+        "level": {"type": "integer", "minimum": 1, "maximum": 3},
+        "ms": {"$ref": "#/$defs/ms_signed"},
+        "per_step_ms": {"$ref": "#/$defs/ms_signed"},
+        "sub": {"$ref": "#/$defs/step_segments"}
+      },
+      "additionalProperties": false
+    },
+    "segments": {"type": "object", "propertyNames": {"pattern": "^[a-z][a-z0-9_]*$"}, "additionalProperties": {"$ref": "#/$defs/segment"}},
+    "step_segments": {"type": "object", "propertyNames": {"pattern": "^[a-z][a-z0-9_]*$"}, "additionalProperties": {"$ref": "#/$defs/step_segment"}},
+    "side": {
+      "type": "object",
+      "required": ["start", "executions"],
+      "properties": {"start": {"anyOf": [{"$ref": "#/$defs/time"}, {"type": "null"}]}, "executions": {"$ref": "#/$defs/count"}}
+    }
+  }
+}

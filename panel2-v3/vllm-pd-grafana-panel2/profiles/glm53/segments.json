@@ -1,0 +1,1191 @@
+{
+  "version": 2,
+  "config_id": "pd-diag-v3.3-extra-glm53-2026-11-20a",
+  "line": {
+    "marker": "[PD_DIAG] ",
+    "logger": "vllm.v1.metrics.pd_diagnostics",
+    "time_format": "iso8601_ms_offset",
+    "log_dir": "/var/log/pd-diag",
+    "rotate_mib": 256,
+    "keep_hours": 12,
+    "flush_seconds": 5,
+    "selfcheck_seconds": 60,
+    "idle_evict_seconds": 120,
+    "max_requests": 20000,
+    "record_version": 2
+  },
+  "roles": {
+    "by_process_name": [
+      {
+        "contains": "EngineCore",
+        "role": "engine"
+      },
+      {
+        "contains": "Worker",
+        "role": "worker"
+      },
+      {
+        "contains": "APIServer",
+        "role": "api"
+      },
+      {
+        "contains": "MainProcess",
+        "role": "api"
+      }
+    ],
+    "by_event_prefix": [
+      {
+        "prefix": "worker_summary",
+        "role": "worker",
+        "from": [
+          "engine"
+        ]
+      },
+      {
+        "prefix": "pool_task",
+        "role": "pool"
+      }
+    ],
+    "keep_tp_rank": [
+      0
+    ],
+    "ranked_roles": [
+      "worker",
+      "pool"
+    ]
+  },
+  "passthrough": [
+    "api_summary",
+    {
+      "event": "core_summary",
+      "where": {
+        "scope": "request"
+      }
+    }
+  ],
+  "accumulate": [
+    {
+      "id": "lookup",
+      "role": "engine",
+      "event": "core_summary",
+      "where": {
+        "scope": "execution"
+      },
+      "key": "request_ids",
+      "value": "stages.lookup.duration_ns"
+    },
+    {
+      "id": "alloc",
+      "role": "engine",
+      "event": "core_summary",
+      "where": {
+        "scope": "execution"
+      },
+      "key": "request_ids",
+      "value": "stages.alloc.duration_ns"
+    },
+    {
+      "id": "schedule_other",
+      "role": "engine",
+      "event": "core_summary",
+      "where": {
+        "scope": "execution"
+      },
+      "key": "request_ids",
+      "value": "stages.other.duration_ns"
+    },
+    {
+      "id": "forward",
+      "role": "worker",
+      "event": "worker_summary",
+      "where": {
+        "phase": "execute"
+      },
+      "key": "request_ids",
+      "value": [
+        "stages.forward.device_duration_ns"
+      ]
+    },
+    {
+      "id": "sampling",
+      "role": "worker",
+      "event": "worker_summary",
+      "where": {
+        "phase": "sample"
+      },
+      "key": "request_ids",
+      "value": [
+        "stages.sampling.device_duration_ns"
+      ]
+    },
+    {
+      "id": "wait_for_put",
+      "role": "worker",
+      "event": "worker_summary",
+      "where": {
+        "phase": "execute"
+      },
+      "key": "request_ids",
+      "value": "stages.wait_for_put.duration_ns"
+    },
+    {
+      "id": "prepare_inputs",
+      "role": "worker",
+      "event": "worker_summary",
+      "where": {
+        "phase": "execute"
+      },
+      "key": "request_ids",
+      "value": [
+        "stages.prepare_inputs.device_duration_ns"
+      ]
+    },
+    {
+      "id": "lm_head",
+      "role": "worker",
+      "event": "worker_summary",
+      "where": {
+        "phase": "execute"
+      },
+      "key": "request_ids",
+      "value": [
+        "stages.lm_head.device_duration_ns"
+      ]
+    },
+    {
+      "id": "draft",
+      "role": "worker",
+      "event": "worker_summary",
+      "where": {
+        "phase": "sample"
+      },
+      "key": "request_ids",
+      "value": [
+        "stages.draft.device_duration_ns"
+      ]
+    },
+    {
+      "id": "step_device_span",
+      "role": "worker",
+      "event": "worker_summary",
+      "where": {
+        "phase": "sample"
+      },
+      "key": "request_ids",
+      "value": "step_device_span_ns"
+    },
+    {
+      "id": "graph_full",
+      "role": "worker",
+      "event": "worker_summary",
+      "where": {
+        "phase": "execute",
+        "cudagraph_runtime_mode": "FULL"
+      },
+      "key": "request_ids",
+      "value": "stages.forward.duration_ns"
+    },
+    {
+      "id": "graph_piecewise",
+      "role": "worker",
+      "event": "worker_summary",
+      "where": {
+        "phase": "execute",
+        "cudagraph_runtime_mode": "PIECEWISE"
+      },
+      "key": "request_ids",
+      "value": "stages.forward.duration_ns"
+    },
+    {
+      "id": "graph_none",
+      "role": "worker",
+      "event": "worker_summary",
+      "where": {
+        "phase": "execute",
+        "cudagraph_runtime_mode": "NONE"
+      },
+      "key": "request_ids",
+      "value": "stages.forward.duration_ns"
+    },
+    {
+      "id": "bookkeeping",
+      "role": "worker",
+      "event": "worker_summary",
+      "where": {
+        "phase": "sample"
+      },
+      "key": "request_ids",
+      "value": [
+        "stages.bookkeeping.device_duration_ns"
+      ]
+    }
+  ],
+  "candidate": {
+    "map": [
+      {
+        "event": "pd_transfer_summary",
+        "where": {
+          "scope": "link",
+          "transfer_role": "consumer"
+        }
+      },
+      {
+        "event": "pd_transfer_summary",
+        "where": {
+          "scope": "link",
+          "transfer_role": "pool_load"
+        }
+      },
+      {
+        "event": "pd_transfer_summary",
+        "where": {
+          "scope": "task"
+        }
+      },
+      {
+        "event": "pool_task",
+        "where": {
+          "scope": "task",
+          "operation": "load_submit",
+          "status": "submission_returned"
+        }
+      }
+    ],
+    "accumulate": [
+      {
+        "id": "cand_submit",
+        "role": "worker",
+        "event": "worker_summary",
+        "where": {
+          "phase": "execute"
+        },
+        "value": "stages.submit.duration_ns"
+      },
+      {
+        "id": "cand_lookup",
+        "role": "engine",
+        "event": "core_summary",
+        "where": {
+          "scope": "execution"
+        },
+        "value": "stages.lookup.duration_ns"
+      },
+      {
+        "id": "cand_alloc",
+        "role": "engine",
+        "event": "core_summary",
+        "where": {
+          "scope": "execution"
+        },
+        "value": "stages.alloc.duration_ns"
+      },
+      {
+        "id": "cand_other",
+        "role": "engine",
+        "event": "core_summary",
+        "where": {
+          "scope": "execution"
+        },
+        "value": "stages.other.duration_ns"
+      }
+    ],
+    "hold_steps": 8192,
+    "hold_seconds": 120
+  },
+  "shared_members": [
+    "pool_task",
+    "pd_native_put"
+  ],
+  "missing_execution_id": "own_step_first_null",
+  "sides": {
+    "prefill": {
+      "name": "P",
+      "total_label": "P 合计",
+      "proxy": [
+        {
+          "id": "api_gateway",
+          "label": "api 网关",
+          "before_proxy": true,
+          "src": null
+        },
+        {
+          "id": "lb_proxy",
+          "label": "P/D LB proxy",
+          "column": "proxy_to_p_ms",
+          "src": [
+            {
+              "proxy": "proxy_to_p_ms"
+            }
+          ]
+        }
+      ],
+      "ttft": [
+        {
+          "id": "req_resolve",
+          "proc": "api",
+          "src": [
+            {
+              "event": "api_summary",
+              "where": {
+                "scope": "http"
+              },
+              "field": "stages.req_resolve.duration_ns"
+            },
+            {
+              "event": "api_summary",
+              "where": {
+                "scope": "http"
+              },
+              "field": "stages.render.duration_ns"
+            }
+          ]
+        },
+        {
+          "id": "tokenizer",
+          "proc": "api",
+          "src": [
+            {
+              "event": "api_summary",
+              "where": {
+                "scope": "http"
+              },
+              "field": "stages.tokenize.duration_ns"
+            }
+          ]
+        },
+        {
+          "id": "add_request",
+          "proc": "api",
+          "src": [
+            {
+              "event": "api_summary",
+              "where": {
+                "scope": "engine_submission"
+              },
+              "field": "stages.add_request.duration_ns"
+            }
+          ]
+        },
+        {
+          "id": "schedule",
+          "short": "sched",
+          "proc": "engine",
+          "children": [
+            {
+              "id": "queue_time",
+              "proc": "engine",
+              "src": [
+                {
+                  "event": "core_summary",
+                  "where": {
+                    "scope": "request"
+                  },
+                  "field": "stages.queue.initial_wait_ns"
+                }
+              ]
+            },
+            {
+              "id": "hash",
+              "proc": "engine",
+              "src": [
+                {
+                  "event": "core_summary",
+                  "where": {
+                    "scope": "request"
+                  },
+                  "field": "stages.hash.duration_ns"
+                }
+              ]
+            },
+            {
+              "id": "lookup",
+              "proc": "engine",
+              "src": [
+                {
+                  "acc": "lookup",
+                  "part": "total"
+                },
+                {
+                  "acc": "cand_lookup",
+                  "part": "total"
+                }
+              ]
+            },
+            {
+              "id": "alloc",
+              "proc": "engine",
+              "src": [
+                {
+                  "acc": "alloc",
+                  "part": "total"
+                },
+                {
+                  "acc": "cand_alloc",
+                  "part": "total"
+                }
+              ]
+            },
+            {
+              "id": "other",
+              "proc": "engine",
+              "src": [
+                {
+                  "acc": "schedule_other",
+                  "part": "total"
+                },
+                {
+                  "acc": "cand_other",
+                  "part": "total"
+                }
+              ],
+              "label": "other"
+            }
+          ]
+        },
+        {
+          "id": "wait_for_put",
+          "label": "wait_for_put",
+          "proc": "worker",
+          "src": [
+            {
+              "acc": "wait_for_put",
+              "part": "total"
+            }
+          ]
+        },
+        {
+          "id": "start_load_kv",
+          "short": "load",
+          "optional": true,
+          "proc": "engine",
+          "children": [
+            {
+              "id": "submit",
+              "proc": "worker",
+              "optional": true,
+              "src": [
+                {
+                  "event": "pool_task",
+                  "where": {
+                    "scope": "task",
+                    "operation": "load",
+                    "status": "succeeded"
+                  },
+                  "field": "duration_ns"
+                },
+                {
+                  "event": "pool_task",
+                  "where": {
+                    "scope": "task",
+                    "operation": "load",
+                    "status": "backend_failure"
+                  },
+                  "field": "duration_ns"
+                },
+                {
+                  "event": "pool_task",
+                  "where": {
+                    "scope": "task",
+                    "operation": "load",
+                    "status": "unknown_result"
+                  },
+                  "field": "duration_ns"
+                },
+                {
+                  "event": "pool_task",
+                  "where": {
+                    "scope": "task",
+                    "operation": "load",
+                    "status": "exception"
+                  },
+                  "field": "duration_ns"
+                }
+              ]
+            },
+            {
+              "id": "wait_for_transfer",
+              "proc": "worker",
+              "optional": true,
+              "src": null
+            }
+          ]
+        },
+        {
+          "id": "forward",
+          "label": "forward",
+          "proc": "worker",
+          "src": [
+            {
+              "acc": "forward",
+              "part": "total"
+            }
+          ]
+        },
+        {
+          "id": "sampling",
+          "label": "sampling",
+          "proc": "worker",
+          "src": [
+            {
+              "acc": "sampling",
+              "part": "total"
+            }
+          ]
+        },
+        {
+          "id": "detokenizer",
+          "proc": "api",
+          "src": [
+            {
+              "event": "api_summary",
+              "where": {
+                "scope": "request"
+              },
+              "field": "terminal.detokenize_duration_ns"
+            }
+          ]
+        }
+      ],
+      "background": [
+        {
+          "id": "wait_for_save",
+          "short": "save",
+          "label": "wait_for_save",
+          "proc": "save",
+          "src": [
+            {
+              "event": "pool_task",
+              "where": {
+                "scope": "task",
+                "operation": "save"
+              },
+              "field": "counters.queue_wait_ns"
+            },
+            {
+              "event": "pool_task",
+              "where": {
+                "scope": "task",
+                "operation": "save"
+              },
+              "field": "duration_ns"
+            }
+          ],
+          "children": [
+            {
+              "id": "build_key",
+              "proc": "save",
+              "src": [
+                {
+                  "event": "pool_task",
+                  "where": {
+                    "scope": "task",
+                    "operation": "save"
+                  },
+                  "field": "stages.build_key.duration_ns"
+                }
+              ],
+              "from_level": 2
+            },
+            {
+              "id": "lookup",
+              "proc": "save",
+              "src": [
+                {
+                  "event": "pool_task",
+                  "where": {
+                    "scope": "task",
+                    "operation": "save"
+                  },
+                  "field": "stages.lookup.duration_ns"
+                }
+              ],
+              "from_level": 2
+            },
+            {
+              "id": "prepare",
+              "proc": "save",
+              "src": [
+                {
+                  "event": "pool_task",
+                  "where": {
+                    "scope": "task",
+                    "operation": "save"
+                  },
+                  "field": "stages.prepare.duration_ns"
+                }
+              ],
+              "from_level": 2
+            },
+            {
+              "id": "sync",
+              "proc": "save",
+              "src": [
+                {
+                  "event": "pool_task",
+                  "where": {
+                    "scope": "task",
+                    "operation": "save"
+                  },
+                  "field": "stages.sync.duration_ns"
+                }
+              ],
+              "from_level": 2
+            },
+            {
+              "id": "put",
+              "proc": "save",
+              "src": [
+                {
+                  "event": "pool_task",
+                  "where": {
+                    "scope": "task",
+                    "operation": "save"
+                  },
+                  "field": "stages.put.duration_ns"
+                }
+              ],
+              "children": [
+                {
+                  "id": "submit",
+                  "proc": "save",
+                  "src": [
+                    {
+                      "event": "pd_native_put",
+                      "field": "stages.submit.duration_ns"
+                    }
+                  ],
+                  "from_level": 3
+                },
+                {
+                  "id": "wait_for_transfer",
+                  "proc": "save",
+                  "src": [
+                    {
+                      "event": "pd_native_put",
+                      "field": "stages.wait_for_transfer.duration_ns"
+                    }
+                  ],
+                  "from_level": 3
+                },
+                {
+                  "id": "finalize",
+                  "proc": "save",
+                  "src": [
+                    {
+                      "event": "pd_native_put",
+                      "field": "stages.finalize.duration_ns"
+                    }
+                  ],
+                  "from_level": 3
+                }
+              ],
+              "from_level": 2
+            }
+          ]
+        }
+      ]
+    },
+    "decode": {
+      "name": "D",
+      "total_label": "D 合计",
+      "proxy": [
+        {
+          "id": "lb_proxy",
+          "label": "P/D LB proxy",
+          "column": "proxy_to_d_ms",
+          "src": [
+            {
+              "proxy": "proxy_to_d_ms"
+            }
+          ]
+        }
+      ],
+      "ttft": [
+        {
+          "id": "req_resolve",
+          "proc": "api",
+          "src": [
+            {
+              "event": "api_summary",
+              "where": {
+                "scope": "http"
+              },
+              "field": "stages.req_resolve.duration_ns"
+            },
+            {
+              "event": "api_summary",
+              "where": {
+                "scope": "http"
+              },
+              "field": "stages.render.duration_ns"
+            }
+          ]
+        },
+        {
+          "id": "tokenizer",
+          "proc": "api",
+          "src": [
+            {
+              "event": "api_summary",
+              "where": {
+                "scope": "http"
+              },
+              "field": "stages.tokenize.duration_ns"
+            }
+          ]
+        },
+        {
+          "id": "add_request",
+          "proc": "api",
+          "src": [
+            {
+              "event": "api_summary",
+              "where": {
+                "scope": "engine_submission"
+              },
+              "field": "stages.add_request.duration_ns"
+            }
+          ]
+        },
+        {
+          "id": "schedule",
+          "short": "sched",
+          "proc": "engine",
+          "children": [
+            {
+              "id": "queue_time",
+              "proc": "engine",
+              "src": [
+                {
+                  "event": "core_summary",
+                  "where": {
+                    "scope": "request"
+                  },
+                  "field": "stages.queue.initial_wait_ns"
+                }
+              ]
+            },
+            {
+              "id": "alloc",
+              "proc": "engine",
+              "src": [
+                {
+                  "acc": "alloc",
+                  "part": "first"
+                }
+              ]
+            },
+            {
+              "id": "other",
+              "proc": "engine",
+              "src": [
+                {
+                  "acc": "schedule_other",
+                  "part": "first"
+                }
+              ],
+              "label": "other"
+            }
+          ]
+        },
+        {
+          "id": "start_load_kv",
+          "short": "load",
+          "proc": "engine",
+          "children": [
+            {
+              "id": "submit",
+              "proc": "worker",
+              "src": [
+                {
+                  "acc": "cand_submit",
+                  "part": "total"
+                }
+              ],
+              "from_level": 2
+            },
+            {
+              "id": "receive_queue",
+              "label": "receive_queue",
+              "proc": "worker",
+              "src": [
+                {
+                  "event": "pd_transfer_summary",
+                  "where": {
+                    "scope": "request_generation"
+                  },
+                  "field": "task_max_queue_wait_ns"
+                }
+              ],
+              "from_level": 2
+            },
+            {
+              "id": "prepare_read",
+              "label": "prepare_read",
+              "proc": "worker",
+              "src": [
+                {
+                  "event": "pd_transfer_summary",
+                  "where": {
+                    "scope": "request_generation"
+                  },
+                  "field": "task_max_meta_fetch_ns"
+                },
+                {
+                  "event": "pd_transfer_summary",
+                  "where": {
+                    "scope": "request_generation"
+                  },
+                  "field": "task_max_prepare_ns"
+                }
+              ],
+              "from_level": 2
+            },
+            {
+              "id": "wait_for_transfer",
+              "proc": "engine",
+              "src": [
+                {
+                  "event": "pd_transfer_summary",
+                  "where": {
+                    "scope": "request_generation"
+                  },
+                  "field": "transfer_envelope_ns"
+                }
+              ],
+              "from_level": 2
+            }
+          ],
+          "src": [
+            {
+              "event": "pd_transfer_summary",
+              "where": {
+                "scope": "request_generation"
+              },
+              "field": "kv_load_envelope_ns"
+            }
+          ]
+        },
+        {
+          "id": "kv_ready_wait",
+          "label": "kv_ready_wait",
+          "proc": "engine",
+          "src": [
+            {
+              "event": "core_summary",
+              "where": {
+                "scope": "request"
+              },
+              "field": "stages.kv_ready_wait.duration_ns"
+            }
+          ]
+        },
+        {
+          "id": "kv_wait_vllm",
+          "label": "queued_time (vLLM)",
+          "proc": "api",
+          "compare": true,
+          "src": [
+            {
+              "event": "api_summary",
+              "where": {
+                "scope": "request"
+              },
+              "field": "official.queued_time",
+              "unit": "s"
+            }
+          ]
+        },
+        {
+          "id": "prepare_inputs",
+          "label": "prepare_inputs（第一步）",
+          "proc": "worker",
+          "src": [
+            {
+              "acc": "prepare_inputs",
+              "part": "first"
+            }
+          ]
+        },
+        {
+          "id": "forward",
+          "label": "forward（第一步）",
+          "proc": "worker",
+          "src": [
+            {
+              "acc": "forward",
+              "part": "first"
+            }
+          ]
+        },
+        {
+          "id": "lm_head",
+          "label": "lm_head（第一步）",
+          "proc": "worker",
+          "src": [
+            {
+              "acc": "lm_head",
+              "part": "first"
+            }
+          ]
+        },
+        {
+          "id": "sampling",
+          "label": "sampling（第一步）",
+          "proc": "worker",
+          "src": [
+            {
+              "acc": "sampling",
+              "part": "first"
+            }
+          ]
+        },
+        {
+          "id": "draft",
+          "label": "draft（第一步）",
+          "proc": "worker",
+          "src": [
+            {
+              "acc": "draft",
+              "part": "first"
+            }
+          ]
+        },
+        {
+          "id": "first_step_vllm",
+          "label": "prefill_time (vLLM)",
+          "proc": "api",
+          "compare": true,
+          "src": [
+            {
+              "event": "api_summary",
+              "where": {
+                "scope": "request"
+              },
+              "field": "official.prefill_time",
+              "unit": "s"
+            }
+          ]
+        },
+        {
+          "id": "detokenizer",
+          "label": "detokenizer（第一步）",
+          "proc": "api",
+          "src": [
+            {
+              "event": "api_summary",
+              "where": {
+                "scope": "request"
+              },
+              "ranges": "stages.detokenize.ranges",
+              "total": "terminal.detokenize_duration_ns",
+              "part": "first"
+            }
+          ]
+        }
+      ],
+      "tpot": [
+        {
+          "id": "schedule",
+          "short": "sched",
+          "label": "schedule（第二步起）",
+          "proc": "engine",
+          "children": [
+            {
+              "id": "alloc",
+              "proc": "engine",
+              "src": [
+                {
+                  "acc": "alloc",
+                  "part": "rest"
+                }
+              ]
+            },
+            {
+              "id": "other",
+              "proc": "engine",
+              "src": [
+                {
+                  "acc": "schedule_other",
+                  "part": "rest"
+                }
+              ],
+              "label": "other"
+            }
+          ]
+        },
+        {
+          "id": "prepare_inputs",
+          "label": "prepare_inputs（第二步起）",
+          "proc": "worker",
+          "src": [
+            {
+              "acc": "prepare_inputs",
+              "part": "rest"
+            }
+          ]
+        },
+        {
+          "id": "forward",
+          "label": "forward（第二步起）",
+          "proc": "worker",
+          "src": [
+            {
+              "acc": "forward",
+              "part": "rest"
+            }
+          ]
+        },
+        {
+          "id": "lm_head",
+          "label": "lm_head（第二步起）",
+          "proc": "worker",
+          "src": [
+            {
+              "acc": "lm_head",
+              "part": "rest"
+            }
+          ]
+        },
+        {
+          "id": "sampling",
+          "label": "sampling（第二步起）",
+          "proc": "worker",
+          "src": [
+            {
+              "acc": "sampling",
+              "part": "rest"
+            }
+          ]
+        },
+        {
+          "id": "draft",
+          "label": "draft（第二步起）",
+          "proc": "worker",
+          "src": [
+            {
+              "acc": "draft",
+              "part": "rest"
+            }
+          ]
+        },
+        {
+          "id": "detokenizer",
+          "label": "detokenizer（第二步起）",
+          "proc": "api",
+          "short": "detok",
+          "src": [
+            {
+              "event": "api_summary",
+              "where": {
+                "scope": "request"
+              },
+              "ranges": "stages.detokenize.ranges",
+              "total": "terminal.detokenize_duration_ns",
+              "part": "rest"
+            }
+          ]
+        },
+        {
+          "id": "rest_vllm",
+          "label": "decode_time (vLLM)",
+          "proc": "api",
+          "compare": true,
+          "src": [
+            {
+              "event": "api_summary",
+              "where": {
+                "scope": "request"
+              },
+              "field": "official.decode_time",
+              "unit": "s"
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "request": {
+    "official_e2e_ms": {
+      "event": "api_summary",
+      "where": {
+        "scope": "request"
+      },
+      "field": "official.e2e_latency",
+      "unit": "s"
+    },
+    "official_ttft_ms": {
+      "event": "api_summary",
+      "where": {
+        "scope": "request"
+      },
+      "field": "official.time_to_first_token",
+      "unit": "s"
+    },
+    "official_tpot_ms": {
+      "event": "api_summary",
+      "where": {
+        "scope": "request"
+      },
+      "field": "official.mean_time_per_output_token",
+      "unit": "s"
+    },
+    "api_total_ms": {
+      "event": "api_summary",
+      "where": {
+        "scope": "http"
+      },
+      "field": "end_ns-start_ns"
+    },
+    "prompt_tokens": {
+      "event": "api_summary",
+      "where": {
+        "scope": "request"
+      },
+      "field": "official.num_prompt_tokens"
+    },
+    "cached_tokens": {
+      "event": "api_summary",
+      "where": {
+        "scope": "request"
+      },
+      "field": "official.num_cached_tokens"
+    },
+    "output_tokens": {
+      "event": "api_summary",
+      "where": {
+        "scope": "request"
+      },
+      "field": "official.num_generation_tokens"
+    },
+    "executions": {
+      "event": "core_summary",
+      "where": {
+        "scope": "request"
+      },
+      "field": "executions",
+      "member": "members"
+    },
+    "finish_reason": {
+      "event": "api_summary",
+      "where": {
+        "scope": "request"
+      },
+      "field": "official.status"
+    },
+    "status": {
+      "event": "api_summary",
+      "where": {
+        "scope": "http"
+      },
+      "field": "status"
+    },
+    "http_status": {
+      "event": "api_summary",
+      "where": {
+        "scope": "http"
+      },
+      "field": "http_status"
+    }
+  }
+}

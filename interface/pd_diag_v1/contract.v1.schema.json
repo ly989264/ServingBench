@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "pd_diag/v1/contract.v1.schema.json",
+  "title": "段定义接口的响应 pd_diag.contract.v1",
+  "description": "GET /pd_diag/v1/contract 的响应：当前段定义。只固定结构，不列举段名。",
+  "type": "object",
+  "required": ["schema", "interface", "cluster", "config_version", "config_id", "sides", "segments"],
+  "properties": {
+    "schema": {"const": "pd_diag.contract.v1"},
+    "interface": {"const": "pd_diag/v1"},
+    "cluster": {"type": "string", "pattern": "^[a-z0-9-]+$"},
+    "config_version": {"type": "string", "pattern": "^.+@[0-9a-f]{8}$"},
+    "config_id": {"type": "string"},
+    "sides": {
+      "type": "object",
+      "required": ["prefill", "decode"],
+      "properties": {"prefill": {"$ref": "#/$defs/side"}, "decode": {"$ref": "#/$defs/side"}},
+      "additionalProperties": false
+    },
+    "segments": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/segment"}}
+  },
+  "$defs": {
+    "side": {"type": "object", "required": ["name", "total_label"],
+             "properties": {"name": {"type": "string"}, "total_label": {"type": "string"}}},
+    "segment": {
+      "type": "object",
+      "required": ["code", "group", "side", "phase", "order", "parent", "depth", "from_level", "unit", "column", "doc_path",
+                   "label", "short", "proc", "optional", "compare", "outside_total", "parallel", "before_proxy", "has_src"],
+      "properties": {
+        "code": {"type": "string", "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$"},
+        "group": {"enum": ["ttft", "tpot", "background"]},
+        "side": {"enum": ["p", "d"]},
+        "phase": {"enum": ["proxy", "ttft", "tpot", "background"]},
+        "order": {"type": "integer", "minimum": 1},
+        "parent": {"type": ["string", "null"]},
+        "depth": {"type": "integer", "minimum": 1},
+        "from_level": {"type": "integer", "minimum": 1, "maximum": 3},
+        "unit": {"const": "ms"},
+        "column": {"type": "string", "pattern": "^[a-z][a-z0-9_]*_ms$"},
+        "doc_path": {"type": "string", "pattern": "^(ttft|tpot|background)\\.(p|d)\\.[a-z0-9_.]+\\.ms$"},
+        "label": {"type": "string"},
+        "short": {"type": ["string", "null"]},
+        "proc": {"type": ["string", "null"]},
+        "optional": {"type": "boolean"},
+        "compare": {"type": "boolean"},
+        "outside_total": {"type": "boolean"},
+        "parallel": {"type": "boolean"},
+        "before_proxy": {"type": "boolean"},
+        "has_src": {"type": "boolean"}
+      }
+    }
+  }
+}

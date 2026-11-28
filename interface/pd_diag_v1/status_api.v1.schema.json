@@ -1,0 +1,332 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "$id": "pd_diag/v1/status_api.v1.schema.json",
+ "title": "状态接口 GET /pd_diag/v1/status 的响应",
+ "description": "fetcher 与 scope 为 fetcher 的状态文档的计数相同（status.v1.schema.json 的 fetcher_doc），不带 schema、cluster、seq。",
+ "type": "object",
+ "required": [
+  "interface",
+  "major",
+  "cluster",
+  "doc_schemas",
+  "config_version",
+  "head_seq",
+  "oldest_seq",
+  "open_requests",
+  "sources",
+  "fetcher"
+ ],
+ "properties": {
+  "interface": {
+   "const": "pd_diag/v1"
+  },
+  "major": {
+   "const": 1
+  },
+  "cluster": {
+   "type": "string",
+   "minLength": 1
+  },
+  "doc_schemas": {
+   "type": "object",
+   "required": [
+    "request",
+    "status",
+    "contract"
+   ],
+   "properties": {
+    "request": {
+     "const": "vllm_pd.request.v2"
+    },
+    "status": {
+     "const": "pd_diag.status.v1"
+    },
+    "contract": {
+     "const": "pd_diag.contract.v1"
+    }
+   }
+  },
+  "config_version": {
+   "type": "string",
+   "minLength": 1
+  },
+  "head_seq": {
+   "$ref": "#/$defs/n"
+  },
+  "oldest_seq": {
+   "$ref": "#/$defs/n"
+  },
+  "open_requests": {
+   "$ref": "#/$defs/n"
+  },
+  "sources": {
+   "type": "array",
+   "items": {
+    "type": "object",
+    "required": [
+     "name",
+     "kind",
+     "side",
+     "run",
+     "read_seq",
+     "head_seq",
+     "errors",
+     "backoffs",
+     "run_changes",
+     "ring_overwritten_lines",
+     "last_ok_seconds",
+     "last_error",
+     "behind_seconds",
+     "gone"
+    ],
+    "properties": {
+     "name": {
+      "type": "string",
+      "minLength": 1
+     },
+     "kind": {
+      "enum": [
+       "instance",
+       "proxy"
+      ]
+     },
+     "side": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "run": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "read_seq": {
+      "$ref": "#/$defs/n"
+     },
+     "head_seq": {
+      "type": [
+       "integer",
+       "null"
+      ],
+      "minimum": 0
+     },
+     "errors": {
+      "$ref": "#/$defs/n"
+     },
+     "backoffs": {
+      "$ref": "#/$defs/n"
+     },
+     "run_changes": {
+      "$ref": "#/$defs/n"
+     },
+     "ring_overwritten_lines": {
+      "$ref": "#/$defs/n"
+     },
+     "last_ok_seconds": {
+      "type": [
+       "number",
+       "null"
+      ],
+      "minimum": 0
+     },
+     "last_error": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "behind_seconds": {
+      "type": "number",
+      "minimum": 0
+     },
+     "gone": {
+      "type": "boolean"
+     }
+    }
+   }
+  },
+  "fetcher": {
+   "$ref": "#/$defs/fetcher_doc"
+  }
+ },
+ "$defs": {
+  "time": {
+   "type": "string",
+   "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$"
+  },
+  "n": {
+   "type": "integer",
+   "minimum": 0
+  },
+  "counts": {
+   "type": "object",
+   "additionalProperties": {
+    "$ref": "#/$defs/n"
+   }
+  },
+  "fetcher_doc": {
+   "type": "object",
+   "required": [
+    "interface",
+    "doc_schemas",
+    "config_version",
+    "config_mismatch",
+    "segment_changes",
+    "segment_changes_recent",
+    "segments_errors",
+    "open_requests",
+    "docs_written",
+    "docs_rewritten",
+    "closed",
+    "late_records",
+    "late_dropped",
+    "refetch_skipped",
+    "no_api_dropped",
+    "unparsed",
+    "log_dropped",
+    "log_write_errors",
+    "spool_bytes",
+    "summary_bytes",
+    "mooncake",
+    "proxy_source",
+    "started"
+   ],
+   "properties": {
+    "instance": {
+     "const": "fetcher"
+    },
+    "interface": {
+     "const": "pd_diag/v1"
+    },
+    "doc_schemas": {
+     "type": "array",
+     "items": {
+      "type": "string"
+     }
+    },
+    "config_version": {
+     "type": "string"
+    },
+    "config_mismatch": {
+     "type": "array",
+     "items": {
+      "type": "string"
+     }
+    },
+    "segment_changes": {
+     "$ref": "#/$defs/n"
+    },
+    "segment_changes_recent": {
+     "type": "array",
+     "maxItems": 20,
+     "items": {
+      "type": "object",
+      "required": [
+       "ts",
+       "from",
+       "to",
+       "added",
+       "removed"
+      ],
+      "properties": {
+       "ts": {
+        "$ref": "#/$defs/time"
+       },
+       "from": {
+        "type": "string"
+       },
+       "to": {
+        "type": "string"
+       },
+       "added": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        }
+       },
+       "removed": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    },
+    "segments_errors": {
+     "$ref": "#/$defs/n"
+    },
+    "open_requests": {
+     "$ref": "#/$defs/n"
+    },
+    "docs_written": {
+     "$ref": "#/$defs/n"
+    },
+    "docs_rewritten": {
+     "$ref": "#/$defs/n"
+    },
+    "closed": {
+     "type": "object",
+     "required": [
+      "complete",
+      "no_proxy",
+      "incomplete",
+      "evicted"
+     ],
+     "properties": {
+      "complete": {
+       "$ref": "#/$defs/n"
+      },
+      "no_proxy": {
+       "$ref": "#/$defs/n"
+      },
+      "incomplete": {
+       "$ref": "#/$defs/n"
+      },
+      "evicted": {
+       "$ref": "#/$defs/n"
+      }
+     }
+    },
+    "late_records": {
+     "$ref": "#/$defs/n"
+    },
+    "late_dropped": {
+     "$ref": "#/$defs/n"
+    },
+    "refetch_skipped": {
+     "$ref": "#/$defs/n"
+    },
+    "no_api_dropped": {
+     "$ref": "#/$defs/n"
+    },
+    "unparsed": {
+     "$ref": "#/$defs/n"
+    },
+    "log_dropped": {
+     "$ref": "#/$defs/n"
+    },
+    "log_write_errors": {
+     "$ref": "#/$defs/n"
+    },
+    "spool_bytes": {
+     "$ref": "#/$defs/n"
+    },
+    "summary_bytes": {
+     "$ref": "#/$defs/n"
+    },
+    "mooncake": {
+     "$ref": "#/$defs/counts"
+    },
+    "proxy_source": {
+     "type": "boolean"
+    },
+    "started": {
+     "$ref": "#/$defs/time"
+    }
+   }
+  }
+ }
+}

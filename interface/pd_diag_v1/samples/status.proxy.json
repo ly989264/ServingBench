@@ -1,0 +1,22 @@
+{
+ "schema": "pd_diag.status.v1",
+ "cluster": "lab",
+ "seq": 1795771263140660,
+ "scope": "proxy",
+ "ts": "2026-11-27T09:22:03.264Z",
+ "instance": "proxy.4242",
+ "run_id": "e808a0f6",
+ "gone": false,
+ "proxy": {},
+ "buffer_overwritten": 0,
+ "fetch": {
+  "errors": 0,
+  "backoffs": 0,
+  "behind_seconds": 0,
+  "run_changes": 0,
+  "ring_overwritten_lines": 0,
+  "rejected_429": 0,
+  "read_seq": 112,
+  "head_seq": 112
+ }
+}

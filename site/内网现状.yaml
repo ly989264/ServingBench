@@ -1,0 +1,156 @@
+# 内网现状：site/内网现状.md 的机器可读版，两者同时更新。
+# 状态时点 2026-11-28；依据为 site/check_site_state.py 的现场检测（11-28 17:42 全机，17:18 单机）和当天的现场查询。
+# 现场值都是占位符：<个人目录>、<监控机地址>、<P 机器地址>、<D 机器地址>、<proxy 机器地址>；查法见 site/内网现状.md 附录 A。
+# 需要示例地址时只用 10.1.x.x。
+#
+# 字段：
+#   monitor        监控机上的共用组件
+#   ports          每个集群的端口基数与各容器的主机端口
+#   clusters       每个已登记集群一条
+#   panel2         两套面板二的部署事实
+#   foreign        监控机上不属于面板部署的容器
+#   residue        残留与清理状态
+#   risks          风险
+#   unverified     仍未核实的事项
+
+schema_version: 2
+as_of: "2026-11-28"
+basis: "现场检测 11-28 17:42（v2 全机）；单机项为 11-28 17:18（v1）；其余注明"
+
+monitor:
+  arch: aarch64
+  account: root
+  root_dir: /data/grafana
+  tools_dir: /data/grafana/tools
+  personal_dir: "/data/<个人目录>"
+  registry: /root/.vllm-pd-clusters.json
+  docker_network: vllm-pd-monitor
+  grafana:
+    container: vllm-pd-grafana
+    image: "grafana/grafana:latest"
+    version: "12.4.2"            # /api/health
+    port: "3000->3000"
+    clickhouse_plugin: "4.23.4"
+    mounts:
+      - "/data/<个人目录>/vllm-pd-grafana-panel1/grafana/provisioning -> /etc/grafana/provisioning"
+      - "/data/<个人目录>/vllm-pd-grafana-panel1/grafana/dashboards -> /etc/grafana/dashboards"
+      - "volume vllm-pd-grafana-data -> /var/lib/grafana"
+    account_source: /data/grafana/vllm-pd-grafana-panel2/glm53-1/deploy.env
+    folders: 11
+    dashboards: 18
+    datasources: 10       # Prometheus 8, ClickHouse 2
+  prometheus_image: "prom/prometheus:v3.11.2"
+  clickhouse_version: "26.8.36.3"
+  vector_image: "timberio/vector:0.61.0-debian"
+
+ports:   # Prometheus = base + 2; ClickHouse = base; puller metrics = base + 1
+  glm53-1:       {base: 18100, clickhouse: 18100, puller_metrics: 18101, prometheus: 18102}
+  dsv41-flash-1: {base: 18120, prometheus: 18122}
+  dsv41-flash-2: {base: 18130, prometheus: 18132}
+  dsv41-flash-3: {base: 18140, prometheus: 18142}
+  dsv41-flash-4: {base: 18150, prometheus: 18152}
+  dsv41-flash-5: {base: 18160, prometheus: 18162}
+  glm53-0:       {base: 18170, prometheus: 18172}
+  glm53-2:       {base: 18180, prometheus: 18182}
+  test-glm53:    {base: 18190, clickhouse: 18190, ingest_status: 18191, prometheus_alert_only: 18192}
+  next_free_base: 18200
+  grafana: 3000
+  # glm53-1 puller_metrics: deploy.env leaves it blank, derived by the pack's default rule
+
+clusters:
+  - {name: glm53-1, display_name: glm53-1, model_group: glm53-1, grafana_folder: GLM-5.3/glm53-1, online: true,
+     panel1: v1.2, panel2: v3.4-extra-t53, nodes: "P 8 台 × 1 实例（TP16），D 4 台 × 16 实例（TP1）；注册表 12 台"}
+  - {name: glm53-0, display_name: glm53-0, model_group: glm53-0, grafana_folder: GLM-5.3/glm53-0, online: true,
+     panel1: v1.2, panel2: null, nodes: unverified}
+  - {name: glm53-2, display_name: glm53-2, model_group: glm53-2, grafana_folder: GLM-5.3/glm53-2, online: true,
+     panel1: v1.2, panel2: null, nodes: unverified}
+  - {name: "dsv41-flash-N (N=1..5)", display_name: dsv4.1-flash-N, model_group: dsv4.1-flash-N,
+     grafana_folder: dsv4.1-flash/dsv4.1-flash-N, online: true, panel1: v1.2, panel2: null,
+     nodes: "P 4 台 × 2 实例、D 2 台 × 8 实例（面板一清单，未登录节点核对）"}
+  - {name: test-glm53, display_name: test-glm53, model_group: GLM-5.3-test, grafana_folder: GLM-5.3-test, online: false,
+     panel1: null, panel2: v4.0-extra, nodes: "P 1 台 × 1 实例（TP16），D 1 台 × 16 实例（TP1、DP16）；P 机器同时是 proxy 机器",
+     status: "已部署、待验收"}
+
+panel1:
+  version: v1.2
+  pack_sha256_8: "55847494"
+  containers: "vllm-pd-prometheus-<集群>，数据卷 vllm-pd-prometheus-data-<集群>"
+  dashboards: "vllm-pd-prefill-<集群>、vllm-pd-decode-<集群>"
+  dashboard_titles: "vLLM 服务侧监控面板 - Prefill实例（<显示名>）、vLLM 服务侧监控面板 - Decode实例（<显示名>）"
+  datasource: "名称 Prometheus（<集群>），UID prometheus-<集群>，地址 vllm-pd-prometheus-<集群>:9090"
+  cluster_dir: "/data/grafana/vllm-pd-grafana-panel1/<集群>/"
+
+panel2:
+  glm53-1:
+    scheme: "旧方案：节点写诊断文件 → 监控机拉取程序 → Vector → ClickHouse"
+    version: v3.4-extra-t53
+    dir: /data/grafana/vllm-pd-grafana-panel2/glm53-1/
+    clickhouse: {container: vllm-pd-clickhouse-glm53-1, port: "18100->8123", data_dir: /data/clickhouse-glm53-1}
+    vector: {container: vllm-pd-vector-glm53-1, host_ports: none}
+    puller: "bash while 循环维护 scripts/puller.py；pid 文件 /data/grafana/vllm-timing/glm53-1/puller/puller.pid"
+    alerting: "面板一 Prometheus vllm-pd-prometheus-glm53-1 的 prometheus.yml 标记段"
+    dashboard: {uid: vllm-pd-request-glm53-1, title: "vLLM 请求侧拆解面板"}
+    datasource: {name: "vLLM ClickHouse（glm53-1）", uid: vllm-pd-clickhouse-glm53-1}
+    node: {container: vllm-ascend-glm53-v30, image_id: 3f8bca8dd182, vllm: "0.30.0", vllm_ascend_commit: d4ad497,
+           patch_state: "T73（37 个文件一致，T62 新增 10 个不存在）", mooncake_connector_sha16: 1b797d86,
+           mooncake_lib_sha16: 37a3aaf8acb53c6a, PD_DIAG_LEVEL: "未设置", dirs: [/data/pd-diag/conf, /data/pd-diag/logs]}
+    proxy: "/data/pd-diag/logs/proxy 存在；补丁版本未核实"
+  test-glm53:
+    scheme: "新方案：proxy 机器上的采集进程（9300）→ 监控机入库进程 pd_ingest.py → ClickHouse 新表"
+    version: v4.0-extra
+    dir: /data/grafana/vllm-pd-grafana-panel2/test-glm53/
+    clickhouse: {container: vllm-pd-clickhouse-test-glm53, port: "18190->8123", data_dir: /data/clickhouse-test-glm53}
+    tables_new: {request_doc: {rows: 2133, ttl_days: 30}, status_doc: {rows: 6318, ttl_days: 30},
+                 segment_def: {rows: 59}, db_interface: {rows: 1}}
+    old_tables_present: true     # 第 7 步（删旧表）未执行
+    ingest: {running: true, status_port: 18191, last_log: "2026-11-28T11:51:21", request_doc_max_ts: "2026-11-28 09:41:26"}
+    alert_prometheus: {container: vllm-pd-prometheus-test-glm53, port: "18192->9090",
+                       rule_file: /prometheus/vllm-pd-ingest-rules-test-glm53.yml, rule: PdIngestDocsStale}
+    dashboard: {uid: vllm-pd-request-test-glm53, title: "面板二：请求时延拆解（P / D）（test-glm53）"}
+    datasource: {name: "vLLM ClickHouse（test-glm53）", uid: vllm-pd-clickhouse-test-glm53}
+    node: {container: "<test-glm53 的 vLLM 容器名>", image: "vllm-ascend-glm53-v30:backup", vllm: "0.30.0",
+           vllm_ascend_commit: d4ad497, patch_state: "T62（47 个文件一致）", mooncake_connector_sha16: f10dee5cd4dfdccb,
+           mooncake_connector_site_original_sha16: 2c4acb3eeb1ced7d, mooncake_lib_sha16: 39854f25629a3cac,
+           PD_DIAG_LEVEL: "进程间不同：3 与未设置（11-28 17:18）"}
+    fetcher: {machine: "P 机器", process: pd_fetcher.py, port: 9300}
+    acceptance: "第 0–6 步已执行，第 6 步 1 项 FAIL（最可能没有流量）；第 7 步待验收"
+
+foreign:   # monitoring machine, not part of the panels
+  - {name: fb-local, image: "docker.elastic.co/beats/filebeat:8.15.0"}
+  - {name: node-exporter, image: "prom/node-exporter:v1.12.1"}
+  - {name: npu-exporter, image: "ascendhub/npu-exporter:v26.2.0-openeuler24.03"}
+  - {name: vllm-ascend-glm52-0827, image: "vllm_ascend_v23_release:0831"}
+  - {name: vllm-ascend-glm53-0907, image: "vllm_ascend_v23_release:0907-squash", state: stopped}
+  - {name: vllm-ascend-glm53-op, image: "vllm_ascend_v23_release:1021bak"}
+  - {name: vllm-ascend-glm53-v30, image_id: 3f8bca8dd182}
+
+in_use_dirs:
+  - /data/grafana/vllm-timing/glm53-1      # glm53-1 拉取程序的运行目录
+  - /data/clickhouse-glm53-1
+  - /data/clickhouse-test-glm53
+  - "/data/<个人目录>/vllm-pd-grafana-panel1"   # Grafana provisioning、dashboards 挂载
+
+residue:
+  deleted: ["/data/vllm-clickhouse", "/data/vllm-clickhouse-glm53-test", "/data/vllm-clickhouse-test", "/data/vllm-timing",
+            "容器 vllm-pd-prometheus-test"]
+  unknown_after_cleanup_commands:   # 无引用；清理命令已发给用户，执行情况未知
+    - /data/grafana/vllm-pd-grafana-panel2/glm53-1.leftover-20261127-172638
+    - /data/grafana/vllm-timing/test-glm53
+    - "/data/<个人目录>/vllm-pd-panel2-update-*、vllm-pd-update-v*、vllm-pd-grafana-panel2、vllm032-pd-grafana-panel2"
+    - "/data/<个人目录>/panel1-export-20261112-*、dashboards.bak-*、vllm-pd-patch-glm53"
+    - "/root/t53-两步包.tar*、t53-演练包.tar*、vllm-pd-update-backup*、vllm-pd-arrange-backup、panel2-1114、check-1112、vllm-pd-test-glm53"
+    - "/root/vllm-pd-grafana-panel2-offline-aarch64.tar.gz、vllm-pd-grafana-panel2.tar.gz"
+
+risks:
+  - "Grafana 镜像标签为 latest：重建容器并重新拉取镜像时可能升级"
+  - "Grafana provisioning 与 dashboards 挂载自 /data/<个人目录>/vllm-pd-grafana-panel1/grafana/"
+  - "监控机上运行着 vLLM 推理容器：docker prune、重启 docker 会影响推理服务"
+  - "glm53-1 的名字和端口靠部署脚本的默认规则推出，不写在 deploy.env"
+
+unverified:
+  - "glm53-0、glm53-2 的机器数和实例布局"
+  - "dsv41-flash-1 … 5 的机器布局（取自清单）"
+  - "test-glm53 只告警规则是否已加载（检测项为误报）"
+  - "test-glm53 各 vLLM 进程的 PD_DIAG_LEVEL 明细"
+  - "glm53-1 proxy 机器的 proxy 补丁版本"
+  - "清理命令的执行情况"

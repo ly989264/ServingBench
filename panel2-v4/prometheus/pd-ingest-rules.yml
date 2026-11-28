@@ -1,0 +1,29 @@
+groups:
+  - name: pd-ingest
+    rules:
+      - alert: PdIngestDown
+        expr: up{job="pd-ingest"} == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "入库进程停止"
+          description: "状态端口无法抓取；入库进程停止期间文档保留在采集进程的写出队列中"
+      - alert: PdIngestDocsStale
+        expr: pd_ingest_last_doc_age_seconds{job="pd-ingest"} > {ALERT_STALE_SECONDS}
+        labels: {severity: warning}
+        annotations:
+          summary: "最近文档超过阈值"
+          description: "最近一份入库文档距今超过 {ALERT_STALE_SECONDS} 秒，通常表示采集进程停止"
+      - alert: PdIngestFetcherUnreachable
+        expr: pd_ingest_fetch_failures{job="pd-ingest"} >= 3
+        for: 1m
+        labels: {severity: warning}
+        annotations:
+          summary: "无法连接采集进程"
+          description: "入库进程连续连接采集进程失败：网络中断或采集进程停止"
+      - alert: PdFetcherLogDropped
+        expr: increase(pd_fetcher_log_dropped{job="pd-ingest"}[10m]) > 0
+        labels: {severity: warning}
+        annotations:
+          summary: "写出队列丢弃文档"
+          description: "采集进程状态文档中的 log_dropped 增加：监控端停机时间超过写出队列可容纳的时长"

@@ -1,0 +1,48 @@
+{
+ "schema": "pd_diag.status.v1",
+ "cluster": "lab",
+ "seq": 1795771263140661,
+ "scope": "fetcher",
+ "ts": "2026-11-27T09:22:03.264Z",
+ "instance": "fetcher",
+ "interface": "pd_diag/v1",
+ "doc_schemas": [
+  "vllm_pd.request.v2",
+  "pd_diag.status.v1"
+ ],
+ "config_version": "pd-diag-v3.3-extra-glm53-2026-11-20a@0a2312c6",
+ "config_mismatch": [],
+ "segment_changes": 0,
+ "segment_changes_recent": [],
+ "segments_errors": 0,
+ "open_requests": 0,
+ "docs_written": 110,
+ "docs_rewritten": 0,
+ "closed": {
+  "complete": 110,
+  "no_proxy": 0,
+  "incomplete": 0,
+  "evicted": 0
+ },
+ "late_records": 0,
+ "late_dropped": 0,
+ "refetch_skipped": 0,
+ "no_api_dropped": 2,
+ "unparsed": 0,
+ "log_dropped": 0,
+ "log_write_errors": 0,
+ "spool_bytes": 398910,
+ "summary_bytes": 17993,
+ "mooncake": {
+  "native_lines": 0,
+  "matched_calls": 0,
+  "records_written": 0,
+  "tasks_incomplete": 0,
+  "lines_unmatched": 0,
+  "lines_unparsed": 0,
+  "bytes_mismatch": 0,
+  "mooncake_dropped": 0
+ },
+ "proxy_source": true,
+ "started": "2026-11-27T09:21:03.140Z"
+}
