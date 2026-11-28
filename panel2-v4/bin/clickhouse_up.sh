@@ -11,10 +11,11 @@ done
 for k in CH_ADMIN_PASSWORD CH_WRITER_PASSWORD CH_READER_PASSWORD; do
   case ${!k} in *[!A-Za-z0-9]*) fail "clickhouse.env 的 $k 只能用字母和数字" ;; change-me-*) fail "clickhouse.env 的 $k 还是示例值，先填写" ;; esac
 done
-docker network inspect "$DOCKER_NETWORK" >/dev/null 2>&1 || docker network create "$DOCKER_NETWORK" >/dev/null || fail "建不了网络 $DOCKER_NETWORK"
 # The memory cap, always mounted so that the container never needs rebuilding for it: empty when the setting is blank.
 mem_mb=${CLICKHOUSE_MAX_SERVER_MEMORY_MB:-}
 case $mem_mb in ""|*[!0-9]*) [ -z "$mem_mb" ] || fail "CLICKHOUSE_MAX_SERVER_MEMORY_MB=$mem_mb 不是整数（MiB）" ;; esac
+[ -z "$mem_mb" ] || [ "$mem_mb" -ge 1500 ] || fail "CLICKHOUSE_MAX_SERVER_MEMORY_MB=$mem_mb 太小，至少 1500（MiB）；留空表示不设上限"
+docker network inspect "$DOCKER_NETWORK" >/dev/null 2>&1 || docker network create "$DOCKER_NETWORK" >/dev/null || fail "建不了网络 $DOCKER_NETWORK"
 mkdir -p "$PACK_DIR/generated" || fail "建不了目录 $PACK_DIR/generated"
 if [ -n "$mem_mb" ]; then
   printf '<clickhouse>\n    <max_server_memory_usage>%d</max_server_memory_usage>\n</clickhouse>\n' $((mem_mb * 1048576)) > "$PACK_DIR/generated/clickhouse_memory.xml"

@@ -110,6 +110,7 @@ proxy 的诊断记录 → proxy 缓冲区 ────────┘     （pro
 | `bin/monitor_down.sh [--purge]` | 从监控机移除本集群的面板二，缺省保留数据 |
 | `bin/migrate_deploy_env.sh split｜retire-old｜drop-old-tables` | 由上一版迁移：拆分 `deploy.env`；停止上一版的拉取程序并删除 Vector 容器；删除上一版的 9 个表和视图 |
 | `bin/has_value.sh show｜hide｜state` | 分布表「有值 / 请求」列的显示设置 |
+| `bin/make_pack.sh <输出文件.tar.gz>` | 由本目录出部署包：复制一份（不含三份配置文件和 `generated/`、`run/`、`logs/`），在副本中写出 `SHA256SUMS` 后打包；本目录不变。安装后 `panel2_cluster.sh check` 按这份 `SHA256SUMS` 核对集群目录的文件 |
 
 采集进程一侧的检查用 `../interface/fetcher_check.py --url http://<proxy 机器>:9300`（只读，只调用状态接口）。
 
@@ -158,6 +159,7 @@ proxy 的诊断记录 → proxy 缓冲区 ────────┘     （pro
 - **监控机重启后入库进程不会自动启动。** `bin/ingest.sh start` 用 `nohup` 起一个循环，入库进程退出后 5 秒由循环重启；但监控机重启或这个循环本身被结束后，没有任何机制再启动它，需要在集群目录执行 `bin/ingest.sh start`。期间文档留在写出队列中，启动后从库中的最大序号接着读取。
 - **集群没有流量时，状态面板「最近文档距今秒数」变红。** 这个数字取请求文档表 `request_doc` 中最新一份文档的时间，超过 `STALE_RED_SECONDS`（缺省 60 秒）显示为红色。没有流量时没有新的请求文档，数字持续增长并变红，并不表示采集或入库中断。数据链路是否在工作，以状态文档表 `status_doc` 中 `scope = 'fetcher'` 的最新时间为准（采集进程每分钟写一份）。告警「最近文档超过阈值」同时计入状态文档，不受影响。
 - **`migrate_deploy_env.sh split` 删除集群目录中的 `inventory.json`。** 原文件打包在 `pack-before-t62.tar.gz` 中。此后仍读取集群目录中 `inventory.json` 的脚本（例如 `scripts/uninstall_old.py`）会因找不到文件而失败；需要时用 `tar -xzf pack-before-t62.tar.gz -C <集群目录> inventory.json` 取回。
+- **修改固定列没有迁移路径。** `request_doc`、`status_doc` 的固定列（段列以外的列）由 `clickhouse/schema.sql` 的 `CREATE TABLE IF NOT EXISTS` 建立；`pd_ingest.py init` 和 `bin/clickhouse_up.sh` 对已有的表只调整保留天数，不改列。入库进程只为新段加列。新增、删除、改名固定列或改变列的类型后，已有集群的表不会随之改变，需要另写 `ALTER TABLE` 语句并在升级时执行；删除、改名和改类型还要按接口二规范第 4 节把版本表的 `major` 加 1，与看板在同一次升级中完成。
 - 接口一不做身份认证、不限制来源地址。
 - 一台机器只登记给一个集群，这一点不由任何机制保证，由集群清单的填写者保证。
 - 采集进程只在 proxy 容器中手动启动，没有自动重启；停止时由告警「无法连接采集进程」和「最近文档超过阈值」发现。

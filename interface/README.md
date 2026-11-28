@@ -54,9 +54,9 @@
 
 不需要内网和集群：模拟采集进程代替采集进程，本机起一个 ClickHouse，入库进程和看板生成器用 `../panel2-v4/` 中的原样代码。
 
-需要：Python 3.9 或以上；Docker（用于 ClickHouse 镜像 `clickhouse/clickhouse-server:26.8.36.3`）；`curl`。
+需要：Python 3.9 或以上；Docker（镜像 `clickhouse/clickhouse-server:26.8.36.3` 和 `grafana/grafana:12.4.2`）；`curl`。
 
-以下命令在仓库根目录执行，用到的端口为 9300（模拟采集进程）、18123（ClickHouse）、18191（入库进程的状态端口），被占用时一并改掉。
+以下命令在仓库根目录执行，用到的端口为 9300（模拟采集进程）、18123（ClickHouse）、18191（入库进程的状态端口）、13000（Grafana），被占用时一并改掉。ClickHouse 和 Grafana 两个容器接在 Docker 网络 `pd-local` 上，Grafana 按容器名 `pd-local-clickhouse` 连接 ClickHouse。
 
 **第 1 步：启动模拟采集进程（单独一个终端）。**
 
@@ -64,7 +64,7 @@
 python3 interface/mock_fetcher.py --port 9300 --cluster lab
 ```
 
-写出队列先有 12 份样例文档，之后每秒新增 1 份请求文档（样例的副本，换新的 `request_id`）、每 60 秒新增一组 3 份状态文档。`--rate 0` 只提供 12 份样例。
+写出队列先有 11 份样例文档（请求文档 8 份、状态文档 3 份），之后每秒新增 1 份请求文档（样例的副本，换新的 `request_id`）、每 60 秒新增一组 3 份状态文档。`--rate 0` 只提供这 11 份样例。
 
 **第 2 步：检查模拟采集进程。**
 
@@ -79,21 +79,21 @@ W=$HOME/pd-local/lab && mkdir -p "$HOME/pd-local" && cp -R panel2-v4 "$W"
 ```
 
 ```bash
-A=$(python3 -c 'import secrets;print(secrets.token_hex(12))'); WR=$(python3 -c 'import secrets;print(secrets.token_hex(12))'); RD=$(python3 -c 'import secrets;print(secrets.token_hex(12))')
+A=$(python3 -c 'import secrets;print(secrets.token_hex(12))'); WR=$(python3 -c 'import secrets;print(secrets.token_hex(12))'); RD=$(python3 -c 'import secrets;print(secrets.token_hex(12))'); G=$(python3 -c 'import secrets;print(secrets.token_hex(12))')
 ```
 
 ```bash
 printf '{"interface": "pd_diag/v1", "fetcher_url": "http://127.0.0.1:9300", "poll_seconds": 5, "max_bytes": 4194304}\n' > "$W/ingest.json"
 printf 'CLICKHOUSE_CONTAINER=pd-local-clickhouse\nCLICKHOUSE_ADDR=127.0.0.1\nCLICKHOUSE_HTTP_PORT=18123\nCH_ADMIN_PASSWORD=%s\nCH_WRITER_PASSWORD=%s\nCH_READER_PASSWORD=%s\nSUMMARY_TTL_DAYS=30\nINGEST_STATUS_PORT=18191\n' "$A" "$WR" "$RD" > "$W/clickhouse.env"
-printf 'DB_INTERFACE=pd_diag_db/v1\nCLICKHOUSE_ADDR=127.0.0.1\nCLICKHOUSE_HTTP_PORT=18123\nCH_READER_PASSWORD=%s\nGRAFANA_DS_UID=pd-local-clickhouse\nGRAFANA_DS_NAME=pd-local-clickhouse\nGRAFANA_BOARD_UID=pd-local-request\nGRAFANA_BOARD_TITLE=面板二本地开发\nMODEL_GROUP=local\nSTALE_RED_SECONDS=60\n' "$RD" > "$W/grafana.env"
+printf 'DB_INTERFACE=pd_diag_db/v1\nCLICKHOUSE_ADDR=pd-local-clickhouse\nCLICKHOUSE_HTTP_PORT=8123\nCH_READER_PASSWORD=%s\nGRAFANA_URL=http://127.0.0.1:13000\nGRAFANA_USER=admin\nGRAFANA_PASSWORD=%s\nGRAFANA_CONTAINER=pd-local-grafana\nGRAFANA_DS_UID=pd-local-clickhouse\nGRAFANA_DS_NAME=pd-local-clickhouse\nGRAFANA_BOARD_UID=pd-local-request\nGRAFANA_BOARD_TITLE=面板二本地开发\nMODEL_GROUP=local\nSTALE_RED_SECONDS=60\n' "$RD" "$G" > "$W/grafana.env"
 ```
 
-`CLICKHOUSE_ADDR` 写成 IPv4 地址时，入库进程直接连这个地址的 `CLICKHOUSE_HTTP_PORT`。三个口令只在本机使用，每次随机生成。
+`clickhouse.env` 的 `CLICKHOUSE_ADDR` 写成 IPv4 地址，入库进程直接连这个地址的 `CLICKHOUSE_HTTP_PORT`。`grafana.env` 的 `CLICKHOUSE_ADDR` 写成容器名：看板生成器经 `docker exec` 查询，Grafana 在 `pd-local` 网络上按容器名连接容器内的 8123 端口。四个口令只在本机使用，每次随机生成。
 
 **第 4 步：启动 ClickHouse，建账号和表。**
 
 ```bash
-docker run --rm -d --name pd-local-clickhouse -p 18123:8123 -e CLICKHOUSE_PASSWORD="$A" -e CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1 -v "$W/clickhouse/config.d/vllm_pd.xml:/etc/clickhouse-server/config.d/vllm_pd.xml:ro" clickhouse/clickhouse-server:26.8.36.3
+docker network create pd-local && docker run --rm -d --name pd-local-clickhouse --network pd-local -p 18123:8123 -e CLICKHOUSE_PASSWORD="$A" -e CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1 -v "$W/clickhouse/config.d/vllm_pd.xml:/etc/clickhouse-server/config.d/vllm_pd.xml:ro" clickhouse/clickhouse-server:26.8.36.3
 ```
 
 ```bash
@@ -126,14 +126,31 @@ curl -s -u "vllm_reader:$RD" --data-binary "SELECT count() FROM vllm_pd.request_
 cd "$W" && GRAFANA_ENV="$W/grafana.env" python3 -I scripts/generate.py --out "$W/generated/vllm-pd-request.json"
 ```
 
-导入 Grafana 用 `bin/grafana_board.sh`，需要一个装有 ClickHouse 数据源插件（`grafana-clickhouse-datasource`）的 Grafana，并在 `grafana.env` 中补 `GRAFANA_URL`、`GRAFANA_USER`、`GRAFANA_PASSWORD`。
+**第 8 步：启动 Grafana，装 ClickHouse 数据源插件，导入看板。** 插件取离线 zip，文件名中的架构与 Grafana 镜像一致（Apple 芯片和 aarch64 为 `arm64`，x86_64 为 `amd64`）；现场包的 `offline/` 中有这两份，也可以在联网的机器上下载。
 
-**第 8 步：结束。** 在两个终端中按 Ctrl-C 结束模拟采集进程和入库进程；`docker stop pd-local-clickhouse`（带 `--rm` 启动，停止后容器和数据一并删除）；删除工作目录 `$HOME/pd-local/lab`。
+```bash
+docker run --rm -d --name pd-local-grafana --network pd-local -p 13000:3000 -e GF_SECURITY_ADMIN_PASSWORD="$G" grafana/grafana:12.4.2
+```
 
-### 6.1 实测结果（2026-11-28）
+```bash
+mkdir -p "$W/offline" && curl -fSL -o "$W/offline/grafana-clickhouse-datasource-4.23.4.linux_arm64.zip" 'https://grafana.com/api/plugins/grafana-clickhouse-datasource/versions/4.23.4/download?os=linux&arch=arm64'
+```
+
+```bash
+bash "$W/bin/grafana_plugin.sh" && bash "$W/bin/grafana_board.sh"
+```
+
+两条命令的最后一行都是 `RESULT: OK`，看板地址为 `http://127.0.0.1:13000/d/pd-local-request`，用户名 `admin`，口令为 `$G`。
+
+**第 9 步：结束。** 在两个终端中按 Ctrl-C 结束模拟采集进程和入库进程；`docker stop pd-local-grafana pd-local-clickhouse`（都带 `--rm` 启动，停止后容器和数据一并删除）；`docker network rm pd-local`；删除工作目录 `$HOME/pd-local/lab`。
+
+### 6.1 实测结果（2026-11-28，Apple 芯片，Docker 29.2.1）
 
 | 步骤 | 结果 |
 |---|---|
 | 第 1、2 步 | `fetcher_check.py` 对模拟采集进程输出 `RESULT: OK`；三个端点的输出（状态接口、段定义接口、62 份请求文档和 12 份状态文档）按 4 份 JSON Schema 校验全部通过 |
-| 第 7 步（不连库） | `python3 -I scripts/generate.py --contract interface/pd_diag_v1/samples/contract.json --out <文件>` 按样例的段定义生成看板：P 27 段、D 32 段，看板 29 个 panel |
-| 第 3–7 步（连库） | 尚未实测 |
+| 第 3、4 步 | `users.sql` 执行成功；`pd_ingest.py init` 输出 `RESULT: OK` |
+| 第 5、6 步 | 入库进程运行约 2 分钟后：`request_doc` 130 行，`status_doc` 9 行（`fetcher`、`instance`、`proxy` 各 3 行），`segment_def` 59 行（P 27、D 32）；入库进程状态 `ingest_gap` 0、`fetch_errors` 0、`ch_errors` 0，为新段加列 59 个 |
+| 第 7 步 | 按库中的段定义生成看板：P 27 段、D 32 段，看板 29 个 panel |
+| 第 8 步 | `grafana_plugin.sh` 装上插件 4.23.4，`grafana_board.sh` 确认 Grafana 能连上 ClickHouse 并导入看板，两者均为 `RESULT: OK`；看板显示请求数 115、「最近文档距今秒数」4 s，P 侧、D 侧分段时延分布各段有值 |
+| 不连库生成看板 | 在 `panel2-v4/` 下执行 `python3 -I scripts/generate.py --contract ../interface/pd_diag_v1/samples/contract.json --out <文件>`，按样例的段定义生成看板：P 27 段、D 32 段，看板 29 个 panel |

@@ -7,10 +7,10 @@ The three endpoints of the specification (pd_diag_v1/接口一_采集接口规�
   GET /pd_diag/v1/contract                        the segment definition endpoint (samples/contract.json)
   GET /pd_diag/v1/docs?after=<seq>&max_bytes=<n>  the output queue as NDJSON, with the X-PD-* response headers
 
-The output queue starts with the 12 sample documents (9 request documents, 3 status documents), each renumbered and
+The output queue starts with the 11 sample documents (8 request documents, 3 status documents), each renumbered and
 stamped with the current time. Then a copy of a request sample (a new request_id) is added every 1/--rate seconds, and
 the three status samples every --status-interval seconds, so that the board shows current data. --rate 0 serves the
-12 samples only. Sequence numbers start at the start time in microseconds and go up by one per document, as in the
+11 samples only. Sequence numbers start at the start time in microseconds and go up by one per document, as in the
 specification (section 3). The documents are the samples as they are: only seq, cluster, ts and, for the copies,
 request_id change.
 
@@ -190,7 +190,7 @@ def main():
     ap = argparse.ArgumentParser(description="模拟采集进程：按 pd_diag_v1/samples/ 的样例提供接口一的三个端点")
     ap.add_argument("--port", type=int, default=9300, help="监听端口，默认 9300（与采集进程的 listen_port 缺省值相同）")
     ap.add_argument("--cluster", default="lab", help="集群名，写进全部文档和状态接口，默认 lab")
-    ap.add_argument("--rate", type=float, default=1.0, help="每秒新增几份请求文档，默认 1；0 表示只提供 12 份样例")
+    ap.add_argument("--rate", type=float, default=1.0, help="每秒新增几份请求文档，默认 1；0 表示只提供 11 份样例")
     ap.add_argument("--status-interval", type=float, default=60.0, help="每隔多少秒新增一组状态文档，默认 60")
     ap.add_argument("--max-docs", type=int, default=100000, help="写出队列最多保留多少份文档，默认 100000")
     a = ap.parse_args()
