@@ -10,7 +10,7 @@
 |---|---|---|---|---|
 | 面板一 | [`panel1/`](panel1/) | glm53-0、glm53-1、glm53-2、dsv41-flash-1 … 5（8 个） | v1.2 | 线上在用 |
 | 旧面板二 | [`panel2-v3/`](panel2-v3/) | glm53-1 | v3.4-extra-t53 | 线上在用，冻结 |
-| 新面板二 | [`panel2-v4/`](panel2-v4/) | test-glm53（线下测试集群） | v4.0-extra | 已部署、待验收；本仓库内容的本地全链路运行（ClickHouse → 入库进程 → 看板）待验证 |
+| 新面板二 | [`panel2-v4/`](panel2-v4/) | test-glm53（线下测试集群） | v4.0-extra | 已部署、待验收；本仓库内容的本地全链路运行（模拟采集进程 → ClickHouse → 入库进程 → 看板）已跑通，见 [`interface/README.md`](interface/README.md) 6.1 节 |
 | 新面板二的采集接口（接口一） | [`interface/`](interface/) | test-glm53 的采集进程 | pd_diag_v1 | 随新面板二 |
 
 内网的端口、目录、容器、看板和数据源清单见 [`site/内网现状.md`](site/内网现状.md)；每个目录改动后影响内网哪里，见 [`site/改动影响表.md`](site/改动影响表.md)。
